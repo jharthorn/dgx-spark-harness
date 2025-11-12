@@ -1,0 +1,39 @@
+name: "tensorrt_llm"
+backend: "tensorrtllm"
+
+# This points to the engine we just built.
+# The Docker run command (later) will mount it at /engine/model.tensorrt
+model_repository {
+  root_location: "/engine"
+}
+model_version_policy {
+  specific {
+    versions: 1
+  }
+}
+
+parameters {
+  key: "max_beam_width"
+  value: { string_value: "1" }
+}
+parameters {
+  key: "gpt_model_type"
+  value: { string_value: "gpt" }
+}
+
+# --- LoRA SUPPORT ---
+# This is the magic. We enable a 8GB LoRA cache.
+parameters {
+  key: "lora_cache_size_bytes"
+  value: { string_value: "8589934592" } # 8 GiB
+}
+# This tells Triton where to find the adapter files we mount
+parameters {
+  key: "lora_dir"
+  value: { string_value: "/lora_adapters" }
+}
+
+# Dynamic batching
+dynamic_batching {
+  max_queue_delay_microseconds: 10000 # 10ms
+}

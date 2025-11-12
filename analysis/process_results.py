@@ -6,8 +6,6 @@ import matplotlib.pyplot as plt
 import os
 import re
 
-# v2.2: Simplified for H1, H2, H6, H7, H8 (H4/H5 removed)
-
 # Use container-absolute paths
 HARNESS_DIR = Path(os.environ.get("HARNESS_DIR", "/harness"))
 RESULTS_DIR = Path(os.environ.get("RESULTS_DIR", str(HARNESS_DIR / "results")))
@@ -18,49 +16,77 @@ print(f"Writing to:   {FIGURES_DIR}")
 
 # --- 5.1 smartctl Parser ---
 def parse_smartctl(path):
+    """Parses a smartctl output file for key statistics."""
     stats = {'temp_c': None, 'data_units_read': None, 'data_units_written': None, 'host_reads': None}
-    if not path.exists(): return stats
+    if not path.exists():
+        return stats
     try:
         text = path.read_text()
+        
         m = re.search(r'Temperature:\s+(\d+)\s+Celsius', text)
         if m: stats['temp_c'] = int(m.group(1))
+        
         m = re.search(r'Data Units Read:\s+([\d,]+)', text)
         if m: stats['data_units_read'] = int(m.group(1).replace(',', ''))
+        
         m = re.search(r'Data Units Written:\s+([\d,]+)', text)
         if m: stats['data_units_written'] = int(m.group(1).replace(',', ''))
+
         m = re.search(r'Host Read Commands:\s+([\d,]+)', text)
         if m: stats['host_reads'] = int(m.group(1).replace(',', ''))
+                
     except Exception as e:
         print(f"Warning: could not parse {path}: {e}", file=sys.stderr)
     return stats
 
 # --- 5.2 mpstat Parser ---
 def parse_mpstat(path):
-    if not path.exists(): return pd.DataFrame()
+    """Parses an mpstat log file into a pandas DataFrame."""
+    if not path.exists():
+        return pd.DataFrame()
     try:
-        with open(path, 'r') as f: lines = f.readlines()
+        with open(path, 'r') as f:
+            lines = f.readlines()
+        
         header_idx = -1
         for i, line in enumerate(lines):
-            if '%usr' in line and 'CPU' in line: header_idx = i; break
-        if header_idx == -1: return pd.DataFrame()
+            if '%usr' in line and 'CPU' in line:
+                header_idx = i
+                break
         
-        header = lines[header_idx].replace('%', 'pct_').split(); header[0] = 'Time'
+        if header_idx == -1: 
+            print(f"Warning: could not find mpstat header in {path}", file=sys.stderr)
+            return pd.DataFrame()
+        
+        # Clean header: remove special chars, fix time
+        header = lines[header_idx].replace('%', 'pct_').split()
+        header[0] = 'Time'
+        
         data = []
         for line in lines[header_idx+1:]:
             if not line.strip() or 'Average:' in line: continue
             vals = line.split()
-            if len(vals) == len(header): data.append(vals)
-        if not data: return pd.DataFrame()
+            if len(vals) == len(header):
+                data.append(vals)
+        
+        if not data:
+            print(f"Warning: no data found in mpstat log {path}", file=sys.stderr)
+            return pd.DataFrame()
 
         df = pd.DataFrame(data, columns=header)
+        
+        # Convert numeric cols
         numeric_cols = [col for col in df.columns if col not in ['Time', 'AM/PM', 'CPU']]
         for col in numeric_cols:
             df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # Create a time index (approximates 1s interval)
         df['time_s'] = df.groupby('CPU').cumcount()
         return df
     except Exception as e:
         print(f"Warning: could not parse {path}: {e}", file=sys.stderr)
         return pd.DataFrame()
+
 
 # --- Load Helpers ---
 def load_manifest(run_id):
@@ -69,10 +95,9 @@ def load_manifest(run_id):
 
 def load_summary(run_id):
     p = RESULTS_DIR / f"{run_id}_summary.json"
-    if not p.exists(): return {}
-    s = json.loads(p.read_text())
-    # Defensive backfill
-    if s and s.get("avg", {}).get("io_wait_pct") is None and s.get("requests_total", 0) > 0:
+    s = json.loads(p.read_text()) if p.exists() else {}
+    # Defensive backfill in case backfill_summary.py failed
+    if s and s.get("avg", {}).get("io_wait_pct") is None:
         tele = load_telemetry(run_id)
         if not tele.empty:
             s['avg']['io_wait_pct'] = tele['vm_wa'].mean()
@@ -86,20 +111,28 @@ def load_telemetry(run_id):
     df = pd.read_csv(p)
     return df.dropna(subset=['vm_wa', 'iostat_avg_qu_sz', 'gpu_util_pct'])
 
-# --- Plot Helpers ---
+
+# --- Plot Helpers (H1, H2, H3) ---
 
 def h1_plot(run_ids, name="h1_cache_cold_warm.png"):
     cold_ids = [r for r in run_ids if "COLD" in r]
     warm_ids = [r for r in run_ids if "WARM" in r]
-    cold_ttfts = [load_summary(r)["ttft_ms"]["p50"] for r in cold_ids if "ttft_ms" in load_summary(r) and load_summary(r)["ttft_ms"].get("p50") is not None]
-    warm_ttfts = [load_summary(r)["ttft_ms"]["p50"] for r in warm_ids if "ttft_ms" in load_summary(r) and load_summary(r)["ttft_ms"].get("p50") is not None]
+    cold_ttfts = [load_summary(r)["ttft_ms"]["p50"] for r in cold_ids if "ttft_ms" in load_summary(r) and load_summary(r)["ttft_ms"]["p50"] is not None]
+    warm_ttfts = [load_summary(r)["ttft_ms"]["p50"] for r in warm_ids if "ttft_ms" in load_summary(r) and load_summary(r)["ttft_ms"]["p50"] is not None]
     cold_ttft = np.mean(cold_ttfts) if cold_ttfts else 0
     warm_ttft = np.mean(warm_ttfts) if warm_ttfts else 0
-    if cold_ttft == 0 and warm_ttft == 0: print("H1: No data found to plot."); return
-    plt.figure()
-    plt.bar(["Cold Cache (H1)"], [cold_ttft], label=f"Cold (p50 TTFT: {cold_ttft:.0f} ms)", width=0.4)
-    plt.bar(["Warm Cache (H1)"], [warm_ttft], label=f"Warm (p50 TTFT: {warm_ttft:.0f} ms)", width=0.4)
-    plt.ylabel("p50 TTFT (ms)"); plt.title("H1: Cold vs. Warm Cache TTFT"); plt.legend()
+    
+    # v2.2 addition: Handle the "flat" 44ms/46ms finding
+    if abs(cold_ttft - warm_ttft) < 100: # If diff is negligible
+        plt.figure()
+        plt.bar(["Baseline TTFT (H1)"], [warm_ttft], label=f"Hot-Cache p50 TTFT: {warm_ttft:.0f} ms", width=0.4, color='blue')
+        plt.ylabel("p50 TTFT (ms)"); plt.title("H1: Baseline Hot-Cache TTFT (Model Pre-Loaded)"); plt.legend()
+    else:
+        plt.figure()
+        plt.bar(["Cold Cache (H1)"], [cold_ttft], label=f"Cold (p50 TTFT: {cold_ttft:.0f} ms)", width=0.4, color='red')
+        plt.bar(["Warm Cache (H1)"], [warm_ttft], label=f"Warm (p50 TTFT: {warm_ttft:.0f} ms)", width=0.4, color='green')
+        plt.ylabel("p50 TTFT (ms)"); plt.title("H1: Cold vs. Warm Cache TTFT"); plt.legend()
+    
     out = FIGURES_DIR / name; plt.tight_layout(); plt.savefig(out, dpi=160); print(f"Wrote {out}")
 
 def h2_scatter(run_ids, name="h2_io_wait_vs_p99.png"):
@@ -138,26 +171,63 @@ def h3_timeseries(run_id, name="h3_timeseries.png"):
                         if i < len(t): ax.axvline(t.iloc[i], color='gray', alpha=0.4, linestyle='--')
     out = FIGURES_DIR / name; plt.tight_layout(rect=[0, 0.03, 1, 0.98]); plt.savefig(out, dpi=160); print(f"Wrote {out}")
 
-def h2_vs_h6_plot(h2_ids, h6_ids, name="h6_h2_vs_h6_workload.png"):
+# --- Plot Helpers (H4, H5 - DEFERRED for v2.2) ---
+# (Keeping functions here, but they won't be called by default)
+
+def h4_plot(run_ids, name="h4_kv_cache_policy.png"):
+    data = []
+    for rid in run_ids:
+        summ = load_summary(rid); manifest = load_manifest(rid)
+        if "latency_ms" not in summ or "kv_cache" not in manifest or summ.get("avg") is None: continue
+        kv_state = manifest.get("kv_cache", "UNKNOWN"); p99 = summ["latency_ms"].get("p99"); io_wait = summ["avg"].get("io_wait_pct")
+        if p99 is not None and io_wait is not None: data.append({"kv_state": kv_state, "p99": p99, "io_wait": io_wait})
+    if not data: print("H4: No data found to plot."); return
+    df = pd.DataFrame(data).groupby("kv_state").mean()
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5)); fig.suptitle("H4: KV-Cache Policy Impact (Averaged)")
+    df['p99'].plot(kind='bar', ax=ax1, color=['blue', 'orange'], rot=0); ax1.set_ylabel("p99 Latency (ms)"); ax1.set_title("Tail Latency")
+    df['io_wait'].plot(kind='bar', ax=ax2, color=['blue', 'orange'], rot=0); ax2.set_ylabel("Average io_wait (%)"); ax2.set_title("Storage I/O Wait")
+    out = FIGURES_DIR / name; plt.tight_layout(rect=[0, 0.03, 1, 0.95]); plt.savefig(out, dpi=160); print(f"Wrote {out}")
+
+def h5_plot(run_ids, name="h5_context_length.png"):
+    data = []
+    def parse_k(s): match = re.match(r'(\d+)k', s.lower()); return int(match.group(1)) if match else None
+    for rid in run_ids:
+        summ = load_summary(rid); manifest = load_manifest(rid)
+        if "latency_ms" not in summ or "context" not in manifest or summ.get("avg") is None: continue
+        context_k = parse_k(manifest.get("context", "")); io_wait = summ["avg"].get("io_wait_pct"); p99 = summ["latency_ms"].get("p99")
+        if context_k is not None and io_wait is not None and p99 is not None: data.append({"context_k": context_k, "io_wait": io_wait, "p99": p99})
+    if not data: print("H5: No data found to plot."); return
+    df = pd.DataFrame(data).groupby("context_k").mean().sort_index()
+    fig, (ax1) = plt.subplots(1, 1, figsize=(8, 5)); fig.suptitle("H5: Context Length vs. System Load")
+    ax1.plot(df.index, df['io_wait'], 'o-', label='Avg. io_wait (%)', color='orange'); ax1.set_xlabel("Context Length (k tokens)"); ax1.set_ylabel("Average io_wait (%)", color='orange'); ax1.tick_params(axis='y', labelcolor='orange'); ax1.legend(loc='upper left')
+    ax2 = ax1.twinx(); ax2.plot(df.index, df['p99'], 's-', label='p99 Latency (ms)', color='blue'); ax2.set_ylabel("p99 Latency (ms)", color='blue'); ax2.tick_params(axis='y', labelcolor='blue'); ax2.legend(loc='upper right')
+    out = FIGURES_DIR / name; plt.tight_layout(rect=[0, 0.03, 1, 0.95]); plt.savefig(out, dpi=160); print(f"Wrote {out}")
+
+# --- Plot Helpers (H6, H7, H8 - v2.2) ---
+
+def h6_plot(h2_ids, h6_ids, name="h6_h2_vs_h6_workload.png"):
     def get_data(run_ids):
         data = []
         for rid in run_ids:
             summ = load_summary(rid); manifest = load_manifest(rid)
             if "latency_ms" not in summ or "concurrency_users" not in manifest or summ.get("avg") is None: continue
-            if summ.get("requests_total", 0) == 0: continue # Skip dummy H6 runs
             users = manifest.get("concurrency_users"); p99 = summ["latency_ms"].get("p99")
             if users is not None and p99 is not None: data.append({"users": users, "p99": p99})
         if not data: return pd.DataFrame()
         return pd.DataFrame(data).groupby("users").mean().sort_index()
+    
     df_h2 = get_data(h2_ids); df_h6 = get_data(h6_ids)
-    if df_h2.empty: print(f"H6: Not enough data for H2 baseline."); return
+    
+    if df_h2.empty and df_h6.empty:
+        print(f"H6: No data found for H2 or H6."); return
     
     plt.figure(figsize=(10, 6))
-    plt.plot(df_h2.index, df_h2['p99'], 'o-', label='H2: Baseline Workload')
+    if not df_h2.empty:
+        plt.plot(df_h2.index, df_h2['p99'], 'o-', label='H2: Baseline Workload')
     if not df_h6.empty:
         plt.plot(df_h6.index, df_h6['p99'], 's-', label='H6: LoRA Storm Workload')
     else:
-        print("H6: No valid LoRA run data found. Plotting H2 only.")
+        print("H6: No H6 (LoRA) data found to plot. Server may not support LoRA.")
         
     plt.xlabel("Concurrent Users"); plt.ylabel("p99 Latency (ms)"); plt.title("H6 vs H2: Workload Impact on Tail Latency"); plt.legend(); plt.grid(True, which='both', linestyle='--', linewidth=0.5)
     out = FIGURES_DIR / name; plt.tight_layout(); plt.savefig(out, dpi=160); print(f"Wrote {out}")
@@ -168,14 +238,14 @@ def h7_smartctl_deltas(run_ids, name="h7_smartctl_deltas.png"):
         manifest = load_manifest(rid)
         hyp = manifest.get("hypothesis", "UNKNOWN")
         if hyp not in ['H2', 'H6']: continue
-        if load_summary(rid).get("requests_total", 0) == 0: continue # Skip dummy H6
         
         users = manifest.get("concurrency_users", 0)
+        
         pre = parse_smartctl(RESULTS_DIR / f"{rid}_smartctl_pre.txt")
         post = parse_smartctl(RESULTS_DIR / f"{rid}_smartctl_post.txt")
         
-        if pre.get('data_units_read') is None or post.get('data_units_read') is None or \
-           pre.get('host_reads') is None or post.get('host_reads') is None:
+        if pre['data_units_read'] is None or post['data_units_read'] is None or \
+           pre['host_reads'] is None or post['host_reads'] is None:
             print(f"H7: Skipping {rid}, missing smartctl data.")
             continue
             
@@ -183,13 +253,17 @@ def h7_smartctl_deltas(run_ids, name="h7_smartctl_deltas.png"):
         write_delta_gb = (post.get('data_units_written', 0) - pre.get('data_units_written', 0)) * 512 / (1024**3)
         read_cmds_m = (post['host_reads'] - pre['host_reads']) / 1_000_000
         
-        data.append({ "run_id": rid, "hyp": hyp, "users": users, "read_gb": read_delta_gb,
-                      "write_gb": write_delta_gb, "read_cmds_m": read_cmds_m })
+        data.append({
+            "run_id": rid, "hyp": hyp, "users": users,
+            "read_gb": read_delta_gb,
+            "write_gb": write_delta_gb,
+            "read_cmds_m": read_cmds_m
+        })
     
     if not data: print("H7: No smartctl data found to plot."); return
     
     df = pd.DataFrame(data)
-    df = df.groupby(['hyp', 'users']).mean(numeric_only=True).reset_index()
+    df = df.groupby(['hyp', 'users']).mean().reset_index() # Average repeats
     
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
     fig.suptitle("H7: Storage Workload Deltas (from smartctl)")
@@ -222,35 +296,45 @@ def h8_mpstat_timeseries(run_id, name="h8_mpstat_cores.png"):
                   colors=['#1f77b4', '#ff7f0e', '#d62728', '#2ca02c']) # usr, sys, iowait, idle
     
     plt.xlabel("Time (seconds)"); plt.ylabel("CPU Usage (%)"); plt.title(f"H8: CPU Dynamics (all cores) - {run_id}"); plt.legend(loc='upper left'); plt.ylim(0, 100)
+    
     out = FIGURES_DIR / name
     plt.tight_layout(); plt.savefig(out, dpi=160); print(f"Wrote {out}")
     
 
-# --- Main CLI (v2.2) ---
+# --- Main CLI (v2.2.1 - BUG FIX) ---
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(f"Usage: {sys.argv[0]} <COMMAND> [run_ids...]", file=sys.stderr)
         print("Commands:", file=sys.stderr)
         print("  ALL        (Runs H1, H2, H6, H7, H8 plots)", file=sys.stderr)
         print("  H1, H2, H6 (Generates specific hypothesis plot)", file=sys.stderr)
-        print("  H3, H8     (Deep-dive plot, specify one run_id)", file=sys.stderr)
         print("  H7         (Generates smartctl delta plots for H2/H6)", file=sys.stderr)
+        print("  H8, H3     (Generates mpstat/telemetry plot, specify one run_id or auto-picks)", file=sys.stderr)
         sys.exit(1)
         
     what = sys.argv[1].upper()
-    run_ids = sys.argv[2:]
+    run_ids_arg = sys.argv[2:]
 
-    if not run_ids and what not in ['H3', 'H8']:
-        all_files = glob.glob(str(RESULTS_DIR / "*_manifest.json"))
-        run_ids = [Path(f).stem.replace('_manifest', '') for f in all_files]
-        if not run_ids:
-            print(f"No run data found in {RESULTS_DIR}")
-            sys.exit(0)
-        print(f"Found {len(run_ids)} total runs to analyze...")
+    # --- BUG FIX: Run auto-glob FIRST ---
+    all_files = glob.glob(str(RESULTS_DIR / "*_manifest.json"))
+    all_run_ids = [Path(f).stem.replace('_manifest', '') for f in all_files]
     
-    h1_ids = [r for r in run_ids if "H1" in r]
-    h2_ids = [r for r in run_ids if "H2" in r]
-    h6_ids = [r for r in run_ids if "H6" in r]
+    if not all_run_ids and not run_ids_arg:
+        print(f"No run data found in {RESULTS_DIR}")
+        sys.exit(0)
+    
+    # If user specified IDs, use them. Otherwise, use all found IDs.
+    if run_ids_arg:
+        all_run_ids = run_ids_arg
+    
+    print(f"Found {len(all_run_ids)} total runs to analyze...")
+    
+    h1_ids = [r for r in all_run_ids if "H1" in r]
+    h2_ids = [r for r in all_run_ids if "H2" in r]
+    h4_ids = [r for r in all_run_ids if "H4" in r]
+    h5_ids = [r for r in all_run_ids if "H5" in r]
+    h6_ids = [r for r in all_run_ids if "H6" in r]
+    # --- END BUG FIX ---
 
     if what == "ALL" or what == "H1":
         if h1_ids: h1_plot(h1_ids)
@@ -262,32 +346,39 @@ if __name__ == "__main__":
     
     if what == "ALL" or what == "H3":
         target_id = None
-        if run_ids and what == "H3": target_id = run_ids[0] # Use specified ID
-        elif h6_ids: # H6 is the most stressful test, use it
-            target_id = sorted(h6_ids, key=lambda r: load_manifest(r).get("concurrency_users", 0), reverse=True)[0]
-            print(f"H3: Auto-selected target (from H6): {target_id}")
+        if run_ids_arg and what == "H3": target_id = run_ids_arg[0] # Use specified ID
         elif h2_ids: 
+            # Auto-select highest concurrency run from H2
             target_id = sorted(h2_ids, key=lambda r: load_manifest(r).get("concurrency_users", 0), reverse=True)[0]
-            print(f"H3: Auto-selected target (from H2): {target_id}")
+            print(f"H3: Auto-selected target: {target_id}")
         
         if target_id: h3_timeseries(target_id, name=f"h3_timeseries_{target_id}.png")
-        else: print("H3: No H2 or H6 runs found to analyze. Specify a run_id.")
+        else: print("H3: No H2 runs found to analyze. Specify a run_id.")
     
+    # H4 and H5 are deferred in v2.2, but logic is kept
+    if what == "H4":
+        if h4_ids: h4_plot(h4_ids)
+        else: print("H4: No runs found.")
+            
+    if what == "H5":
+        if h5_ids: h5_plot(h5_ids)
+        else: print("H5: No runs found.")
+
     if what == "ALL" or what == "H6":
-        if h2_ids: h2_vs_h6_plot(h2_ids, h6_ids) # H6 plot now handles missing H6 data
-        else: print(f"H6: Not enough data. H2 runs: {len(h2_ids)}")
+        if h2_ids or h6_ids: h6_plot(h2_ids, h6_ids)
+        else: print(f"H6: Not enough data. H2 runs: {len(h2_ids)}, H6 runs: {len(h6_ids)}")
     
     if what == "ALL" or what == "H7":
-        if h2_ids: h7_smartctl_deltas(h2_ids + h6_ids) # H7 plot handles missing H6 data
+        if h2_ids or h6_ids: h7_smartctl_deltas(h2_ids + h6_ids)
         else: print(f"H7: No H2 or H6 runs found to analyze.")
 
     if what == "ALL" or what == "H8":
         target_id = None
-        if run_ids and what == "H8": target_id = run_ids[0] # Use specified ID
-        elif h6_ids: # H6 is the most stressful test, use it
+        if run_ids_arg and what == "H8": target_id = run_ids_arg[0] # Use specified ID
+        elif h6_ids: # Prioritize H6 for the most interesting CPU plot
             target_id = sorted(h6_ids, key=lambda r: load_manifest(r).get("concurrency_users", 0), reverse=True)[0]
             print(f"H8: Auto-selected target (from H6): {target_id}")
-        elif h2_ids: 
+        elif h2_ids: # Fallback to H2
             target_id = sorted(h2_ids, key=lambda r: load_manifest(r).get("concurrency_users", 0), reverse=True)[0]
             print(f"H8: Auto-selected target (from H2): {target_id}")
         
