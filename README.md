@@ -1,4 +1,3 @@
-````markdown
 # DGX Spark LLM Storage Test Harness (v2.2)
 
 This harness is designed to test the performance of the NVIDIA DGX Spark's internal NVMe SSD under a memory-pressure-bound LLM inference workload.
