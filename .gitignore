@@ -1,0 +1,32 @@
+# Python cache files
+
+pycache/
+*.pyc
+*.pyo
+
+# Generated data, logs, and summaries
+
+# This is the most important directory to ignore!
+
+results/
+
+# Generated plot images
+
+analysis/figures/
+
+# Master log file
+
+master_run.log
+
+# FIO test file (if it gets created in the root)
+
+fio_test_file.dat
+
+# OS-specific files
+
+.DS_Store
+
+# Editor swap files
+
+*.swp
+*.swo
