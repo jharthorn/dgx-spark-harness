@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# runs/run_H2_uma_pressure.sh
-# Runs H2 (Revised) - UMA Pressure Sweep (by context length)
-# This test MUST run against the Triton server (port 8000).
+# v2.5: Parameterized model tag
+# Usage: ./run_H2_uma_pressure.sh L8B
+#    or: ./run_H2_uma_pressure.sh L70B
 
 # Paths & defaults
 export HARNESS_DIR=${HARNESS_DIR:-/harness}
@@ -13,6 +13,9 @@ export INPUTS_DIR=${INPUTS_DIR:-$HARNESS_DIR/inputs}
 export ANALYSIS_DIR=${ANALYSIS_DIR:-$HARNESS_DIR/analysis}
 export NVME_DEVICE=${NVME_DEVICE:-nvme0n1}
 export MASTER_LOG=${MASTER_LOG:-$HARNESS_DIR/master_run.log}
+
+# --- NEW v2.5: Source Model Env ---
+source "$HARNESS_DIR/runs/model_env.sh" $1
 
 source "$HARNESS_DIR/runs/_lib_quiescence.sh"
 
@@ -37,8 +40,8 @@ declare -a MAX_TOKENS_LIST=(
 )
 
 mkdir -p "$RESULTS_DIR"
-echo "--- RUNNING H2 (UMA Pressure Sweep) ---" | tee -a "$MASTER_LOG"
-read -p "Ensure the TRITON (LoRA) server is running on port 8000. Press Enter to continue..."
+echo "--- RUNNING H2 (UMA Pressure Sweep) for $MODEL_TAG_SHORT ---" | tee -a "$MASTER_LOG"
+read -p "Ensure the TRITON server for $MODEL_TAG_SHORT is running on port 8000. Press Enter to continue..."
 
 for i in "${!PROMPTS[@]}"; do
   PROMPT_FILE="${PROMPTS[$i]}"
@@ -54,7 +57,7 @@ for i in "${!PROMPTS[@]}"; do
   PROMPT_SHA=$(sha256sum "$PROMPT_FILE" | awk '{print $1}')
 
   for r in $(seq 1 $REPEAT); do
-    RUN_ID="$(date -u +%Y%m%d_%H%M)_${HYP}_${CONTEXT_TAG}_U${U_WORK}_r${r}"
+    RUN_ID="$(date -u +%Y%m%d_%H%M)_${HYP}_${MODEL_TAG_SHORT}_${CONTEXT_TAG}_U${U_WORK}_r${r}"
     export RUN_ID
     echo "Starting run: $RUN_ID" | tee -a "$MASTER_LOG"
 
@@ -64,7 +67,9 @@ for i in "${!PROMPTS[@]}"; do
   "run_id":"${RUN_ID}",
   "timestamp_utc":"$(date -u +%Y%m%dT%H:%M:%SZ)",
   "hypothesis":"${HYP}",
-  "engine_profile": "bs256_ctx2k",
+  "model_handle":"${MODEL_HANDLE}",
+  "model_tag":"${MODEL_TAG_SHORT}",
+  "engine_profile": "bs256_ctx2k_triton",
   "context_config": "${CONTEXT_TAG}",
   "concurrency_users": ${U_WORK},
   "run_duration_sec": ${DUR},
@@ -98,5 +103,5 @@ EOF
     sleep 5
   done
 done
-echo "--- H2 (UMA Pressure Sweep) COMPLETE ---" | tee -a "$MASTER_LOG"
+echo "--- H2 (UMA Pressure Sweep) for $MODEL_TAG_SHORT COMPLETE ---" | tee -a "$MASTER_LOG"
 run_fstrim

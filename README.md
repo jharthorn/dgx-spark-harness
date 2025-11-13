@@ -1,82 +1,43 @@
-# DGX Spark LLM Storage Test Harness (v2.2)
+# DGX Spark LLM Storage Test Harness (v2.5 - Llama 3.x)
 
-This harness is designed to test the performance of the NVIDIA DGX Spark's internal NVMe SSD under a memory-pressure-bound LLM inference workload.
+This harness is designed to test the performance of the NVIDIA DGX Spark's internal NVMe SSD under a memory-pressure-bound LLM inference workload, based on the v2.4 Test Plan.
 
-This v2.2 plan is simplified to target the default trtllm-serve server (which is a "High Throughput" profile, bs=64). It focuses on H1 (Cache), H2 (Concurrency), and H6 (LoRA Storm) tests.
+It has been re-architected to test the Llama 3.x model family (8B and 70B) on a Triton Inference Server with full LoRA support.
 
-## Harness Architecture
+---
 
-The harness is organized into five distinct directories, all managed from the `/harness` mount point.
+## Harness Architecture (v2.5)
+
+The architecture is parameterized to support multiple model engines.
+
 ```
 /harness/
-├── src/                # Core tools: sysmon.sh (telemetry), loadgen.py (load)
-├── runs/               # Orchestration scripts: run_H1_cache.sh, run_H2_...sh, etc.
-├── inputs/             # Static data: prompts/ (for H2/H6), lora_adapters/ (for H6)
-├── results/            # (Git-ignored) RAW DATA: all .csv, .json, and .log files
-└── analysis/           # Analysis tools: process_results.py, backfill_summary.py
-    └── figures/        # (Git-ignored) Final plots (PNG)
+├── src/                # Core tools: sysmon.sh, loadgen.py (v2.3)
+├── runs/               # Orchestration scripts (v2.5)
+│   ├── model_env.sh    # NEW: Sets paths for L8B or L70B
+│   ├── run_H0_...sh
+│   ├── run_H1_...sh
+│   ├── run_H2_...sh
+│   └── run_H6_...sh
+├── inputs/             # Static data: prompts/, lora_adapters/
+├── results/            # (Git-ignored) RAW DATA
+├── analysis/           # Analysis tools
+│   └── figures/        # (Git-ignored) Final plots
+│
+├── setup_triton_server_llama.sh # NEW (v2.5): Builds Llama engine
+└── launch_triton_server.sh      # NEW (v2.5): Launches Triton server
 ```
 
 ---
 
-## Quick Start: Go-Live Checklist
+## Quick Start: The v2.5 Workflow
 
-This plan uses a two-container model: one for the (unprivileged) LLM server, and one for our (privileged) test harness.
+### Step 1: Launch Harness Container
 
-### Step 1: Run the LLM Server (Terminal 1)
-
-This is the command you provided. It starts the trtllm-serve container on port 8355.
+In Terminal 1, launch your persistent `spark-harness:v1` container (which has sysstat, fio, pandas, etc. installed).
 
 ```bash
-# Set the model to test
-export MODEL_HANDLE="openai/gpt-oss-120b"
-
-# Run the server container
-docker run --name trtllm_llm_server --rm -it --gpus all --ipc host --network host \
-  -e HF_TOKEN=$HF_TOKEN \
-  -e MODEL_HANDLE="$MODEL_HANDLE" \
-  -v $HOME/.cache/huggingface/:/root/.cache/huggingface/ \
-  nvcr.io/nvidia/tensorrt-llm/release:spark-single-gpu-dev \
-  bash -c '
-    # Set up tokenizer files
-    export TIKTOKEN_ENCODINGS_BASE="/tmp/harmony-reqs" && \
-    mkdir -p $TIKTOKEN_ENCODINGS_BASE && \
-    wget -P $TIKTOKEN_ENCODINGS_BASE https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken && \
-    wget -P $TIKTOKEN_ENCODINGS_BASE https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken && \
-    
-    # Download the model (will use cache)
-    hf download $MODEL_HANDLE && \
-    
-    # Create the config file (forces KV cache ON)
-    cat > /tmp/extra-llm-api-config.yml <<EOF
-print_iter_log: false
-kv_cache_config:
-  dtype: "auto"
-  free_gpu_memory_fraction: 0.9
-cuda_graph_config:
-  enable_padding: true
-disable_overlap_scheduler: true
-EOF
-    
-    # Run the server
-    trtllm-serve "$MODEL_HANDLE" \
-      --max_batch_size 64 \
-      --trust_remote_code \
-      --port 8355 \
-      --extra_llm_api_options /tmp/extra-llm-api-config.yml
-  '
-```
-
----
-
-### Step 2: Run the Test Harness (Terminal 2)
-
-Once the server is running, open a new terminal.
-
-#### Launch the Privileged Harness Container
-This container must be privileged to access host-level sysstat and smartctl.
-
-```bash
+# (On the host - Terminal 1)
 docker run --gpus all -it --rm \
   --network host \
   --shm-size=1g \
@@ -85,61 +46,112 @@ docker run --gpus all -it --rm \
   -v ~/dgx_spark_harness:/harness \
   -v /sys:/sys \
   -v /proc:/proc \
-  nvcr.io/nvidia/tensorrt-llm/release:spark-single-gpu-dev \
+  spark-harness:v1 \
   bash
-```
-
-#### Install Dependencies (Inside Harness Container)
-
-```bash
-# (Inside container)
-apt-get update && apt-get install -y sysstat smartmontools fio
-pip install httpx pandas matplotlib
-```
-
-#### Run the Test Suite (Inside Harness Container)
-The server is already running on localhost:8355. Our scripts are pre-configured to target it.
-
-```bash
-# (Inside container)
-cd /harness/runs
-
-# Run H1 (Cold/Warm)
-bash ./run_H1_cache.sh
-
-# Run H2 (Baseline Concurrency)
-bash ./run_H2_concurrency.sh
-
-# Run H6 (LoRA Storm Concurrency)
-bash ./run_H6_lora_storm.sh
 ```
 
 ---
 
-### Step 3: Analyze Results (Inside Harness Container)
+### Step 2: Build Engines
 
-After the tests are complete, run the analysis script.
+On the host (Terminal 2), you must build the TRT-LLM engines once for each model. This will take time.
 
 ```bash
-# (Inside container)
+# (On the host - Terminal 2)
+cd ~/dgx_spark_harness
+
+# Build the 8B engine
+bash ./setup_triton_server_llama.sh L8B
+
+# Build the 70B engine (this will take a while)
+bash ./setup_triton_server_llama.sh L70B
+```
+
+---
+
+### Step 3: Run the 8B (L8B) Test Suite
+
+This is an “end-to-end” flow for testing the 8B model.
+
+#### A. Launch the 8B Triton Server (Terminal 2)
+
+```bash
+# (On the host - Terminal 2)
+cd ~/dgx_spark_harness
+bash ./launch_triton_server.sh L8B
+```
+
+Leave this terminal running. You will see the Triton logs here.
+
+#### B. Run the 8B Tests (Harness Container — Terminal 1)
+
+```bash
+# (Inside Harness Container - Terminal 1)
+cd /harness/runs
+
+# 1. Calibrate the 8B server
+bash ./run_H0_queue_knee.sh L8B
+
+# 2. Find the 8B UMA/storage bottleneck
+bash ./run_H2_uma_pressure.sh L8B
+
+# 3. Run the 8B LoRA A/B test
+bash ./run_H6_workload_ab.sh L8B
+
+# 4. Run the 8B LoRA Cold/Warm test
+bash ./run_H1_coldwarm_lora.sh L8B
+```
+
+#### C. Stop the 8B Server (Terminal 2)
+
+Press **Ctrl+C** in Terminal 2 to stop the Triton server.
+
+---
+
+### Step 4: Run the 70B (L70B) Test Suite
+
+Now, repeat the process for the “hero” 70B model.
+
+#### A. Launch the 70B Triton Server (Terminal 2)
+
+```bash
+# (On the host - Terminal 2)
+cd ~/dgx_spark_harness
+bash ./launch_triton_server.sh L70B
+```
+
+Leave this running.
+
+#### B. Run the 70B Tests (Harness Container — Terminal 1)
+
+```bash
+# (Inside Harness Container - Terminal 1)
+cd /harness/runs
+
+bash ./run_H0_queue_knee.sh L70B
+bash ./run_H2_uma_pressure.sh L70B
+bash ./run_H6_workload_ab.sh L70B
+bash ./run_H1_coldwarm_lora.sh L70B
+```
+
+#### C. Stop the 70B Server (Terminal 2)
+
+Press **Ctrl+C**.
+
+---
+
+### Step 5: Analyze All Results
+
+You have now collected all data for both models.
+
+```bash
+# (Inside Harness Container - Terminal 1)
 cd /harness/analysis
 
 # Run ALL analysis and generate ALL plots
 python3 ./process_results.py ALL
 ```
 
-This will generate all plots (H1, H2, H6, H7, H8) in the `/harness/analysis/figures/` directory.
+This will create all plots (H0, H1, H2, H6, etc.) in `analysis/figures/`.
 
----
-
-## Test Suite Overview (v2.2)
-
-| Script | Test ID | Purpose |
-|--------|----------|---------|
-| `run_H1_cache.sh` | H1 | Cache QoS: Measures p50 TTFT for a COLD vs. WARM model load. |
-| `run_H2_concurrency.sh` | H2 | Baseline Latency: Generates the p99 latency vs. io_wait curve under load. |
-| `run_H6_lora_storm.sh` | H6 | Workload A/B Test: Runs a concurrency sweep with LoRA switching. |
-| *(Analyzes H2/H6 Data)* | H3 | Eviction Analysis: Deep-dive time-series of a high-load H2/H6 run. |
-| *(Analyzes H2/H6 Data)* | H7 | smartctl Deltas: Plots total GB read and total read commands. |
-| *(Analyzes H2/H6 Data)* | H8 | mpstat Dynamics: Plots per-core CPU usage (usr, sys, iowait). |
-````
+The `process_results.py` script (v2.3) is already smart enough to create **separate plots for L8B and L70B** data by reading the `model_tag` from the manifest.

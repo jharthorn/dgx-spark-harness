@@ -14,6 +14,9 @@ export ANALYSIS_DIR=${ANALYSIS_DIR:-$HARNESS_DIR/analysis}
 export NVME_DEVICE=${NVME_DEVICE:-nvme0n1}
 export MASTER_LOG=${MASTER_LOG:-$HARNESS_DIR/master_run.log}
 
+# 70B NVFP4 model
+export MODEL_HANDLE="nvidia/Llama-3.3-70B-Instruct-FP4"
+
 source "$HARNESS_DIR/runs/_lib_quiescence.sh"
 
 HYP=H0

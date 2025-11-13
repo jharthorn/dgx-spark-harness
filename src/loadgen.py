@@ -1,209 +1,381 @@
 #!/usr/bin/env python3
-import argparse, asyncio, json, time, random, os
+"""Async load generator for DGX Spark LLM Storage Test Harness."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import os
+import random
 import sys
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterable, List, Optional, Sequence
+
 import httpx
 
-# v2.3: "Smart" Loadgen
-# - Auto-detects H6 (LoRA) test and switches to Triton API (port 8000)
-# - All other tests (H1, H2) default to OpenAI API (port 8355)
+# -----------------------------------------------------------------------------
+# Environment configuration
 
-# --- API Endpoints ---
-API_CONFIGS = {
-    "openai": {
-        "url": "http://127.0.0.1:8355/v1/completions",
-        "doc": "OpenAI-compatible (trtllm-serve, default)"
-    },
-    "triton": {
-        "url": "http://127.0.0.1:8000/v2/models/ensemble/generate_stream",
-        "doc": "NVIDIA Triton (for LoRA support)"
-    }
-}
-# ---
-
-# Paths (container-absolute defaults)
 HARNESS_DIR = Path(os.environ.get("HARNESS_DIR", "/harness"))
-RESULTS_DIR = Path(os.environ.get("RESULTS_DIR", str(HARNESS_DIR / "results")))
-INPUTS_DIR  = Path(os.environ.get("INPUTS_DIR",  str(HARNESS_DIR / "inputs")))
+RESULTS_DIR = Path(os.environ.get("RESULTS_DIR", HARNESS_DIR / "results"))
+INPUTS_DIR = Path(os.environ.get("INPUTS_DIR", HARNESS_DIR / "inputs"))
 MODEL_HANDLE = os.environ.get("MODEL_HANDLE", "openai/gpt-oss-120b")
 
-def percentile(xs, p):
-    if not xs: return None
-    xs_sorted = sorted(xs)
-    k = (len(xs_sorted)-1) * (p/100.0)
-    f = int(k); c = min(f+1, len(xs_sorted)-1)
-    if f == c: return xs_sorted[f]
-    d0 = xs_sorted[f] * (c - k)
-    d1 = xs_sorted[c] * (k - f)
-    return d0 + d1
+# -----------------------------------------------------------------------------
+# API configuration
 
-def bootstrap_ci(xs, p=99, iters=10000, alpha=0.05):
-    if not xs: return (None, None, None)
-    import random
-    n = len(xs); samples = []
-    for _ in range(iters):
-        s = [xs[random.randrange(n)] for _ in range(n)]
-        samples.append(percentile(s, p))
+
+@dataclass(frozen=True, slots=True)
+class ApiConfig:
+    """Connection details for a target inference API."""
+
+    name: str
+    url: str
+    description: str
+    extra_headers: dict[str, str] = field(default_factory=dict)
+
+
+API_CONFIGS: dict[str, ApiConfig] = {
+    "openai": ApiConfig(
+        name="openai",
+        url="http://127.0.0.1:8355/v1/completions",
+        description="OpenAI-compatible (trtllm-serve, default)",
+    ),
+    "triton": ApiConfig(
+        name="triton",
+        url="http://127.0.0.1:8000/v2/models/ensemble/generate_stream",
+        description="NVIDIA Triton (required for LoRA support)",
+        extra_headers={"Accept": "text/event-stream"},
+    ),
+}
+
+# -----------------------------------------------------------------------------
+# Small utilities
+
+
+@dataclass(slots=True)
+class RequestMetrics:
+    """Latency measurements for a single inference request."""
+
+    ttft_ms: Optional[float]
+    latency_ms: Optional[float]
+    success: bool
+
+
+def percentile(values: Sequence[float], percent: float) -> Optional[float]:
+    """Returns the percentile using linear interpolation (inclusive)."""
+    cleaned = sorted(v for v in values if v is not None)
+    if not cleaned:
+        return None
+    if percent <= 0:
+        return cleaned[0]
+    if percent >= 100:
+        return cleaned[-1]
+    rank = (len(cleaned) - 1) * (percent / 100.0)
+    low = int(rank)
+    high = min(low + 1, len(cleaned) - 1)
+    fraction = rank - low
+    if low == high:
+        return cleaned[low]
+    return cleaned[low] * (1.0 - fraction) + cleaned[high] * fraction
+
+
+def bootstrap_percentile_ci(
+    values: Sequence[float],
+    percent: float = 99.0,
+    iterations: int = 5000,
+    alpha: float = 0.05,
+) -> tuple[Optional[float], Optional[float], Optional[float]]:
+    """Bootstrap percentile confidence interval."""
+    cleaned = [v for v in values if v is not None]
+    if not cleaned:
+        return (None, None, None)
+    rng = random.Random(1234)  # deterministic for reproducibility
+    samples: List[float] = []
+    for _ in range(iterations):
+        bucket = [cleaned[rng.randrange(len(cleaned))] for _ in cleaned]
+        samples.append(percentile(bucket, percent) or 0.0)
     samples.sort()
-    lo = samples[int((alpha/2)*iters)]
-    hi = samples[int((1-alpha/2)*iters)]
-    return (percentile(xs, p), lo, hi)
+    lo_index = int((alpha / 2.0) * iterations)
+    hi_index = int((1 - alpha / 2.0) * iterations)
+    return (
+        percentile(cleaned, percent),
+        samples[lo_index],
+        samples[min(hi_index, len(samples) - 1)],
+    )
 
-async def stream_request(client, url, payload, api_mode, timeout):
-    """Sends one request, measures client-side TTFT and total latency."""
-    t_send_end = time.time()
-    ttft = None; total_latency = None; success = False
-    
-    headers = {"Content-Type": "application/json"}
-    if api_mode == "triton":
-        headers["Accept"] = "text/event-stream"
-        
-    try:
-        async with client.stream("POST", url, json=payload, timeout=timeout, headers=headers) as r:
-            async for chunk in r.aiter_raw():
-                if ttft is None: # First chunk received
-                    ttft = (time.time() - t_send_end) * 1000.0
-            
-            # After stream ends
-            total_latency = (time.time() - t_send_end) * 1000.0
-            r.raise_for_status() # Raise HTTPStatusError for 4xx/5xx
-            success = True
-            
-    except Exception as e:
-        print(f"Request failed: {e}", file=sys.stderr)
-        success = False
-        
-    return ttft, total_latency, success
 
-def build_payload(args, prompt, adapter, api_mode):
-    """Builds the JSON payload based on the API mode."""
-    
-    if api_mode == "triton":
-        return {
-            "prompt": prompt,
-            "max_tokens": args.max_tokens,
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-            "seed": args.seed,
-            "stream": True,
-            "lora_config": {
-                "lora_name": adapter
-            }
-        }
-    else: # openai
-        return {
-            "model": MODEL_HANDLE,
-            "prompt": prompt,
-            "max_tokens": args.max_tokens,
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-            "seed": args.seed,
-            "stream": True
-        }
+def resolve_path(candidate: str, base_dir: Path) -> Path:
+    """Resolves relative paths against a base directory."""
+    path = Path(candidate)
+    return path if path.is_absolute() else base_dir / path
 
-async def worker(args, prompts, adapters, results_queue, api_mode):
-    """A single concurrent worker task."""
-    url = API_CONFIGS[api_mode]["url"]
-    deadline = time.time() + args.duration
-    timeout = httpx.Timeout(args.timeout)
-    
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        while time.time() < deadline:
-            prompt = random.choice(prompts)
-            adapter = random.choice(adapters) if adapters else None
-            
-            payload = build_payload(args, prompt, adapter, api_mode)
 
-            ttft, lat, ok = await stream_request(client, url, payload, api_mode, timeout)
-            await results_queue.put((time.time(), ttft, lat, ok))
-
-async def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--run-id", required=True)
-    ap.add_argument("-U","--users", type=int, required=True, help="Number of concurrent users")
-    ap.add_argument("-P","--prompt-file", action="append", default=[], help="Path to prompt file(s). Relative to INPUTS_DIR or absolute.")
-    ap.add_argument("--lora-list", default=None, help="Path to lora_list.txt. Using this flag *forces* Triton API mode.")
-    ap.add_argument("--duration", type=int, default=300, help="Test duration in seconds")
-    ap.add_argument("--max-tokens", type=int, default=256)
-    ap.add_argument("--temperature", type=float, default=0.0)
-    ap.add_argument("--top-p", type=float, default=1.0)
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--timeout", type=float, default=120.0, help="Request timeout in seconds")
-    args = ap.parse_args()
-
-    # --- v2.3: Auto-detect API mode ---
-    api_mode = "openai"
-    adapters = None
-    if args.lora_list:
-        api_mode = "triton" # H6 LoRA test MUST use Triton
-        pth = Path(args.lora_list)
-        if not pth.is_absolute():
-            pth = Path(INPUTS_DIR) / pth
-        if pth.exists():
-            lines = pth.read_text().splitlines()
-            adapters = [
-                x.strip() for x in lines 
-                if x.strip() and not x.strip().startswith("#")
-            ]
-        else:
-            print(f"Error: LoRA list not found: {pth}", file=sys.stderr)
-            return
-
-        if not adapters:
-            print(f"Error: --lora-list specified but no valid adapters found in {pth}", file=sys.stderr)
-            return
-    # ---------------------------------
-
-    print(f"--- Starting Loadgen for Run ID: {args.run_id} ---")
-    print(f"API Mode: {api_mode.upper()} (Target: {API_CONFIGS[api_mode]['url']})")
-
-    # Input prompts
-    prompts = []
-    for p in args.prompt_file:
-        pth = Path(p)
-        if not pth.is_absolute():
-            pth = Path(INPUTS_DIR) / p
-        if not pth.exists():
-            print(f"Warning: Prompt file not found: {pth}", file=sys.stderr)
+def read_prompt_files(files: Iterable[str]) -> list[str]:
+    """Reads prompts from provided files, falling back to a default prompt."""
+    prompts: list[str] = []
+    for prompt_file in files:
+        resolved = resolve_path(prompt_file, INPUTS_DIR)
+        if not resolved.exists():
+            logging.warning("Prompt file not found: %s", resolved)
             continue
-        prompts.append(pth.read_text())
+        prompts.append(resolved.read_text())
     if not prompts:
-        prompts = ["Hello world."] # Default prompt
+        logging.warning("No prompt files supplied; using default stub prompt.")
+        prompts = ["Hello world."]
+    return prompts
 
-    results_queue = asyncio.Queue()
-    tasks = [worker(args, prompts, adapters, results_queue, api_mode) for _ in range(args.users)]
-    
-    print(f"Starting load: {args.users} users for {args.duration}s...")
-    await asyncio.gather(*tasks)
-    print("Loadgen complete. Summarizing...")
 
-    results = []
-    while not results_queue.empty():
-        results.append(results_queue.get_nowait())
+def load_adapters(lora_list: Optional[str]) -> list[str]:
+    """Loads LoRA adapter names when the --lora-list flag is provided."""
+    if not lora_list:
+        return []
+    resolved = resolve_path(lora_list, INPUTS_DIR)
+    if not resolved.exists():
+        raise FileNotFoundError(
+            f"LoRA manifest not found at {resolved}. Provide an absolute path "
+            "or a path relative to $INPUTS_DIR."
+        )
+    adapters = [
+        line.strip()
+        for line in resolved.read_text().splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not adapters:
+        raise ValueError(
+            f"--lora-list specified but no adapters detected in {resolved}."
+        )
+    logging.info("Loaded %d LoRA adapters from %s.", len(adapters), resolved)
+    return adapters
 
-    # --- Summaries ---
-    ttfts = [r[1] for r in results if r[1] is not None]
-    lats  = [r[2] for r in results if r[3] and r[2] is not None] # Only successful, completed latencies
-    total_reqs = len(results)
-    success_reqs = len(lats)
-    admission = 100.0 * (success_reqs / max(1, total_reqs))
-    rps = success_reqs / max(1.0, args.duration)
 
-    p99, ci_lo, ci_hi = bootstrap_ci(lats, 99)
-    summary = {
-      "requests_total": total_reqs,
-      "admission_pct": admission,
-      "throughput_rps": rps,
-      "ttft_ms": {"p50": percentile(ttfts,50), "p95": percentile(ttfts,95), "p99": percentile(ttfts,99)},
-      "latency_ms": {"p50": percentile(lats,50), "p90": percentile(lats,90), "p95": percentile(lats,95),
-                     "p99": p99, "p99_ci_low": ci_lo, "p99_ci_high": ci_hi},
-      "avg": {"io_wait_pct": None, "qu_sz": None, "rps": rps, "gpu_util_pct": None} # Populated by analysis script
+def build_payload(
+    args: argparse.Namespace, prompt: str, adapter: Optional[str], api: ApiConfig
+) -> dict:
+    """Constructs the request payload for the selected API."""
+    base_payload = {
+        "max_tokens": args.max_tokens,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "seed": args.seed,
+        "stream": True,
+    }
+    if api.name == "triton":
+        payload = {
+            "prompt": prompt,
+            **base_payload,
+        }
+        if adapter is None:
+            raise ValueError("LoRA adapter selection failed for Triton mode.")
+        payload["lora_config"] = {"lora_name": adapter}
+        return payload
+    return {
+        "model": MODEL_HANDLE,
+        "prompt": prompt,
+        **base_payload,
     }
 
-    out_dir = Path(RESULTS_DIR); out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{args.run_id}_summary.json"
-    out_path.write_text(json.dumps(summary, indent=2))
-    print(f"Wrote summary: {out_path}")
+
+async def stream_request(
+    client: httpx.AsyncClient,
+    payload: dict,
+    api: ApiConfig,
+    timeout: httpx.Timeout,
+) -> RequestMetrics:
+    """Executes one streaming inference request."""
+    start = time.perf_counter()
+    ttft_ms: Optional[float] = None
+    latency_ms: Optional[float] = None
+    success = False
+    headers = {"Content-Type": "application/json", **api.extra_headers}
+    try:
+        async with client.stream(
+            "POST", api.url, json=payload, timeout=timeout, headers=headers
+        ) as response:
+            async for _chunk in response.aiter_raw():
+                if ttft_ms is None:
+                    ttft_ms = (time.perf_counter() - start) * 1000.0
+            latency_ms = (time.perf_counter() - start) * 1000.0
+            response.raise_for_status()
+            success = True
+    except Exception as exc:  # pragma: no cover - network errors
+        logging.error("Request failed: %s", exc)
+    return RequestMetrics(ttft_ms=ttft_ms, latency_ms=latency_ms, success=success)
+
+
+async def worker(
+    *,
+    args: argparse.Namespace,
+    prompts: Sequence[str],
+    adapters: Sequence[str],
+    api: ApiConfig,
+) -> list[RequestMetrics]:
+    """Continuously issues requests until the duration deadline is reached."""
+    timeout = httpx.Timeout(args.timeout)
+    deadline = time.monotonic() + args.duration
+    rng = random.Random()
+    collected: list[RequestMetrics] = []
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        while time.monotonic() < deadline:
+            prompt = rng.choice(prompts)
+            adapter = rng.choice(adapters) if adapters else None
+            payload = build_payload(args, prompt, adapter, api)
+            collected.append(
+                await stream_request(client, payload, api=api, timeout=timeout)
+            )
+    return collected
+
+
+def summarise_results(
+    results: Sequence[RequestMetrics], duration: int
+) -> dict[str, object]:
+    """Converts raw request metrics into the summary JSON document."""
+    ttfts = [r.ttft_ms for r in results if r.ttft_ms is not None]
+    latencies = [r.latency_ms for r in results if r.success and r.latency_ms]
+    total_reqs = len(results)
+    success_reqs = len(latencies)
+    admission_pct = 100.0 * (success_reqs / max(1, total_reqs))
+    throughput_rps = success_reqs / max(1.0, duration)
+    p99, ci_lo, ci_hi = bootstrap_percentile_ci(latencies, percent=99.0)
+    return {
+        "requests_total": total_reqs,
+        "admission_pct": admission_pct,
+        "throughput_rps": throughput_rps,
+        "ttft_ms": {
+            "p50": percentile(ttfts, 50),
+            "p95": percentile(ttfts, 95),
+            "p99": percentile(ttfts, 99),
+        },
+        "latency_ms": {
+            "p50": percentile(latencies, 50),
+            "p90": percentile(latencies, 90),
+            "p95": percentile(latencies, 95),
+            "p99": p99,
+            "p99_ci_low": ci_lo,
+            "p99_ci_high": ci_hi,
+        },
+        "avg": {
+            "io_wait_pct": None,
+            "qu_sz": None,
+            "rps": throughput_rps,
+            "gpu_util_pct": None,
+        },
+    }
+
+
+def persist_summary(run_id: str, summary: dict[str, object], api: ApiConfig) -> Path:
+    """Writes the summary JSON file to disk."""
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = RESULTS_DIR / f"{run_id}_summary.json"
+    payload = {
+        **summary,
+        "meta": {
+            "run_id": run_id,
+            "api_mode": api.name,
+            "target_url": api.url,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        },
+    }
+    out_path.write_text(json.dumps(payload, indent=2))
+    return out_path
+
+
+async def run_loadgen(args: argparse.Namespace) -> None:
+    """Entrypoint for the async load generator."""
+    logging.info("Starting loadgen for run %s.", args.run_id)
+    adapters = load_adapters(args.lora_list)
+    api = API_CONFIGS["triton" if adapters else "openai"]
+    logging.info("API Mode: %s (%s)", api.name.upper(), api.url)
+    prompts = read_prompt_files(args.prompt_file or [])
+    logging.info(
+        "Running %s users for %ss with %d prompt(s).",
+        args.users,
+        args.duration,
+        len(prompts),
+    )
+    worker_tasks = [
+        worker(args=args, prompts=prompts, adapters=adapters, api=api)
+        for _ in range(args.users)
+    ]
+    results_nested = await asyncio.gather(*worker_tasks)
+    all_results = [metric for worker_results in results_nested for metric in worker_results]
+    logging.info("Completed load generation: %d samples collected.", len(all_results))
+    summary = summarise_results(all_results, args.duration)
+    out_path = persist_summary(args.run_id, summary, api)
+    logging.info("Wrote summary: %s", out_path)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Creates the CLI argument parser."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run-id", required=True, help="Unique identifier for this run.")
+    parser.add_argument(
+        "-U",
+        "--users",
+        type=int,
+        required=True,
+        help="Number of concurrent workers (users).",
+    )
+    parser.add_argument(
+        "-P",
+        "--prompt-file",
+        action="append",
+        default=[],
+        help="Prompt file (relative to $INPUTS_DIR unless absolute). Can repeat.",
+    )
+    parser.add_argument(
+        "--lora-list",
+        default=None,
+        help="Path to lora_list.txt; forces Triton API mode.",
+    )
+    parser.add_argument(
+        "--duration",
+        type=int,
+        default=300,
+        help="Test duration in seconds.",
+    )
+    parser.add_argument("--max-tokens", type=int, default=256)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=42, help="Sampling seed passed through to the API.")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=120.0,
+        help="Request timeout in seconds.",
+    )
+    return parser
+
+
+def configure_logging(verbose: bool = False) -> None:
+    """Initialises root logger once for the module."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="[%(asctime)s] %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """CLI wrapper to parse args and execute the async entrypoint."""
+    parser = build_parser()
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="Enable debug logging."
+    )
+    args = parser.parse_args(argv)
+    configure_logging(verbose=args.verbose)
+    try:
+        asyncio.run(run_loadgen(args))
+    except (FileNotFoundError, ValueError) as exc:
+        logging.error("%s", exc)
+        return 1
+    return 0
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(main())

@@ -1,0 +1,6 @@
+{
+  "adapter_finance_v1": "/lora_adapters/adapter_finance_v1",
+  "adapter_legal_v2": "/lora_adapters/adapter_legal_v2",
+  "adapter_customer_support_v4": "/lora_adapters/adapter_customer_support_v4",
+  "adapter_summarization_v3": "/lora_adapters/adapter_summarization_v3"
+}

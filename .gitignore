@@ -1,18 +1,16 @@
 # Python cache files
 
-pycache/
+__pycache__/
 *.pyc
 *.pyo
 
 # Generated data, logs, and summaries
 
-# This is the most important directory to ignore!
-
 results/
 
 # Generated plot images
 
-figures/
+analysis/figures
 
 # Master log file
 
@@ -30,3 +28,7 @@ fio_test_file.dat
 
 *.swp
 *.swo
+
+# Model files
+
+model_repository/
