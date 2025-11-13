@@ -43,7 +43,7 @@ API_CONFIGS: dict[str, ApiConfig] = {
     "openai": ApiConfig(
         name="openai",
         url="http://127.0.0.1:8355/v1/completions",
-        description="OpenAI-compatible (trtllm-serve, default)",
+        description="OpenAI-compatible (trtllm-serve, default for No-LoRA)",
     ),
     "triton": ApiConfig(
         name="triton",
@@ -165,14 +165,12 @@ def build_payload(
         "stream": True,
     }
     if api.name == "triton":
-        payload = {
-            "prompt": prompt,
-            **base_payload,
-        }
-        if adapter is None:
-            raise ValueError("LoRA adapter selection failed for Triton mode.")
-        payload["lora_config"] = {"lora_name": adapter}
+        payload = {"prompt": prompt, **base_payload}
+        if adapter:
+            payload["lora_config"] = {"lora_name": adapter}
         return payload
+    
+    # OpenAI compatible mode (No LoRA)
     return {
         "model": MODEL_HANDLE,
         "prompt": prompt,
@@ -219,11 +217,29 @@ async def worker(
     deadline = time.monotonic() + args.duration
     rng = random.Random()
     collected: list[RequestMetrics] = []
+
+    # --- H5 Sticky-mode logic ---
+    # If adapters are present and session is sticky, pick *one* for this worker.
+    sticky_adapter: Optional[str] = None
+    if adapters and args.lora_session == "sticky":
+        sticky_adapter = rng.choice(adapters)
+
     async with httpx.AsyncClient(timeout=timeout) as client:
         while time.monotonic() < deadline:
             prompt = rng.choice(prompts)
-            adapter = rng.choice(adapters) if adapters else None
-            payload = build_payload(args, prompt, adapter, api)
+            
+            # Select adapter for *this* request
+            chosen_adapter: Optional[str] = None
+            if adapters:
+                if args.lora_session == "sticky":
+                    chosen_adapter = sticky_adapter
+                else:  # 'random' (Stormy)
+                    chosen_adapter = rng.choice(adapters)
+            
+            # If no adapters were loaded (e.g. H0, H2, H4), chosen_adapter remains None.
+            # This is correct for the OpenAI API path.
+
+            payload = build_payload(args, prompt, chosen_adapter, api)
             collected.append(
                 await stream_request(client, payload, api=api, timeout=timeout)
             )
@@ -259,10 +275,13 @@ def summarise_results(
             "p99_ci_high": ci_hi,
         },
         "avg": {
+            # These are backfilled by backfill_summary.py
             "io_wait_pct": None,
             "qu_sz": None,
             "rps": throughput_rps,
             "gpu_util_pct": None,
+            "r_await_ms": None,
+            "rps_storage": None,
         },
     }
 
@@ -284,12 +303,33 @@ def persist_summary(run_id: str, summary: dict[str, object], api: ApiConfig) -> 
     return out_path
 
 
+def resolve_api_mode(args: argparse.Namespace, adapters: list[str]) -> ApiConfig:
+    """Determines which API endpoint should be used for this run."""
+    forced_mode = args.api_mode
+    if forced_mode not in {"auto", *API_CONFIGS.keys()}:
+        raise ValueError(f"Unsupported --api-mode value: {forced_mode}")
+
+    if adapters and forced_mode == "openai":
+        raise ValueError("--lora-list requires Triton. Remove --api-mode openai or the adapter list.")
+
+    selected = forced_mode
+    if forced_mode == "auto":
+        selected = "triton" if adapters else "openai"
+    elif forced_mode == "triton" and not adapters:
+        logging.info("Forcing Triton API without LoRA adapters (baseline run on LoRA server).")
+
+    return API_CONFIGS[selected]
+
+
 async def run_loadgen(args: argparse.Namespace) -> None:
     """Entrypoint for the async load generator."""
     logging.info("Starting loadgen for run %s.", args.run_id)
     adapters = load_adapters(args.lora_list)
-    api = API_CONFIGS["triton" if adapters else "openai"]
+    api = resolve_api_mode(args, adapters)
     logging.info("API Mode: %s (%s)", api.name.upper(), api.url)
+    if adapters:
+        logging.info("LoRA Mode: %s sessions", args.lora_session.upper())
+        
     prompts = read_prompt_files(args.prompt_file or [])
     logging.info(
         "Running %s users for %ss with %d prompt(s).",
@@ -330,7 +370,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lora-list",
         default=None,
-        help="Path to lora_list.txt; forces Triton API mode.",
+        help="Path to lora_list.txt; requires Triton API mode.",
+    )
+    # --- NEW ARGUMENT FOR H5 ---
+    parser.add_argument(
+        "--lora-session",
+        choices=["random", "sticky"],
+        default="random",
+        help="LoRA session type. 'random' = stormy (default), 'sticky' = affinity.",
+    )
+    # ---
+    parser.add_argument(
+        "--api-mode",
+        choices=["auto", "openai", "triton"],
+        default="auto",
+        help="Override API selection. Use 'triton' to hit the LoRA server without adapters.",
     )
     parser.add_argument(
         "--duration",

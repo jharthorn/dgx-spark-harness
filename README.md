@@ -1,40 +1,110 @@
-# DGX Spark LLM Storage Test Harness (v2.5 - Llama 3.x)
+# DGX Spark LLM Storage Test Harness (v2.5)
 
-This harness is designed to test the performance of the NVIDIA DGX Spark's internal NVMe SSD under a memory-pressure-bound LLM inference workload, based on the v2.4 Test Plan.
+This harness is designed to test the performance of the NVIDIA DGX Spark's internal NVMe SSD under a memory-pressure-bound LLM inference workload, based on the canonical test plan **Test_Plan_v2.5.md**.
 
-It has been re-architected to test the Llama 3.x model family (8B and 70B) on a Triton Inference Server with full LoRA support.
+The goal is to quantify the impact of storage QoS on inference tail latency (p99) once the 128GB Unified Memory Architecture (UMA) is saturated and begins paging model data (KV cache or LoRA adapters) from the local 4TB NVMe drive.
+
+This harness is configured to test the **Llama 3 8B (L8B)** and **70B (L70B)** models.
 
 ---
 
-## Harness Architecture (v2.5)
+## Test Plan & Hypotheses (v2.5)
 
-The architecture is parameterized to support multiple model engines.
+This harness executes the tests defined in **Test_Plan_v2.5.md**.
+
+**H0 — Queue Knee Calibration:**  
+Find the maximum stable concurrency (U_work) before queue delays dominate.
+
+**H1 — Cold vs. Warm LoRA:**  
+Measure p99 TTFT difference between cold OS cache vs. warm cache LoRA loads.
+
+**H2 — UMA Pressure "Hockey Stick":**  
+Identify the paging knee where KV cache paging to NVMe causes a sharp p99 rise.
+
+**H3 (Analytical):**  
+Correlate OS paging/swap metrics with the H2 latency knee.
+
+**H4 — Storage QoS Sensitivity:**  
+Primary goal. While paging, artificially degrade NVMe QoS using `fio`, proving that p99 latency scales with NVMe read latency (r_await).
+
+**H5 — LoRA Working-Set Scaling:**  
+Primary goal. Test how p99 latency and storage IOPS scale with LoRA adapter count (4, 16, 64) and session churn.
+
+**H6 — LoRA Storm A/B Test:**  
+Worst-case thrash scenario comparing baseline vs. LoRA-storm workloads.
+
+**H7 (Analytical):**  
+Correlate smartctl host read commands with LoRA access patterns.
+
+**H8 (Analytical):**  
+Correlate CPU iowait% with storage-bound tail latency.
+
+---
+
+## Harness Architecture
+
+The architecture separates the **baseline (no-LoRA)** server from the **multi-adapter LoRA** server.
+
+### Baseline Server (OpenAI API)
+
+- Runs on **port 8355**
+- Launched via `serve_llama33_70b_fp4.sh`
+- Used for **H0, H2, H4**
+
+### LoRA Server (Triton API)
+
+- Runs on **port 8000**
+- Launched via `launch_triton_server.sh`
+- Used for **H1, H5, H6**
 
 ```
 /harness/
-├── src/                # Core tools: sysmon.sh, loadgen.py (v2.3)
-├── runs/               # Orchestration scripts (v2.5)
-│   ├── model_env.sh    # NEW: Sets paths for L8B or L70B
-│   ├── run_H0_...sh
-│   ├── run_H1_...sh
-│   ├── run_H2_...sh
-│   └── run_H6_...sh
-├── inputs/             # Static data: prompts/, lora_adapters/
-├── results/            # (Git-ignored) RAW DATA
-├── analysis/           # Analysis tools
-│   └── figures/        # (Git-ignored) Final plots
+├── src/
+│   ├── loadgen.py          # Async load generator (Updated for H5)
+│   └── sysmon.sh           # System telemetry collector
+├── runs/
+│   ├── _lib_quiescence.sh  # System prep (drop caches, etc.)
+│   ├── model_env.sh        # Sets L8B/L70B paths
+│   │
+│   ├── run_H0_queue_knee.sh
+│   ├── run_H1_coldwarm_lora.sh
+│   ├── run_H2_uma_pressure.sh
+│   ├── run_H4_storage_qos.sh    # NEW SCRIPT
+│   ├── run_H5_lora_scaling.sh   # NEW SCRIPT
+│   └── run_H6_workload_ab.sh
 │
-├── setup_triton_server_llama.sh # NEW (v2.5): Builds Llama engine
-└── launch_triton_server.sh      # NEW (v2.5): Launches Triton server
+├── inputs/
+│   ├── prompts/             # .txt files for different context lengths
+│   └── lora_adapters/
+│       ├── lora_list.txt        # 4 adapters (H1, H6, H5-Small)
+│       ├── lora_list_16.txt     # NEW: 16 adapters (H5-Medium)
+│       └── lora_list_64.txt     # NEW: 64 adapters (H5-Large)
+│
+├── analysis/
+│   ├── backfill_summary.py  # Updated
+│   └── process_results.py   # Updated for H4, H5
+│
+├── results/                 # (Git-ignored) Raw data
+├── analysis/figures/        # (Git-ignored) Final plots
+│
+├── serve_llama33_70b_fp4.sh # Baseline server (OpenAI API @ 8355)
+└── launch_triton_server.sh  # LoRA server (Triton API @ 8000)
 ```
 
 ---
 
-## Quick Start: The v2.5 Workflow
+## Load Generator (src/loadgen.py)
+
+- Automatically chooses the baseline OpenAI API unless `--lora-list` is supplied or `--api-mode` overrides the selection.
+- `--api-mode triton` lets you hit the Triton server even without LoRA adapters (used by H6 Baseline to keep both phases symmetric).
+- `--lora-session random|sticky` controls adapter churn for H5.
+- Summaries now capture additional telemetry placeholders (`io_wait_pct`, `r_await_ms`, `rps_storage`) that are backfilled by `analysis/backfill_summary.py`.
+
+---
+
+## Test Execution Workflow (v2.5)
 
 ### Step 1: Launch Harness Container
-
-In Terminal 1, launch your persistent `spark-harness:v1` container (which has sysstat, fio, pandas, etc. installed).
 
 ```bash
 # (On the host - Terminal 1)
@@ -52,106 +122,98 @@ docker run --gpus all -it --rm \
 
 ---
 
-### Step 2: Build Engines
+## Step 2: Run Baseline (No-LoRA) Tests — H0, H2, H4
 
-On the host (Terminal 2), you must build the TRT-LLM engines once for each model. This will take time.
+These tests target the baseline server on **port 8355**.
 
-```bash
-# (On the host - Terminal 2)
-cd ~/dgx_spark_harness
-
-# Build the 8B engine
-bash ./setup_triton_server_llama.sh L8B
-
-# Build the 70B engine (this will take a while)
-bash ./setup_triton_server_llama.sh L70B
-```
-
----
-
-### Step 3: Run the 8B (L8B) Test Suite
-
-This is an “end-to-end” flow for testing the 8B model.
-
-#### A. Launch the 8B Triton Server (Terminal 2)
+### A. Launch the Baseline 70B Server (Terminal 2)
 
 ```bash
 # (On the host - Terminal 2)
 cd ~/dgx_spark_harness
-bash ./launch_triton_server.sh L8B
-```
 
-Leave this terminal running. You will see the Triton logs here.
-
-#### B. Run the 8B Tests (Harness Container — Terminal 1)
-
-```bash
-# (Inside Harness Container - Terminal 1)
-cd /harness/runs
-
-# 1. Calibrate the 8B server
-bash ./run_H0_queue_knee.sh L8B
-
-# 2. Find the 8B UMA/storage bottleneck
-bash ./run_H2_uma_pressure.sh L8B
-
-# 3. Run the 8B LoRA A/B test
-bash ./run_H6_workload_ab.sh L8B
-
-# 4. Run the 8B LoRA Cold/Warm test
-bash ./run_H1_coldwarm_lora.sh L8B
-```
-
-#### C. Stop the 8B Server (Terminal 2)
-
-Press **Ctrl+C** in Terminal 2 to stop the Triton server.
-
----
-
-### Step 4: Run the 70B (L70B) Test Suite
-
-Now, repeat the process for the “hero” 70B model.
-
-#### A. Launch the 70B Triton Server (Terminal 2)
-
-```bash
-# (On the host - Terminal 2)
-cd ~/dgx_spark_harness
-bash ./launch_triton_server.sh L70B
+# Starts the server on port 8355
+bash ./serve_llama33_70b_fp4.sh
 ```
 
 Leave this running.
 
-#### B. Run the 70B Tests (Harness Container — Terminal 1)
+### B. Run the Baseline Tests (Terminal 1)
 
 ```bash
 # (Inside Harness Container - Terminal 1)
 cd /harness/runs
 
+# 1. Calibrate queue knee (H0)
 bash ./run_H0_queue_knee.sh L70B
+
+# 2. Find the UMA paging knee (H2)
 bash ./run_H2_uma_pressure.sh L70B
-bash ./run_H6_workload_ab.sh L70B
-bash ./run_H1_coldwarm_lora.sh L70B
+
+# 3. Run the Storage QoS test (H4)
+# Requires the paging regime found in H2
+bash ./run_H4_storage_qos.sh L70B
 ```
 
-#### C. Stop the 70B Server (Terminal 2)
+### C. Stop Baseline Server (Terminal 2)
 
 Press **Ctrl+C**.
 
 ---
 
-### Step 5: Analyze All Results
+## Step 3: Run LoRA-Based Tests — H1, H5, H6
 
-You have now collected all data for both models.
+These use the Triton LoRA server on **port 8000**.
+
+### A. Launch the 70B Triton LoRA Server (Terminal 2)
+
+```bash
+# (On the host - Terminal 2)
+cd ~/dgx_spark_harness
+
+bash ./launch_triton_server.sh L70B
+```
+
+Leave this running.  
+The server must be restarted when prompted by H1 and H5 scripts.
+
+### B. Run the LoRA Tests (Terminal 1)
+
+```bash
+# (Inside Harness Container - Terminal 1)
+cd /harness/runs
+
+# 1. LoRA Cold/Warm (H1)
+# *** This script will ask you to restart the server in Terminal 2 ***
+bash ./run_H1_coldwarm_lora.sh L70B
+
+# 2. LoRA Storm A/B (H6)
+bash ./run_H6_workload_ab.sh L70B
+
+# 3. LoRA Scaling (H5)
+# *** This script will ask for multiple server restarts ***
+bash ./run_H5_lora_scaling.sh L70B
+```
+
+### C. Stop the LoRA Server (Terminal 2)
+
+Press **Ctrl+C**.
+
+---
+
+## Step 4: Analyze All Results
 
 ```bash
 # (Inside Harness Container - Terminal 1)
 cd /harness/analysis
 
-# Run ALL analysis and generate ALL plots
+# Generate ALL plots for L70B
 python3 ./process_results.py ALL
 ```
 
-This will create all plots (H0, H1, H2, H6, etc.) in `analysis/figures/`.
+This will create all plots (H0, H1, H2, H4, H5, H6, etc.) in:
 
-The `process_results.py` script (v2.3) is already smart enough to create **separate plots for L8B and L70B** data by reading the `model_tag` from the manifest.
+```
+analysis/figures/L70B/
+analysis/figures/tables/L70B/
+```

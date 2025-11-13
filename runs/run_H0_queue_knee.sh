@@ -3,7 +3,7 @@ set -euo pipefail
 
 # runs/run_H0_queue_knee.sh
 # Runs H0 (Calibration) test to find the server's application queue knee.
-# This test MUST run against the Triton server (port 8000).
+# This test MUST run against the baseline OpenAI-compatible server (port 8355).
 
 # Paths & defaults
 export HARNESS_DIR=${HARNESS_DIR:-/harness}
@@ -14,8 +14,9 @@ export ANALYSIS_DIR=${ANALYSIS_DIR:-$HARNESS_DIR/analysis}
 export NVME_DEVICE=${NVME_DEVICE:-nvme0n1}
 export MASTER_LOG=${MASTER_LOG:-$HARNESS_DIR/master_run.log}
 
-# 70B NVFP4 model
-export MODEL_HANDLE="nvidia/Llama-3.3-70B-Instruct-FP4"
+# --- Model selection (default L70B) ---
+MODEL_TARGET=${1:-L70B}
+source "$HARNESS_DIR/runs/model_env.sh" "$MODEL_TARGET"
 
 source "$HARNESS_DIR/runs/_lib_quiescence.sh"
 
@@ -27,8 +28,8 @@ PROMPT_FILE="$INPUTS_DIR/prompts/256_tokens.txt" # Use a small, standard prompt
 MAX_TOKENS=32
 
 mkdir -p "$RESULTS_DIR"
-echo "--- RUNNING H0 (Queue Knee Calibration) ---" | tee -a "$MASTER_LOG"
-read -p "Ensure the TRITON (LoRA) server is running on port 8000. Press Enter to continue..."
+echo "--- RUNNING H0 (Queue Knee Calibration) for $MODEL_TAG_SHORT ---" | tee -a "$MASTER_LOG"
+read -p "Ensure the BASELINE server (OpenAI API on port 8355) is running for $MODEL_TAG_SHORT. Press Enter to continue..."
 
 if [[ ! -f "$PROMPT_FILE" ]]; then
     echo "ERROR: Base prompt file not found: $PROMPT_FILE" | tee -a "$MASTER_LOG"
@@ -38,7 +39,7 @@ PROMPT_SHA=$(sha256sum "$PROMPT_FILE" | awk '{print $1}')
 
 for U in "${USERS_LIST[@]}"; do
   for r in $(seq 1 $REPEAT); do
-    RUN_ID="$(date -u +%Y%m%d_%H%M)_${HYP}_U${U}_r${r}"
+    RUN_ID="$(date -u +%Y%m%d_%H%M)_${HYP}_${MODEL_TAG_SHORT}_U${U}_r${r}"
     export RUN_ID
     echo "Starting run: $RUN_ID" | tee -a "$MASTER_LOG"
 
@@ -48,6 +49,8 @@ for U in "${USERS_LIST[@]}"; do
   "run_id":"${RUN_ID}",
   "timestamp_utc":"$(date -u +%Y%m%dT%H:%M:%SZ)",
   "hypothesis":"${HYP}",
+  "model_handle":"${MODEL_HANDLE}",
+  "model_tag":"${MODEL_TAG_SHORT}",
   "engine_profile": "bs256_ctx2k",
   "concurrency_users": ${U},
   "run_duration_sec": ${DUR},

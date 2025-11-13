@@ -37,16 +37,27 @@ def backfill_summary(run_id):
 
         df_telemetry = pd.read_csv(telemetry_path)
         
-        # Compute averages from telemetry, handling potential NA values
+        # --- UPDATED: Compute more averages from telemetry ---
         avg_io_wait = df_telemetry['vm_wa'].mean()
         avg_qu_sz = df_telemetry['iostat_avg_qu_sz'].mean()
         avg_gpu_util = df_telemetry['gpu_util_pct'].mean()
+        # Add metrics for H4/H5 plotting
+        avg_r_await = df_telemetry['iostat_await_ms'].mean()
+        avg_rps_storage = df_telemetry['iostat_rps'].mean()
+
 
         # Update the 'avg' block
-        # Keep 'rps' from loadgen, overwrite the others
-        summary_data['avg']['io_wait_pct'] = round(avg_io_wait, 2) if pd.notna(avg_io_wait) else None
-        summary_data['avg']['qu_sz'] = round(avg_qu_sz, 2) if pd.notna(avg_qu_sz) else None
-        summary_data['avg']['gpu_util_pct'] = round(avg_gpu_util, 2) if pd.notna(avg_gpu_util) else None
+        # Keep 'rps' (application throughput) from loadgen
+        avg_block = summary_data.setdefault('avg', {})
+        avg_block['rps'] = summary_data.get('throughput_rps') # Ensure 'rps' is in avg block
+        avg_block['io_wait_pct'] = round(avg_io_wait, 2) if pd.notna(avg_io_wait) else None
+        avg_block['qu_sz'] = round(avg_qu_sz, 2) if pd.notna(avg_qu_sz) else None
+        avg_block['gpu_util_pct'] = round(avg_gpu_util, 2) if pd.notna(avg_gpu_util) else None
+        avg_block['r_await_ms'] = round(avg_r_await, 2) if pd.notna(avg_r_await) else None
+        avg_block['rps_storage'] = round(avg_rps_storage, 2) if pd.notna(avg_rps_storage) else None
+        
+        summary_data['avg'] = avg_block
+        # --- End update ---
 
         # Write the updated summary back
         with open(summary_path, 'w') as f:

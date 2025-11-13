@@ -32,3 +32,7 @@ fio_test_file.dat
 # Model files
 
 model_repository/
+
+# Serving files
+
+trt_engine_bs256/

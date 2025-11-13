@@ -62,8 +62,9 @@ EOF
   NVME_DEVICE="${NVME_DEVICE}" RUN_ID="${RUN_ID}" "${SRC_DIR}/sysmon.sh" & SYSMON_PID=$!
   mpstat -P ALL 1 "${DUR}" > "${RESULTS_DIR}/${RUN_ID}_mpstat.log" 2>/dev/null & MPSTAT_PID=$!
   
-  # Loadgen (Baseline: NO --lora-list)
-  "${SRC_DIR}/loadgen.py" --run-id "${RUN_ID}" -U ${U} -P "$PROMPT_PATH" --duration ${DUR} || true
+  # Loadgen (Baseline path, but still target Triton to match LoRA phase)
+  "${SRC_DIR}/loadgen.py" --run-id "${RUN_ID}" -U ${U} -P "$PROMPT_PATH" --duration ${DUR} \
+    --api-mode triton || true
 
   smartctl -a "/dev/${NVME_DEVICE}" > "${RESULTS_DIR}/${RUN_ID}_smartctl_post.txt" 2>/dev/null || true
   kill "${SYSMON_PID}" 2>/dev/null || true; wait "${SYSMON_PID}" 2>/dev/null || true
@@ -100,7 +101,8 @@ EOF
 
   # Loadgen (LoRA Storm: ADD --lora-list)
   "${SRC_DIR}/loadgen.py" --run-id "${RUN_ID}" -U ${U} -P "$PROMPT_PATH" --duration ${DUR} \
-    --lora-list "$LORA_LIST_FILE" || true
+    --lora-list "$LORA_LIST_FILE" \
+    --api-mode triton || true
 
   smartctl -a "/dev/${NVME_DEVICE}" > "${RESULTS_DIR}/${RUN_ID}_smartctl_post.txt" 2>/dev/null || true
   kill "${SYSMON_PID}" 2>/dev/null || true; wait "${SYSMON_PID}" 2>/dev/null || true

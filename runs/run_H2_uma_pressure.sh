@@ -41,7 +41,7 @@ declare -a MAX_TOKENS_LIST=(
 
 mkdir -p "$RESULTS_DIR"
 echo "--- RUNNING H2 (UMA Pressure Sweep) for $MODEL_TAG_SHORT ---" | tee -a "$MASTER_LOG"
-read -p "Ensure the TRITON server for $MODEL_TAG_SHORT is running on port 8000. Press Enter to continue..."
+read -p "Ensure the BASELINE server (OpenAI API on port 8355) for $MODEL_TAG_SHORT is running. Press Enter to continue..."
 
 for i in "${!PROMPTS[@]}"; do
   PROMPT_FILE="${PROMPTS[$i]}"
@@ -87,12 +87,13 @@ EOF
     NVME_DEVICE="${NVME_DEVICE}" RUN_ID="${RUN_ID}" "${SRC_DIR}/sysmon.sh" & SYSMON_PID=$!
     mpstat -P ALL 1 "${DUR}" > "${RESULTS_DIR}/${RUN_ID}_mpstat.log" 2>/dev/null & MPSTAT_PID=$!
 
-    # Run loadgen (v2.3) - NO --lora-list flag
+    # Run loadgen against the baseline server (OpenAI API)
     "${SRC_DIR}/loadgen.py" --run-id "${RUN_ID}" \
       -U "${U_WORK}" \
       -P "$PROMPT_FILE" \
       --max-tokens ${MAX_TOKENS} \
-      --duration "${DUR}" || true
+      --duration "${DUR}" \
+      --api-mode openai || true
 
     smartctl -a "/dev/${NVME_DEVICE}" > "${RESULTS_DIR}/${RUN_ID}_smartctl_post.txt" 2>/dev/null || true
     kill "${SYSMON_PID}" 2>/dev/null || true; wait "${SYSMON_PID}" 2>/dev/null || true
