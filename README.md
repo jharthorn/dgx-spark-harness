@@ -156,6 +156,8 @@ bash ./run_H2_uma_pressure.sh L70B
 bash ./run_H4_storage_qos.sh L70B
 ```
 
+> **H2 sweep note:** `run_H2_uma_pressure.sh` now drives inputs up to 8K tokens (plus generated output) using the larger prompt files under `inputs/prompts/`. Allow each phase to finish so the run reaches the UMA paging regime before moving on to H4.
+
 ### C. Stop Baseline Server (Terminal 2)
 
 Press **Ctrl+C**.

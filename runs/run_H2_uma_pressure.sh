@@ -25,18 +25,24 @@ U_WORK=64 # U_work from H0 (e.g., 64)
 REPEAT=3
 
 # Define the context sweeps (Prompt File, Max_Tokens)
-# Note: Engine is built for max_input_len=2048, max_seq_len=3072
+# v2.5: Expand sweep to force UMA paging (up to 8K tokens inputs)
 declare -a PROMPTS=(
     "$INPUTS_DIR/prompts/256_tokens.txt"
     "$INPUTS_DIR/prompts/512_tokens.txt"
     "$INPUTS_DIR/prompts/1024_tokens.txt"
     "$INPUTS_DIR/prompts/1536_tokens.txt"
+    "$INPUTS_DIR/prompts/2k_tokens.txt"
+    "$INPUTS_DIR/prompts/4k_tokens.txt"
+    "$INPUTS_DIR/prompts/8k_tokens.txt"
 )
 declare -a MAX_TOKENS_LIST=(
     256
     512
     512
     512
+    512
+    256
+    128
 )
 
 mkdir -p "$RESULTS_DIR"
