@@ -28,7 +28,7 @@ def env_path(name: str, default: Path | str) -> Path:
 HARNESS_DIR = env_path("HARNESS_DIR", "/harness")
 DEFAULT_RESULTS_DIR = env_path("RESULTS_DIR", HARNESS_DIR / "results")
 DEFAULT_FIGURES_DIR = env_path("FIGURES_DIR", HARNESS_DIR / "analysis/figures")
-DEFAULT_TABLES_DIR = env_path("TABLES_DIR", DEFAULT_FIGURES_DIR / "tables")
+DEFAULT_TABLES_DIR = env_path("TABLES_DIR", HARNESS_DIR / "analysis/tables")
 
 
 CONTEXT_RE = re.compile(r"(?P<input>\d+)_tokens_gen(?P<output>\d+)")

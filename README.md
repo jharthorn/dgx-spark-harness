@@ -79,13 +79,14 @@ The architecture separates the **baseline (no-LoRA)** server from the **multi-ad
 │       ├── lora_list.txt        # 4 adapters (H1, H6, H5-Small)
 │       ├── lora_list_16.txt     # NEW: 16 adapters (H5-Medium)
 │       └── lora_list_64.txt     # NEW: 64 adapters (H5-Large)
-│
+│ 
 ├── analysis/
 │   ├── backfill_summary.py  # Updated
-│   └── process_results.py   # Updated for H4, H5
+│   ├── process_results.py   # Updated for H4, H5
+│   ├── figures/             # (Git-ignored) Final plots
+│   └── tables/              # (Git-ignored) Final tables
 │
 ├── results/                 # (Git-ignored) Raw data
-├── analysis/figures/        # (Git-ignored) Final plots
 │
 ├── serve_llama33_70b_fp4.sh # Baseline server (OpenAI API @ 8355)
 └── launch_triton_server.sh  # LoRA server (Triton API @ 8000)

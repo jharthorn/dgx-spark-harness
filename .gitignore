@@ -8,9 +8,10 @@ __pycache__/
 
 results/
 
-# Generated plot images
+# Generated plot images & tables
 
 analysis/figures
+analysis/tables
 
 # Master log file
 
