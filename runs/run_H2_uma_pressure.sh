@@ -10,6 +10,10 @@ set -euo pipefail
 
 # Paths & defaults
 export HARNESS_DIR=${HARNESS_DIR:-/harness}
+if [[ ! -d "$HARNESS_DIR" ]]; then
+  SCRIPT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+  export HARNESS_DIR="$SCRIPT_ROOT"
+fi
 export SRC_DIR=${SRC_DIR:-$HARNESS_DIR/src}
 export RESULTS_DIR=${RESULTS_DIR:-$HARNESS_DIR/results}
 export INPUTS_DIR=${INPUTS_DIR:-$HARNESS_DIR/inputs}
@@ -24,7 +28,7 @@ source "$HARNESS_DIR/runs/_lib_quiescence.sh"
 
 HYP=H2
 DUR=300
-U_WORK=64 # U_work from H0 (e.g., 64)
+U_WORK=32 # U_work from H0 (e.g., 64)
 REPEAT=3
 
 # Define the context sweeps (Prompt File, Max_Tokens)
