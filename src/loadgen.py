@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import random
+import string
 import sys
 import time
 from dataclasses import dataclass, field
@@ -153,6 +154,22 @@ def load_adapters(lora_list: Optional[str]) -> list[str]:
     return adapters
 
 
+NONCE_ALPHABET = string.ascii_uppercase + string.digits
+NONCE_LENGTH = 12
+NONCE_TEMPLATE = "\n\n[KV-NONCE:{}]\n"
+
+
+def _generate_nonce(rng: random.Random) -> str:
+    return "".join(rng.choice(NONCE_ALPHABET) for _ in range(NONCE_LENGTH))
+
+
+def append_nonce(prompt: str, rng: random.Random) -> str:
+    """Returns prompt with a fixed-length nonce appended to defeat KV cache."""
+    nonce = _generate_nonce(rng)
+    trimmed = prompt.rstrip("\n")
+    return f"{trimmed}{NONCE_TEMPLATE.format(nonce)}"
+
+
 def build_payload(
     args: argparse.Namespace, prompt: str, adapter: Optional[str], api: ApiConfig
 ) -> dict:
@@ -226,8 +243,10 @@ async def worker(
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         while time.monotonic() < deadline:
-            prompt = rng.choice(prompts)
-            
+            prompt_text = rng.choice(prompts)
+            if args.use_nonce:
+                prompt_text = append_nonce(prompt_text, rng)
+
             # Select adapter for *this* request
             chosen_adapter: Optional[str] = None
             if adapters:
@@ -235,11 +254,8 @@ async def worker(
                     chosen_adapter = sticky_adapter
                 else:  # 'random' (Stormy)
                     chosen_adapter = rng.choice(adapters)
-            
-            # If no adapters were loaded (e.g. H0, H2, H4), chosen_adapter remains None.
-            # This is correct for the OpenAI API path.
 
-            payload = build_payload(args, prompt, chosen_adapter, api)
+            payload = build_payload(args, prompt_text, chosen_adapter, api)
             collected.append(
                 await stream_request(client, payload, api=api, timeout=timeout)
             )
@@ -329,6 +345,8 @@ async def run_loadgen(args: argparse.Namespace) -> None:
     logging.info("API Mode: %s (%s)", api.name.upper(), api.url)
     if adapters:
         logging.info("LoRA Mode: %s sessions", args.lora_session.upper())
+    if args.use_nonce:
+        logging.info("KV-cache nonce enabled; prompts will include fixed-length tags.")
         
     prompts = read_prompt_files(args.prompt_file or [])
     logging.info(
@@ -385,6 +403,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["auto", "openai", "triton"],
         default="auto",
         help="Override API selection. Use 'triton' to hit the LoRA server without adapters.",
+    )
+    parser.add_argument(
+        "--use-nonce",
+        action="store_true",
+        help="Append a constant-length nonce to each prompt to defeat KV cache reuse.",
     )
     parser.add_argument(
         "--duration",

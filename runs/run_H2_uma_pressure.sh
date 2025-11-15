@@ -2,6 +2,9 @@
 set -euo pipefail
 
 # v2.5: Parameterized model tag
+# Summary:
+#   * H2 attaches per-request nonces to defeat KV cache sharing (see --use-nonce).
+#   * Default sweep caps prompts at 4K tokens until the engine is rebuilt for longer contexts.
 # Usage: ./run_H2_uma_pressure.sh L8B
 #    or: ./run_H2_uma_pressure.sh L70B
 
@@ -25,7 +28,7 @@ U_WORK=64 # U_work from H0 (e.g., 64)
 REPEAT=3
 
 # Define the context sweeps (Prompt File, Max_Tokens)
-# v2.5: Expand sweep to force UMA paging (up to 8K tokens inputs)
+# v2.5: Expand sweep to force UMA paging (up to 4K tokens inputs; extend after engine rebuild)
 declare -a PROMPTS=(
     "$INPUTS_DIR/prompts/256_tokens.txt"
     "$INPUTS_DIR/prompts/512_tokens.txt"
@@ -33,15 +36,13 @@ declare -a PROMPTS=(
     "$INPUTS_DIR/prompts/1536_tokens.txt"
     "$INPUTS_DIR/prompts/2k_tokens.txt"
     "$INPUTS_DIR/prompts/4k_tokens.txt"
-    "$INPUTS_DIR/prompts/8k_tokens.txt"
 )
 declare -a MAX_TOKENS_LIST=(
     256
     512
     512
     512
-    512
-    256
+    384
     128
 )
 
@@ -99,7 +100,8 @@ EOF
       -P "$PROMPT_FILE" \
       --max-tokens ${MAX_TOKENS} \
       --duration "${DUR}" \
-      --api-mode openai || true
+      --api-mode openai \
+      --use-nonce || true
 
     smartctl -a "/dev/${NVME_DEVICE}" > "${RESULTS_DIR}/${RUN_ID}_smartctl_post.txt" 2>/dev/null || true
     kill "${SYSMON_PID}" 2>/dev/null || true; wait "${SYSMON_PID}" 2>/dev/null || true

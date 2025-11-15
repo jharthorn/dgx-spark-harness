@@ -99,7 +99,44 @@ The architecture separates the **baseline (no-LoRA)** server from the **multi-ad
 - Automatically chooses the baseline OpenAI API unless `--lora-list` is supplied or `--api-mode` overrides the selection.
 - `--api-mode triton` lets you hit the Triton server even without LoRA adapters (used by H6 Baseline to keep both phases symmetric).
 - `--lora-session random|sticky` controls adapter churn for H5.
+- `--use-nonce` appends a fixed-length random tag to every prompt to defeat KV-cache sharing without changing request token counts (H2 enables this by default).
 - Summaries now capture additional telemetry placeholders (`io_wait_pct`, `r_await_ms`, `rps_storage`) that are backfilled by `analysis/backfill_summary.py`.
+
+---
+
+## Rebuilding the Triton / TRT-LLM Engine
+
+If you need longer context lengths (e.g., to push H2 past its current 8K token limit), rebuild the engine and refresh the model repository:
+
+```bash
+# Example: Rebuild the 70B engine for 16K input / 32K total sequence
+HF_TOKEN=... ./setup_triton_server_llama.sh L70B \
+  --max-input-len 16384 \
+  --max-seq-len 32768
+```
+
+What the script does:
+
+1. Launches the TensorRT-LLM build container specified by `TRT_LLM_IMAGE`.
+2. Downloads the HF checkpoint (uses `HF_TOKEN` and `HF_CACHE`).
+3. Runs `trtllm-build` with the requested lengths, writing the engine to `trt_engine_<MODEL>_ctx<LEN>/`.
+4. Copies the artifacts into `model_repository/tensorrt_llm/1` and updates the ensemble config.
+5. Prints a reminder to restart `serve_llama33_70b_fp4.sh` or `launch_triton_server.sh`.
+
+You can override defaults with:
+
+- `--engine-dir /path/to/custom_engine`
+- `TRT_LLM_IMAGE` – alternate container tag
+- `MODEL_REPO_TARGET` – custom Triton repo subdirectory
+
+Once rebuilt, rerun the relevant H2/H4/H5 workflows to exercise the larger contexts.
+
+### Extending H2 after a rebuild
+
+1. Rebuild the engine with the desired context lengths using `setup_triton_server_llama.sh` (as shown above), then restart the baseline server on port 8355.
+2. Update `runs/run_H2_uma_pressure.sh` to add larger prompt files (e.g., 8K/16K) and matching generation budgets, then rerun H2. Keep `--use-nonce` enabled so every user request stays token-unique even at the new lengths.
+
+The default H2 sweep in this repository remains capped at 4K until you complete the rebuild/extension steps above.
 
 ---
 
@@ -156,7 +193,7 @@ bash ./run_H2_uma_pressure.sh L70B
 bash ./run_H4_storage_qos.sh L70B
 ```
 
-> **H2 sweep note:** `run_H2_uma_pressure.sh` now drives inputs up to 8K tokens (plus generated output) using the larger prompt files under `inputs/prompts/`. Allow each phase to finish so the run reaches the UMA paging regime before moving on to H4.
+> **H2 sweep note:** `run_H2_uma_pressure.sh` now drives inputs up to 4K tokens (plus generated output) using the larger prompt files under `inputs/prompts/` and appends a nonce to every prompt so per-user KV cache entries stay unique. Higher prompt files (8K+) exceed the current inference server token limit, so rebuild the engine (see below) before extending the sweep past 4K.
 
 ### C. Stop Baseline Server (Terminal 2)
 

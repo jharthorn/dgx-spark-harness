@@ -33,6 +33,52 @@ DEFAULT_TABLES_DIR = env_path("TABLES_DIR", HARNESS_DIR / "analysis/tables")
 
 CONTEXT_RE = re.compile(r"(?P<input>\d+)_tokens_gen(?P<output>\d+)")
 
+OUTPUT_ROOTS: set[Path] = {
+    DEFAULT_FIGURES_DIR.resolve(),
+    DEFAULT_TABLES_DIR.resolve(),
+}
+
+
+def register_output_root(path: Path) -> None:
+    """Registers an output directory whose descendants may be chowned."""
+    try:
+        OUTPUT_ROOTS.add(path.resolve())
+    except FileNotFoundError:
+        OUTPUT_ROOTS.add(path.parent.resolve())
+
+
+def _is_within_allowed_roots(path: Path) -> bool:
+    resolved = path.resolve()
+    return any(resolved == root or root in resolved.parents for root in OUTPUT_ROOTS)
+
+
+def _target_owner() -> tuple[int, int]:
+    sudo_uid = os.environ.get("SUDO_UID")
+    sudo_gid = os.environ.get("SUDO_GID")
+    try:
+        if sudo_uid is not None and sudo_gid is not None:
+            return int(sudo_uid), int(sudo_gid)
+    except ValueError:
+        pass
+    return os.getuid(), os.getgid()
+
+
+def adjust_artifact_permissions(path: Path) -> None:
+    """If run via sudo, ensure artifacts are owned by the invoking user."""
+    try:
+        resolved = path.resolve()
+    except FileNotFoundError:
+        return
+    if not _is_within_allowed_roots(resolved):
+        return
+    uid, gid = _target_owner()
+    try:
+        os.chown(resolved, uid, gid)
+    except PermissionError:
+        logging.debug("Permission denied while chowning %s", resolved)
+    except FileNotFoundError:
+        pass
+
 # -----------------------------------------------------------------------------
 # Data access layer
 
@@ -171,7 +217,9 @@ def parse_mpstat(path: Path) -> pd.DataFrame:
 
 
 def ensure_output_dir(path: Path) -> Path:
+    register_output_root(path)
     path.mkdir(parents=True, exist_ok=True)
+    adjust_artifact_permissions(path)
     return path
 
 
@@ -189,6 +237,7 @@ def export_table(
     ensure_output_dir(tables_dir)
     table_path = tables_dir / filename
     df.to_csv(table_path, index=index, index_label=index_label)
+    adjust_artifact_permissions(table_path)
     logging.info("Wrote table %s", table_path)
 
 
@@ -259,6 +308,7 @@ def plot_h0(repo: RunRepository, run_ids: Sequence[str], out_dir: Path, tables_d
     output = out_dir / f"h0_queue_knee_{model_tag}.png"
     plt.tight_layout()
     plt.savefig(output, dpi=160)
+    adjust_artifact_permissions(output)
     plt.close(fig)
     logging.info("Wrote %s", output)
     return True
@@ -296,6 +346,7 @@ def plot_h1(repo: RunRepository, run_ids: Sequence[str], out_dir: Path, tables_d
     output = out_dir / f"h1_coldwarm_lora_{model_tag}.png"
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(output, dpi=160)
+    adjust_artifact_permissions(output)
     plt.close(fig)
     logging.info("Wrote %s", output)
     return True
@@ -335,6 +386,7 @@ def plot_h2(repo: RunRepository, run_ids: Sequence[str], out_dir: Path, tables_d
     output = out_dir / f"h2_uma_pressure_hockey_stick_{model_tag}.png"
     plt.tight_layout()
     plt.savefig(output, dpi=160)
+    adjust_artifact_permissions(output)
     plt.close(fig)
     logging.info("Wrote %s", output)
     return True
@@ -384,6 +436,7 @@ def plot_h4(repo: RunRepository, run_ids: Sequence[str], out_dir: Path, tables_d
     output = out_dir / f"h4_storage_qos_{model_tag}.png"
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(output, dpi=160)
+    adjust_artifact_permissions(output)
     plt.close(fig)
     logging.info("Wrote %s", output)
     return True
@@ -447,6 +500,7 @@ def plot_h5(repo: RunRepository, run_ids: Sequence[str], out_dir: Path, tables_d
     output = out_dir / f"h5_lora_scaling_{model_tag}.png"
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(output, dpi=160)
+    adjust_artifact_permissions(output)
     plt.close(fig)
     logging.info("Wrote %s", output)
     return True
@@ -488,6 +542,7 @@ def plot_h6(repo: RunRepository, run_ids: Sequence[str], out_dir: Path, tables_d
     output = out_dir / f"h6_workload_ab_{model_tag}.png"
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(output, dpi=160)
+    adjust_artifact_permissions(output)
     plt.close(fig)
     logging.info("Wrote %s", output)
     return True
@@ -585,6 +640,7 @@ def plot_h3(
     output = out_dir / f"h3_timeseries_{target}.png"
     plt.tight_layout(rect=[0, 0.03, 1, 0.98])
     plt.savefig(output, dpi=160)
+    adjust_artifact_permissions(output)
     plt.close(fig)
     logging.info("Wrote %s", output)
     return True
@@ -630,6 +686,7 @@ def plot_h7(repo: RunRepository, run_ids: Sequence[str], out_dir: Path, tables_d
     output = out_dir / f"h7_smartctl_deltas_{model_tag}.png"
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(output, dpi=160)
+    adjust_artifact_permissions(output)
     plt.close(fig)
     logging.info("Wrote %s", output)
     return True
@@ -673,6 +730,7 @@ def plot_h8(
     output = out_dir / f"h8_mpstat_{target}.png"
     plt.tight_layout()
     plt.savefig(output, dpi=160)
+    adjust_artifact_permissions(output)
     plt.close(fig)
     logging.info("Wrote %s", output)
     return True
