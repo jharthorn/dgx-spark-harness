@@ -1,77 +1,28 @@
 #!/usr/bin/env python3
-import json, sys, os
+"""Backfill helper scaffold (Test_Plan_v3.0 Appendix C)."""
+
+from __future__ import annotations
+
+import json
 from pathlib import Path
-import pandas as pd
-import numpy as np # Import numpy
 
-# analysis/backfill_summary.py
-# Reads a run's telemetry.csv and summary.json, computes telemetry averages,
-# and writes them back into the summary.json's 'avg' block.
-
-HARNESS_DIR = Path(os.environ.get("HARNESS_DIR", "/harness"))
-RESULTS_DIR = Path(os.environ.get("RESULTS_DIR", str(HARNESS_DIR / "results")))
-
-def backfill_summary(run_id):
-    """Computes telemetry averages and updates the summary.json file."""
-    
-    summary_path = RESULTS_DIR / f"{run_id}_summary.json"
-    telemetry_path = RESULTS_DIR / f"{run_id}_telemetry.csv"
-
-    if not summary_path.exists():
-        print(f"Error: Summary file not found: {summary_path}", file=sys.stderr)
-        return
-    
-    if not telemetry_path.exists():
-        print(f"Error: Telemetry file not found: {telemetry_path}", file=sys.stderr)
-        return
-
-    try:
-        # Read both files
-        with open(summary_path, 'r') as f:
-            summary_data = json.load(f)
-        
-        # Check if summary is just a dummy file (e.g., from a skipped H6 run)
-        if summary_data.get("requests_total", 0) == 0:
-             print(f"Skipping backfill for {run_id} (dummy summary file).")
-             return
-
-        df_telemetry = pd.read_csv(telemetry_path)
-        
-        # --- UPDATED: Compute more averages from telemetry ---
-        avg_io_wait = df_telemetry['vm_wa'].mean()
-        avg_qu_sz = df_telemetry['iostat_avg_qu_sz'].mean()
-        avg_gpu_util = df_telemetry['gpu_util_pct'].mean()
-        # Add metrics for H4/H5 plotting
-        avg_r_await = df_telemetry['iostat_await_ms'].mean()
-        avg_rps_storage = df_telemetry['iostat_rps'].mean()
+RUNS_ROOT = Path(__file__).resolve().parent.parent / "runs" / "v3"
 
 
-        # Update the 'avg' block
-        # Keep 'rps' (application throughput) from loadgen
-        avg_block = summary_data.setdefault('avg', {})
-        avg_block['rps'] = summary_data.get('throughput_rps') # Ensure 'rps' is in avg block
-        avg_block['io_wait_pct'] = round(avg_io_wait, 2) if pd.notna(avg_io_wait) else None
-        avg_block['qu_sz'] = round(avg_qu_sz, 2) if pd.notna(avg_qu_sz) else None
-        avg_block['gpu_util_pct'] = round(avg_gpu_util, 2) if pd.notna(avg_gpu_util) else None
-        avg_block['r_await_ms'] = round(avg_r_await, 2) if pd.notna(avg_r_await) else None
-        avg_block['rps_storage'] = round(avg_rps_storage, 2) if pd.notna(avg_rps_storage) else None
-        
-        summary_data['avg'] = avg_block
-        # --- End update ---
+def main() -> int:
+    for run_dir in RUNS_ROOT.glob("*"):
+        metrics_path = run_dir / "metrics.jsonl"
+        summary_path = run_dir / "summary.json"
+        if not metrics_path.exists():
+            continue
+        summary = {
+            "run_id": run_dir.name,
+            "metrics_path": str(metrics_path),
+            "note": "TODO: compute aggregates and persist for analysis pipeline.",
+        }
+        summary_path.write_text(json.dumps(summary, indent=2))
+    return 0
 
-        # Write the updated summary back
-        with open(summary_path, 'w') as f:
-            json.dump(summary_data, f, indent=2)
-            
-        print(f"Backfilled summary for {run_id}")
 
-    except Exception as e:
-        print(f"Error backfilling {run_id}: {e}", file=sys.stderr)
-
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <run_id_1> [run_id_2] ...", file=sys.stderr)
-        sys.exit(1)
-        
-    for run_id in sys.argv[1:]:
-        backfill_summary(run_id)
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

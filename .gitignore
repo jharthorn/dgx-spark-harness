@@ -4,6 +4,10 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Virtual Environment
+
+.venv/
+
 # Generated data, logs, and summaries
 
 results/

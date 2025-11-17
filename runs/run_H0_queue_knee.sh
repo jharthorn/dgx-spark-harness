@@ -1,88 +1,38 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# runs/run_H0_queue_knee.sh
-# Runs H0 (Calibration) test to find the server's application queue knee.
-# This test MUST run against the baseline OpenAI-compatible server (port 8355).
+# H0 queue knee (Test_Plan_v3.0 Section 8.0, Stack A)
 
-# Paths & defaults
-export HARNESS_DIR=${HARNESS_DIR:-/harness}
-export SRC_DIR=${SRC_DIR:-$HARNESS_DIR/src}
-export RESULTS_DIR=${RESULTS_DIR:-$HARNESS_DIR/results}
-export INPUTS_DIR=${INPUTS_DIR:-$HARNESS_DIR/inputs}
-export ANALYSIS_DIR=${ANALYSIS_DIR:-$HARNESS_DIR/analysis}
-export NVME_DEVICE=${NVME_DEVICE:-nvme0n1}
-export MASTER_LOG=${MASTER_LOG:-$HARNESS_DIR/master_run.log}
+HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+source "$HARNESS_DIR/runs/_lib.sh"
 
-# --- Model selection (default L70B) ---
-MODEL_TARGET=${1:-L70B}
-source "$HARNESS_DIR/runs/model_env.sh" "$MODEL_TARGET"
+ENDPOINT=${ENDPOINT:-${1:-http://stackA-baseline:8355/v1/completions}}
+STACK="stackA"
+MODEL="L70B"
+WORKLOAD="fixed_context"
+CTX=256
+DURATION=${DURATION:-120}
+CONCURRENCY_LIST=(8 16 32 64 96 128 160 192 224 256)
+RESULTS_BASE=${RESULTS_BASE:-$HARNESS_DIR/results}
 
-source "$HARNESS_DIR/runs/_lib_quiescence.sh"
+for U in "${CONCURRENCY_LIST[@]}"; do
+  RUN_ID="$(rt_ts)_H0_${STACK}_${MODEL}_U${U}"
+  RUN_DIR="$RESULTS_BASE/${RUN_ID}"
+  ensure_run_dir "$RUN_DIR"
 
-HYP=H0
-DUR=300
-USERS_LIST=("8" "16" "32" "64" "96" "128" "192")
-REPEAT=3
-PROMPT_FILE="$INPUTS_DIR/prompts/256_tokens.txt" # Use a small, standard prompt
-MAX_TOKENS=32
-
-mkdir -p "$RESULTS_DIR"
-echo "--- RUNNING H0 (Queue Knee Calibration) for $MODEL_TAG_SHORT ---" | tee -a "$MASTER_LOG"
-read -p "Ensure the BASELINE server (OpenAI API on port 8355) is running for $MODEL_TAG_SHORT. Press Enter to continue..."
-
-if [[ ! -f "$PROMPT_FILE" ]]; then
-    echo "ERROR: Base prompt file not found: $PROMPT_FILE" | tee -a "$MASTER_LOG"
-    exit 1
-fi
-PROMPT_SHA=$(sha256sum "$PROMPT_FILE" | awk '{print $1}')
-
-for U in "${USERS_LIST[@]}"; do
-  for r in $(seq 1 $REPEAT); do
-    RUN_ID="$(date -u +%Y%m%d_%H%M)_${HYP}_${MODEL_TAG_SHORT}_U${U}_r${r}"
-    export RUN_ID
-    echo "Starting run: $RUN_ID" | tee -a "$MASTER_LOG"
-
-    # Manifest
-    cat > "$RESULTS_DIR/${RUN_ID}_manifest.json" <<EOF
-{
-  "run_id":"${RUN_ID}",
-  "timestamp_utc":"$(date -u +%Y%m%dT%H:%M:%SZ)",
-  "hypothesis":"${HYP}",
-  "model_handle":"${MODEL_HANDLE}",
-  "model_tag":"${MODEL_TAG_SHORT}",
-  "engine_profile": "bs256_ctx2k",
-  "concurrency_users": ${U},
-  "run_duration_sec": ${DUR},
-  "max_tokens": ${MAX_TOKENS},
-  "sampling":{"temperature":0.0,"top_p":1.0,"seed":42},
-  "prompts_sha256":["${PROMPT_SHA}"],
-  "storage":{"device":"/dev/${NVME_DEVICE}","model":"$(cat /sys/block/${NVME_DEVICE}/device/model 2>/dev/null || echo unknown)","sched":"$(cat /sys/block/${NVME_DEVICE}/queue/scheduler 2>/dev/null || echo unknown)","read_ahead_kb":"$(cat /sys/block/${NVME_DEVICE}/queue/read_ahead_kb 2>/dev/null || echo unknown)"},
-  "os":{"kernel":"$(uname -r)","driver":"$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null || echo n/a)","dgx_os":"$(. /etc/os-release && echo $PRETTY_NAME 2>/dev/null || echo n/a)"},
-  "cpu":{"governor":"performance","isolation":"n/a"},
-  "saturated": false
-}
+  cat > "$RUN_DIR/config.yaml" <<EOF
+stack: ${STACK}
+model: ${MODEL}
+workload: ${WORKLOAD}
+context_tokens: ${CTX}
+concurrency: ${U}
+duration_s: ${DURATION}
+endpoint: ${ENDPOINT}
+nonce_per_user: false
+seed: 42
 EOF
 
-    smartctl -a "/dev/${NVME_DEVICE}" > "${RESULTS_DIR}/${RUN_ID}_smartctl_pre.txt" 2>/dev/null || true
-    NVME_DEVICE="${NVME_DEVICE}" RUN_ID="${RUN_ID}" "${SRC_DIR}/sysmon.sh" & SYSMON_PID=$!
-    mpstat -P ALL 1 "${DUR}" > "${RESULTS_DIR}/${RUN_ID}_mpstat.log" 2>/dev/null & MPSTAT_PID=$!
-
-    # Run loadgen (v2.3) - NO --lora-list flag
-    "${SRC_DIR}/loadgen.py" --run-id "${RUN_ID}" \
-      -U "${U}" \
-      -P "$PROMPT_FILE" \
-      --max-tokens ${MAX_TOKENS} \
-      --duration "${DUR}" || true
-
-    smartctl -a "/dev/${NVME_DEVICE}" > "${RESULTS_DIR}/${RUN_ID}_smartctl_post.txt" 2>/dev/null || true
-    kill "${SYSMON_PID}" 2>/dev/null || true; wait "${SYSMON_PID}" 2>/dev/null || true
-    kill "${MPSTAT_PID}" 2>/dev/null || true; wait "${MPSTAT_PID}" 2>/dev/null || true
-
-    "${ANALYSIS_DIR}/backfill_summary.py" "${RUN_ID}"
-    echo "Completed run: $RUN_ID" | tee -a "$MASTER_LOG"
-    sleep 5
-  done
+  start_sysmon "$RUN_DIR" "A"
+  python3 "$HARNESS_DIR/src/loadgen.py" --config "$RUN_DIR/config.yaml" --run-id "$RUN_ID" --output-dir "$RUN_DIR" --endpoint "${ENDPOINT}"
+  stop_sysmon "$RUN_DIR"
 done
-echo "--- H0 (Queue Knee Calibration) COMPLETE ---" | tee -a "$MASTER_LOG"
-run_fstrim

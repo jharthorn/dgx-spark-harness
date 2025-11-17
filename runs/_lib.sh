@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# v3 runner helper (Test_Plan_v3.0 Section 8 scaffolding)
+# Runner helper (Test_Plan_v3.0 Section 8 scaffolding)
 
 rt_ts() { date -u +"%Y%m%d_%H%M%S"; }
 
@@ -12,7 +12,7 @@ ensure_run_dir() {
 
 start_sysmon() {
   local run_dir=$1 stack_tag=$2
-  bash "$HARNESS_DIR/src/telemetry/sysmon_v3.sh" "$run_dir" "$stack_tag" >/dev/null 2>&1 &
+  bash "$HARNESS_DIR/src/telemetry/sysmon.sh" "$run_dir" "$stack_tag" >"$run_dir/sysmon.log" 2>&1 &
   echo $! > "$run_dir/sysmon.pid"
 }
 
