@@ -1,0 +1,31 @@
+# Stack B (Dynamo tiered KV) config per Test_Plan_v3.0.md Section 4.2
+stack: stackB_dynamo_tiered
+model:
+  name: llama3-70b
+  precision: fp4
+  max_num_tokens: 16384  # rebuilt engine recommended
+endpoint:
+  url: http://stackB-dynamo:9000/v1/completions  # Triton + Dynamo front-end
+  protocol: triton_dynamo
+runtime:
+  kv_sharing_enabled: true
+  dynamo:
+    kv_block_size_bytes: 131072           # plan Appendix example
+    eviction_policy: fifo
+    tier0:
+      type: hbm
+      capacity_bytes: 8GiB
+    tier1:
+      type: uma
+      capacity_bytes: 32GiB
+    tier2:
+      type: nvme
+      path: /nvme/dynamo_kv
+      allocate_bytes: 512GiB
+    telemetry_enable: true
+    telemetry_interval_ms: 5000
+telemetry:
+  collect_gpu: true
+  collect_nvme: true
+  collect_sysmon: true
+  collect_dynkv: true

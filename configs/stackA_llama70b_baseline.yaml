@@ -1,0 +1,17 @@
+# Stack A (UMA-only) config per Test_Plan_v3.0.md Section 4.1
+stack: stackA_uma_only
+model:
+  name: llama3-70b
+  precision: fp4
+  max_num_tokens: 8192  # server-side guardrail
+endpoint:
+  url: http://stackA-baseline:8355/v1/completions  # OpenAI-compatible TRT-LLM
+  protocol: openai_compatible
+runtime:
+  kv_sharing_enabled: false  # keep UMA runs clean for regressions
+  kv_cache_tiers: []         # no Dynamo tiering on Stack A
+  nonce_per_user: true       # defeat KV cache reuse during H2A calibration
+telemetry:
+  collect_gpu: true
+  collect_nvme: true
+  collect_sysmon: true
