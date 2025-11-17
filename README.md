@@ -64,6 +64,7 @@ docker run --gpus all -it --rm \
   -v /sys:/sys \
   -v /proc:/proc \
   -w /harness \
+  -e HF_TOKEN="$HF_TOKEN" \
   spark-harness:v1 \
   bash
 ```
