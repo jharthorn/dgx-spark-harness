@@ -30,6 +30,10 @@ Use v3 for all new work; keep v2.5 runnable for comparison.
 2) Launch a runner from `runs/v3/` (e.g., `run_H2A_uma_pressure.sh` or `run_H2B_dynamo_kv_pressure.sh`). Each script writes a run directory under `runs/v3/YYYYMMDD_*` containing `config.yaml`, `metrics.jsonl`, and telemetry stubs (`sysmon.jsonl`, `dynkv.jsonl` for Stack B).
 3) Analyze with `python3 analysis/process_results_v3.py` (writes summary CSVs to `analysis/figures/`).
 
+### Archiving runs
+
+Use `scripts/archive_results.sh [archive_name.tar.gz]` to bundle `results/`, `runs/v3`, `runs/v2.5`, and `analysis/figures/` into `archives/` for safekeeping or transfer.
+
 ## Legacy v2.5 Workflow
 
 The previous UMA paging/LoRA harness remains available (scripts under `runs/`, loadgen at `src/loadgen.py`, analysis at `analysis/process_results.py`). See `Test_Plan_v2.5.md` and the README_harness.md scaffold for details. Treat this track as non-canonical going forward.
