@@ -72,6 +72,7 @@ docker run --gpus all -it --rm \
 ## Stack Overview
 - **Stack A (UMA-only)**: TRT-LLM, KV sharing off, no Dynamo tiers. Endpoint default: 8355. Use `stackA_llama70b_baseline.yaml`.
 - **Stack B (Dynamo tiered KV)**: TRT-LLM + Dynamo KV manager with tier0 (hbm), tier1 (uma), tier2 (nvme). Endpoint default: 9000. Use `stackB_llama70b_dynamo_tiered.yaml`. Telemetry stubs exist; QoS/tier controls to be implemented.
+- **Stack B (8B testbed)**: Use `stackB_llama8b_dynamo_tiered.yaml` plus `serve_llama31_8b_fp4.sh` (or your own Dynamo front-end) for Llama 3.1 8B FP4 when 70B is too heavy.
 
 ## Prompt length guardrail (16k engine)
 
@@ -89,6 +90,10 @@ python3 src/loadgen.py \
 ```
 
 `--input_len_margin` subtracts a small safety cushion from `max_input_len` to account for BOS/metadata; adjust as needed. Runner `runs/run_H2A_uma_pressure.sh` will automatically inject `tokenizer/max_input_len/input_len_margin` when `MAX_INPUT_LEN` is exported. When `MAX_INPUT_LEN` is set, H2A enforces tokenizer-aware truncation; reported context lengths in plots should be derived from logged/tokenized counts rather than nominal prompt file size.
+
+## Dynamo worker config (8B)
+
+For the 8B Stack B worker, a sample KV/LLM API config lives at `configs/kvbm_llm_api_8b.yaml` (80% GPU memory for KV cache, padding-enabled cuda graphs). Mount it into the TRT-LLM container and pass via `--extra-engine-args /workspace/kvbm_llm_api_8b.yaml` when launching `dynamo.trtllm`.
 
 ## File Map
 - `configs/`: stackA/stackB YAML.

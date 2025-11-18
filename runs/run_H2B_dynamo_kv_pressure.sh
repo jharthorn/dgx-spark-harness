@@ -7,13 +7,18 @@ HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 source "$HARNESS_DIR/runs/_lib.sh"
 
 STACK="stackB"
-MODEL="L70B"
+MODEL=${MODEL:-meta-llama/Meta-Llama-3.1-8B-Instruct}
 WORKLOAD="fixed_context"
-CONCURRENCY=32
-DURATION=180
+CONCURRENCY=${CONCURRENCY:-32}
+DURATION=${DURATION:-180}
+ENDPOINT=${ENDPOINT:-http://stackB-dynamo:9000/v1/completions}
 
 PROMPTS=(1024 2048 4096 6144)
 RESULTS_BASE=${RESULTS_BASE:-$HARNESS_DIR/results}
+# Tokenizer-aware truncation (align with Stack B engine admit, defaults assume Llama-3.1-8B build at 8k).
+TOKENIZER=${TOKENIZER:-$MODEL}
+MAX_INPUT_LEN=${MAX_INPUT_LEN:-8192}
+INPUT_LEN_MARGIN=${INPUT_LEN_MARGIN:-64}
 
 for CTX in "${PROMPTS[@]}"; do
   RUN_ID="$(rt_ts)_H2B_${STACK}_${MODEL}_${CTX}"
@@ -27,10 +32,21 @@ workload: ${WORKLOAD}
 context_tokens: ${CTX}
 concurrency: ${CONCURRENCY}
 duration_s: ${DURATION}
-endpoint: http://stackB-dynamo:9000/v1/completions
+endpoint: ${ENDPOINT}
 nonce_per_user: true
 seed: 42
+tokenizer: ${TOKENIZER}
+max_input_len: ${MAX_INPUT_LEN}
+input_len_margin: ${INPUT_LEN_MARGIN}
 EOF
+
+  echo "---- Run $RUN_ID ----"
+  echo "  endpoint         : ${ENDPOINT}"
+  echo "  context_tokens   : ${CTX}"
+  echo "  concurrency      : ${CONCURRENCY}"
+  echo "  tokenizer        : ${TOKENIZER}"
+  echo "  max_input_len    : ${MAX_INPUT_LEN}"
+  echo "  input_len_margin : ${INPUT_LEN_MARGIN}"
 
   start_sysmon "$RUN_DIR" "B"
   start_dynkv "$RUN_DIR"

@@ -14,8 +14,8 @@ case "$MODEL_TAG" in
     ;;
   L8B)
     export MODEL_TAG_SHORT="L8B"
-    # Default to Meta's Llama 3 8B Instruct; override via MODEL_HANDLE env if needed.
-    export MODEL_HANDLE=${MODEL_HANDLE:-"meta-llama/Meta-Llama-3-8B-Instruct"}
+    # Default to Meta's Llama 3.1 8B Instruct; override via MODEL_HANDLE env if needed.
+    export MODEL_HANDLE=${MODEL_HANDLE:-"meta-llama/Meta-Llama-3.1-8B-Instruct"}
     ;;
   *)
     echo "Unsupported model tag: $MODEL_TAG (expected L8B or L70B)" >&2

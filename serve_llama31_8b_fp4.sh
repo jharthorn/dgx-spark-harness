@@ -5,14 +5,14 @@ if [[ -z "${HF_TOKEN:-}" ]] && [[ -f "$HOME/hftoken.txt" ]]; then
   export HF_TOKEN="$(<"$HOME/hftoken.txt")"
 fi
 export HF_TOKEN=${HF_TOKEN:?HF_TOKEN must be set}
-export MODEL_HANDLE="${MODEL_HANDLE:-nvidia/Llama-3.3-70B-Instruct-FP4}"
+export MODEL_HANDLE="${MODEL_HANDLE:-meta-llama/Meta-Llama-3.1-8B-Instruct}"
 export HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
 export ENGINE_DIR="${ENGINE_DIR:-}"                 # Optional: host path to a prebuilt TRT-LLM engine dir
 export TOKENIZER_DIR="${TOKENIZER_DIR:-}"           # Optional: host path to tokenizer (defaults to HF cache)
-export PORT="${PORT:-8355}"
+export PORT="${PORT:-9000}"
 export MAX_BATCH_SIZE="${MAX_BATCH_SIZE:-64}"
-export MAX_NUM_TOKENS="${MAX_NUM_TOKENS:-8192}"     # server-side guardrail; set to 16000 for custom ctx
-export MAX_SEQ_LEN="${MAX_SEQ_LEN:-8192}"           # align with engine build (e.g., 32000 for ctx16k build)
+export MAX_NUM_TOKENS="${MAX_NUM_TOKENS:-8192}"
+export MAX_SEQ_LEN="${MAX_SEQ_LEN:-16384}"
 
 mkdir -p "$HF_CACHE"
 
@@ -39,13 +39,11 @@ docker run --name trtllm_llm_server --rm -it \
     if [[ -n "$ENGINE_DIR" ]]; then
       use_engine=true
       model_arg="/workspace/engine"
-      # When serving a local engine we must request backend=trt and point to tokenizer assets.
       backend_flag="--backend trt"
     else
       backend_flag=""
     fi
 
-    # Ensure tokenizer path is available (for both HF + engine flows).
     if [[ -z "$tokenizer_arg" ]]; then
       echo "Downloading tokenizer/model assets for $MODEL_HANDLE ..."
       hf download "$MODEL_HANDLE"
@@ -67,18 +65,14 @@ PY
       exit 1
     fi
 
-    # Ensure tokenizer config declares a known model_type (older snapshots may miss it).
     export TOKENIZER_ARG="$tokenizer_arg"
     python3 - <<'PY'
 import json, os, sys
-
 cfg = os.path.join(os.environ.get("TOKENIZER_ARG", ""), "config.json")
 if not os.path.isfile(cfg):
     sys.exit(0)
-
 with open(cfg, "r") as f:
     data = json.load(f)
-
 changed = False
 if "model_type" not in data:
     data["model_type"] = "llama"
@@ -87,7 +81,6 @@ if "architectures" not in data:
     arch = data.get("architecture") or data.get("model_type") or "LlamaForCausalLM"
     data["architectures"] = [arch]
     changed = True
-
 if changed:
     with open(cfg, "w") as f:
         json.dump(data, f)

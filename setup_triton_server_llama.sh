@@ -3,6 +3,7 @@ set -euo pipefail
 
 # setup_triton_server_llama.sh
 # Rebuilds the TensorRT-LLM engine + Triton model repo for Llama 3.x with custom context limits.
+# Supports L8B / L70B; tested with Stack B 8B flow as of 2025-11-18.
 #
 # Usage:
 #   ./setup_triton_server_llama.sh L70B --max-input-len 16384 --max-seq-len 32768 --max-num-tokens 16384
@@ -14,6 +15,10 @@ set -euo pipefail
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 <L8B|L70B> [--max-input-len TOKENS] [--max-seq-len TOKENS] [--max-num-tokens TOKENS] [--engine-dir PATH]" >&2
   exit 1
+fi
+
+if [[ -z "${HF_TOKEN:-}" ]] && [[ -f "$HOME/hftoken.txt" ]]; then
+  export HF_TOKEN="$(<"$HOME/hftoken.txt")"
 fi
 
 require_cmd() {
@@ -102,6 +107,7 @@ echo " Max input    : $MAX_INPUT_LEN tokens"
 echo " Max sequence : $MAX_SEQ_LEN tokens"
 echo " Max tokens   : $MAX_NUM_TOKENS tokens (build_config.max_num_tokens)"
 echo " Output dir   : $ENGINE_DIR"
+[[ -n "$CKPT_DIR_HOST" ]] && echo " Checkpoint   : $CKPT_DIR_HOST"
 
 docker run --rm -i \
   --gpus all \
@@ -110,6 +116,7 @@ docker run --rm -i \
   -e HF_TOKEN="$HF_TOKEN" \
   -e TRANSFORMERS_CACHE=/root/.cache/huggingface \
   -e MODEL_HANDLE="$MODEL_HANDLE" \
+  -e MODEL_TAG_SHORT="$MODEL_TAG_SHORT" \
   -e MAX_INPUT_LEN="$MAX_INPUT_LEN" \
   -e MAX_SEQ_LEN="$MAX_SEQ_LEN" \
   -e MAX_NUM_TOKENS="$MAX_NUM_TOKENS" \
@@ -130,19 +137,28 @@ if [[ -n "${CKPT_DIR_OVERRIDE:-}" ]]; then
   echo "Using provided checkpoint directory: $CKPT_DIR"
 else
   echo "Downloading ${MODEL_HANDLE} ..."
-  huggingface-cli download "$MODEL_HANDLE" --cache-dir /root/.cache/huggingface --resume-download >/tmp/hf_download.log 2>&1
-  CKPT_DIR=$(python3 - <<'PY'
-import glob, os
-handle = os.environ.get("MODEL_HANDLE", "").replace("/", "--")
-paths = glob.glob(f"/root/.cache/huggingface/hub/models--{handle}*/snapshots/*")
-paths = [p for p in paths if os.path.isdir(p)]
-paths.sort(key=os.path.getmtime, reverse=True)
-print(paths[0] if paths else "")
-PY
-)
-  if [[ -z "$CKPT_DIR" ]]; then
-    echo "ERROR: could not locate checkpoint directory in HF cache" >&2
+  DOWNLOAD_LOG=/tmp/hf_download.log
+  if ! huggingface-cli download "$MODEL_HANDLE" --cache-dir /root/.cache/huggingface --resume-download --local-dir /workspace/hf_ckpt --local-dir-use-symlinks False >"$DOWNLOAD_LOG" 2>&1; then
+    echo "ERROR: huggingface-cli download failed; log follows:" >&2
+    cat "$DOWNLOAD_LOG" >&2
     exit 1
+  fi
+  CKPT_DIR="/workspace/hf_ckpt"
+  if [[ ! -d "$CKPT_DIR" ]]; then
+    echo "ERROR: could not locate checkpoint directory at $CKPT_DIR" >&2
+    exit 1
+  fi
+  # If HF snapshot does not contain rank0.safetensors, convert to TRT-LLM format (tp1) so trtllm-build can load it.
+  if [[ ! -f "$CKPT_DIR/rank0.safetensors" ]]; then
+    CONVERTED_DIR="/workspace/harness/trt_llm_ckpt_${MODEL_TAG_SHORT}_tp1"
+    echo "Converting HF checkpoint to TRT-LLM format at $CONVERTED_DIR ..."
+    rm -rf "$CONVERTED_DIR"
+    python3 /workspace/harness/scripts/convert_llama_checkpoint.py \
+      --model_dir "$CKPT_DIR" \
+      --output_dir "$CONVERTED_DIR" \
+      --tp_size 1 \
+      --dtype bfloat16
+    CKPT_DIR="$CONVERTED_DIR"
   fi
 fi
 MODEL_CONFIG=/tmp/model_config.json
