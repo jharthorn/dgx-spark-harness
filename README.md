@@ -73,6 +73,23 @@ docker run --gpus all -it --rm \
 - **Stack A (UMA-only)**: TRT-LLM, KV sharing off, no Dynamo tiers. Endpoint default: 8355. Use `stackA_llama70b_baseline.yaml`.
 - **Stack B (Dynamo tiered KV)**: TRT-LLM + Dynamo KV manager with tier0 (hbm), tier1 (uma), tier2 (nvme). Endpoint default: 9000. Use `stackB_llama70b_dynamo_tiered.yaml`. Telemetry stubs exist; QoS/tier controls to be implemented.
 
+## Prompt length guardrail (16k engine)
+
+When exercising large contexts, use loadgen’s tokenizer-aware truncation to stay under the engine’s admit limit:
+
+```bash
+python3 src/loadgen.py \
+  --endpoint http://127.0.0.1:8356/v1/completions \
+  --stack stackA --model nvidia/Llama-3.3-70B-Instruct-FP4 \
+  --tokenizer nvidia/Llama-3.3-70B-Instruct-FP4 \
+  --max_input_len 16000 --input_len_margin 64 \
+  --workload fixed_context --context_tokens 16384 \
+  --prompt-file inputs/prompts/16384_tokens.txt \
+  --concurrency 1 --duration_s 20 --nonce_per_user
+```
+
+`--input_len_margin` subtracts a small safety cushion from `max_input_len` to account for BOS/metadata; adjust as needed. Runner `runs/run_H2A_uma_pressure.sh` will automatically inject `tokenizer/max_input_len/input_len_margin` when `MAX_INPUT_LEN` is exported. When `MAX_INPUT_LEN` is set, H2A enforces tokenizer-aware truncation; reported context lengths in plots should be derived from logged/tokenized counts rather than nominal prompt file size.
+
 ## File Map
 - `configs/`: stackA/stackB YAML.
 - `src/loadgen.py`: load generator.

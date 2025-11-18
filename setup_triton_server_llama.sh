@@ -5,14 +5,14 @@ set -euo pipefail
 # Rebuilds the TensorRT-LLM engine + Triton model repo for Llama 3.x with custom context limits.
 #
 # Usage:
-#   ./setup_triton_server_llama.sh L70B --max-input-len 16384 --max-seq-len 32768
-#   ./setup_triton_server_llama.sh L8B   # uses defaults (8192/16384)
+#   ./setup_triton_server_llama.sh L70B --max-input-len 16384 --max-seq-len 32768 --max-num-tokens 16384
+#   ./setup_triton_server_llama.sh L8B   # uses defaults (8192/16384/8192)
 #
 # The script launches an NVIDIA TensorRT-LLM container, downloads the Hugging Face checkpoint,
 # builds the engine with the requested sequence lengths, and syncs it into model_repository/.
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <L8B|L70B> [--max-input-len TOKENS] [--max-seq-len TOKENS] [--engine-dir PATH]" >&2
+  echo "Usage: $0 <L8B|L70B> [--max-input-len TOKENS] [--max-seq-len TOKENS] [--max-num-tokens TOKENS] [--engine-dir PATH]" >&2
   exit 1
 fi
 
@@ -37,7 +37,9 @@ MODEL_TAG="$1"; shift
 
 MAX_INPUT_LEN=${MAX_INPUT_LEN:-8192}
 MAX_SEQ_LEN=${MAX_SEQ_LEN:-16384}
+MAX_NUM_TOKENS=${MAX_NUM_TOKENS:-8192}
 ENGINE_DIR_OVERRIDE=""
+CKPT_DIR_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -47,6 +49,10 @@ while [[ $# -gt 0 ]]; do
       MAX_SEQ_LEN="$2"; shift 2;;
     --engine-dir)
       ENGINE_DIR_OVERRIDE="$2"; shift 2;;
+    --max-num-tokens)
+      MAX_NUM_TOKENS="$2"; shift 2;;
+    --checkpoint-dir)
+      CKPT_DIR_OVERRIDE="$2"; shift 2;;
     *)
       echo "Unknown option: $1" >&2; exit 1;;
   esac
@@ -54,6 +60,7 @@ done
 
 validate_positive_int "$MAX_INPUT_LEN"
 validate_positive_int "$MAX_SEQ_LEN"
+validate_positive_int "$MAX_NUM_TOKENS"
 
 if (( MAX_SEQ_LEN < MAX_INPUT_LEN )); then
   echo "max-seq-len ($MAX_SEQ_LEN) must be >= max-input-len ($MAX_INPUT_LEN)" >&2
@@ -73,6 +80,7 @@ TRT_LLM_IMAGE=${TRT_LLM_IMAGE:-nvcr.io/nvidia/tensorrt-llm/release:spark-single-
 HF_CACHE=${HF_CACHE:-$HOME/.cache/huggingface}
 ENGINE_DIR=${ENGINE_DIR_OVERRIDE:-$HARNESS_DIR/trt_engine_${MODEL_TAG_SHORT}_ctx${MAX_INPUT_LEN}}
 MODEL_REPO_TARGET=${MODEL_REPO_TARGET:-$HARNESS_DIR/model_repository/tensorrt_llm/1}
+CKPT_DIR_HOST=${CKPT_DIR_OVERRIDE:-}
 
 case "$ENGINE_DIR" in
   "$HARNESS_DIR"/*) ;;
@@ -92,6 +100,7 @@ echo "--- Rebuilding TensorRT-LLM engine ---"
 echo " Model        : $MODEL_HANDLE"
 echo " Max input    : $MAX_INPUT_LEN tokens"
 echo " Max sequence : $MAX_SEQ_LEN tokens"
+echo " Max tokens   : $MAX_NUM_TOKENS tokens (build_config.max_num_tokens)"
 echo " Output dir   : $ENGINE_DIR"
 
 docker run --rm -i \
@@ -103,7 +112,9 @@ docker run --rm -i \
   -e MODEL_HANDLE="$MODEL_HANDLE" \
   -e MAX_INPUT_LEN="$MAX_INPUT_LEN" \
   -e MAX_SEQ_LEN="$MAX_SEQ_LEN" \
+  -e MAX_NUM_TOKENS="$MAX_NUM_TOKENS" \
   -e ENGINE_SUBPATH="$ENGINE_SUBPATH" \
+  ${CKPT_DIR_HOST:+-e CKPT_DIR_OVERRIDE="/workspace/harness/${CKPT_DIR_HOST#$HARNESS_DIR/}"} \
   -v "$HF_CACHE:/root/.cache/huggingface" \
   -v "$HARNESS_DIR:/workspace/harness" \
   --entrypoint /bin/bash \
@@ -114,9 +125,13 @@ BUILD_DIR=/workspace/engine_build
 ENGINE_DIR="/workspace/harness/${ENGINE_SUBPATH}"
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
-echo "Downloading ${MODEL_HANDLE} ..."
-huggingface-cli download "$MODEL_HANDLE" --cache-dir /root/.cache/huggingface --resume-download >/tmp/hf_download.log 2>&1
-CKPT_DIR=$(python3 - <<'PY'
+if [[ -n "${CKPT_DIR_OVERRIDE:-}" ]]; then
+  CKPT_DIR="$CKPT_DIR_OVERRIDE"
+  echo "Using provided checkpoint directory: $CKPT_DIR"
+else
+  echo "Downloading ${MODEL_HANDLE} ..."
+  huggingface-cli download "$MODEL_HANDLE" --cache-dir /root/.cache/huggingface --resume-download >/tmp/hf_download.log 2>&1
+  CKPT_DIR=$(python3 - <<'PY'
 import glob, os
 handle = os.environ.get("MODEL_HANDLE", "").replace("/", "--")
 paths = glob.glob(f"/root/.cache/huggingface/hub/models--{handle}*/snapshots/*")
@@ -125,9 +140,10 @@ paths.sort(key=os.path.getmtime, reverse=True)
 print(paths[0] if paths else "")
 PY
 )
-if [[ -z "$CKPT_DIR" ]]; then
-  echo "ERROR: could not locate checkpoint directory in HF cache" >&2
-  exit 1
+  if [[ -z "$CKPT_DIR" ]]; then
+    echo "ERROR: could not locate checkpoint directory in HF cache" >&2
+    exit 1
+  fi
 fi
 MODEL_CONFIG=/tmp/model_config.json
 export CKPT_DIR MODEL_CONFIG
@@ -169,6 +185,7 @@ trtllm-build \
   --max_batch_size 64 \
   --max_input_len "$MAX_INPUT_LEN" \
   --max_seq_len "$MAX_SEQ_LEN" \
+  --max_num_tokens "$MAX_NUM_TOKENS" \
   --model_config "$MODEL_CONFIG" \
   --gemm_plugin nvfp4 \
   --remove_input_padding enable \

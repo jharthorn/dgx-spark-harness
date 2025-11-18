@@ -46,6 +46,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--context_tokens", type=int, required=False)
     parser.add_argument("--concurrency", type=int, required=False)
     parser.add_argument("--duration_s", type=int, default=60)
+    parser.add_argument("--max_input_len", type=int, default=None, help="Token-level guard (truncate prompt to this many tokens)")
+    parser.add_argument("--tokenizer", default=None, help="HF tokenizer name_or_path; required with --max_input_len for accurate truncation")
+    parser.add_argument("--input_len_margin", type=int, default=64, help="Safety margin tokens below max_input_len to avoid BOS/extra tokens overflow")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--nonce_per_user", action="store_true")
     parser.add_argument("--output-dir", default=".", help="Directory for metrics.jsonl")
@@ -102,6 +105,25 @@ def build_workload(name: str, tokens: int, seed: int, prompt_text: str) -> Itera
     raise NotImplementedError(f"Workload '{name}' not implemented yet")
 
 
+def build_tokenizer(tokenizer_ref: str):
+    try:
+        from transformers import AutoTokenizer  # type: ignore
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise ImportError("transformers is required when --tokenizer/--max_input_len is set") from exc
+    return AutoTokenizer.from_pretrained(tokenizer_ref, use_fast=True)
+
+
+def truncate_prompt(prompt: str, tokenizer, max_input_len: int, margin: int) -> str:
+    target = max_input_len - max(margin, 0)
+    tokens = tokenizer.encode(prompt, add_special_tokens=False)
+    if len(tokens) <= target:
+        return prompt
+    trimmed = tokens[-target:]
+    new_prompt = tokenizer.decode(trimmed, skip_special_tokens=True)
+    LOG.info("Truncated prompt from %s tokens to %s tokens (max_input_len=%s, margin=%s)", len(tokens), len(trimmed), max_input_len, margin)
+    return new_prompt
+
+
 def _nonce(rng: random.Random, user_id: int) -> str:
     tag = "".join(rng.choice(NONCE_ALPHABET) for _ in range(NONCE_LEN))
     return f"[NONCE:{user_id}:{tag}]"
@@ -139,6 +161,8 @@ async def worker(user_id: int, args: argparse.Namespace, prompt_iter: Iterator[s
             prompt = next(prompt_iter)
             if args.nonce_per_user:
                 prompt = f"{prompt}\n{_nonce(rng, user_id)}"
+            if getattr(args, "tokenizer_obj", None) is not None and args.max_input_len is not None:
+                prompt = truncate_prompt(prompt, args.tokenizer_obj, int(args.max_input_len), int(args.input_len_margin))
             ttft, e2e, rc = await send_request(client, args.endpoint, prompt, args.model)
             record = {
                 "run_id": args.run_id,
@@ -158,6 +182,14 @@ async def worker(user_id: int, args: argparse.Namespace, prompt_iter: Iterator[s
 async def run_loadgen(args: argparse.Namespace) -> None:
     rng = random.Random(args.seed)
     prompt_text = load_prompt_file(args.prompt_file, int(args.context_tokens), args.seed)
+
+    tokenizer = None
+    if args.max_input_len is not None:
+        if args.tokenizer is None:
+            raise ValueError("--max_input_len requires --tokenizer to compute token counts accurately")
+        tokenizer = build_tokenizer(args.tokenizer)
+        prompt_text = truncate_prompt(prompt_text, tokenizer, int(args.max_input_len), int(args.input_len_margin))
+    args.tokenizer_obj = tokenizer
     user_generators: list[Iterator[str]] = []
     for user_idx in range(int(args.concurrency)):
         user_generators.append(build_workload(args.workload, int(args.context_tokens), args.seed + user_idx, prompt_text))

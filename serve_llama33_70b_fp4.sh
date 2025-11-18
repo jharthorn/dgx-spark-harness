@@ -64,15 +64,38 @@ PY
       exit 1
     fi
 
+    # Ensure tokenizer config declares a known model_type (older snapshots may miss it).
+    export TOKENIZER_ARG="$tokenizer_arg"
+    python3 - <<'PY'
+import json, os, sys
+
+cfg = os.path.join(os.environ.get("TOKENIZER_ARG", ""), "config.json")
+if not os.path.isfile(cfg):
+    sys.exit(0)
+
+with open(cfg, "r") as f:
+    data = json.load(f)
+
+changed = False
+if "model_type" not in data:
+    data["model_type"] = "llama"
+    changed = True
+if "architectures" not in data:
+    arch = data.get("architecture") or data.get("model_type") or "LlamaForCausalLM"
+    data["architectures"] = [arch]
+    changed = True
+
+if changed:
+    with open(cfg, "w") as f:
+        json.dump(data, f)
+    print(f"Patched tokenizer config model_type/architectures in {cfg}")
+PY
+
     echo "Writing extra-llm-api-config.yml..."
     cat > /tmp/extra-llm-api-config.yml <<EOF
-print_iter_log: false
 kv_cache_config:
   dtype: "auto"
   free_gpu_memory_fraction: 0.90
-cuda_graph_config:
-  enable_padding: true
-disable_overlap_scheduler: true
 EOF
 
     if $use_engine; then
