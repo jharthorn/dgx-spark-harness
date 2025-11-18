@@ -11,7 +11,7 @@ OUT_PATH="$ROOT/archives/$ARCHIVE_NAME"
 mkdir -p "$ROOT/archives"
 
 paths=()
-for p in results runs/v3 runs/v2.5 analysis/figures; do
+for p in results results/; do
   if [[ -e "$ROOT/$p" ]]; then
     paths+=("$p")
   fi
