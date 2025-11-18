@@ -44,5 +44,5 @@ model_repository/
 
 # Serving files
 
-trt_engine_bs256/
+trt_*/
 .hf_cache_fresh/

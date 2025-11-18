@@ -1,0 +1,13 @@
+[2025-11-18 17:22:38] INFO config.py:54: PyTorch version 2.8.0a0+5228986c39.nv25.6 available.
+[2025-11-18 17:22:38] INFO config.py:66: Polars version 1.25.2 available.
+/usr/local/lib/python3.12/dist-packages/modelopt/torch/__init__.py:36: UserWarning: transformers version 4.55.0 is incompatible with nvidia-modelopt and may cause issues. Please install recommended version with `pip install nvidia-modelopt[hf]` if working with HF models.
+  _warnings.warn(
+2025-11-18 17:22:46,702 - INFO - flashinfer.jit: Prebuilt kernels not found, using JIT backend
+[TensorRT-LLM] TensorRT-LLM version: 1.1.0rc3
+1.1.0rc3
+[11/18/2025-17:22:46] [TRT-LLM] [W] Implicitly setting LLaMAConfig.has_partial_lora_mask = False
+[11/18/2025-17:22:46] [TRT-LLM] [W] Implicitly setting LLaMAConfig.tie_word_embeddings = False
+0it [00:00, ?it/s]52it [00:00, 490.18it/s]102it [00:00, 471.88it/s]150it [00:00, 459.71it/s]196it [00:00, 421.83it/s]244it [00:00, 429.64it/s]294it [00:00, 439.72it/s]352it [00:00, 467.22it/s]404it [00:00, 475.19it/s]454it [00:00, 466.81it/s]506it [00:01, 463.91it/s]553it [00:01, 449.52it/s]599it [00:01, 449.74it/s]645it [00:01, 437.85it/s]689it [00:01, 432.40it/s]736it [00:01, 433.87it/s]788it [00:01, 453.48it/s]838it [00:01, 454.84it/s]896it [00:01, 475.29it/s]948it [00:02, 482.11it/s]998it [00:02, 476.30it/s]1056it [00:02, 494.84it/s]1108it [00:02, 499.53it/s]1158it [00:02, 484.59it/s]1216it [00:02, 494.75it/s]1268it [00:02, 494.28it/s]1318it [00:02, 486.18it/s]1376it [00:02, 497.08it/s]1426it [00:03, 472.63it/s]1474it [00:03, 410.15it/s]1517it [00:03, 396.84it/s]1558it [00:03, 371.52it/s]1596it [00:03, 358.30it/s]1638it [00:03, 363.44it/s]1696it [00:03, 410.28it/s]1748it [00:03, 430.88it/s]1798it [00:04, 432.04it/s]1850it [00:04, 454.62it/s]1896it [00:04, 455.13it/s]1952it [00:04, 472.58it/s]2004it [00:04, 483.40it/s]2054it [00:04, 468.59it/s]2102it [00:04, 461.80it/s]2149it [00:04, 444.29it/s]2196it [00:04, 441.43it/s]2246it [00:04, 441.97it/s]2304it [00:05, 468.14it/s]2356it [00:05, 475.25it/s]2406it [00:05, 464.99it/s]2464it [00:05, 480.09it/s]2516it [00:05, 488.77it/s]2566it [00:05, 455.90it/s]
+Total time of reading and converting: 5.757 s
+Total time of saving checkpoint: 47.585 s
+Total time of converting checkpoints: 00:00:53

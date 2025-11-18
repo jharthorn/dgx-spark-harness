@@ -94,7 +94,7 @@ echo " Max input    : $MAX_INPUT_LEN tokens"
 echo " Max sequence : $MAX_SEQ_LEN tokens"
 echo " Output dir   : $ENGINE_DIR"
 
-docker run --rm \
+docker run --rm -i \
   --gpus all \
   --ipc host \
   --network host \
@@ -133,21 +133,31 @@ MODEL_CONFIG=/tmp/model_config.json
 export CKPT_DIR MODEL_CONFIG
 python3 - <<'PY'
 import json, os
+
 ckpt = os.environ["CKPT_DIR"]
 cfg = os.path.join(ckpt, "config.json")
 with open(cfg, "r") as f:
-data = json.load(f)
+    data = json.load(f)
+
 arch = data.get("architecture")
 if not arch:
     arch_candidates = data.get("architectures") or []
     arch = arch_candidates[0] if arch_candidates else data.get("model_type", "")
 if not arch:
     arch = "LlamaForCausalLM"
+
 data["architecture"] = arch
 data["architectures"] = [arch]
+data["dtype"] = str(data.get("torch_dtype", "bfloat16"))
+
 model_config_path = os.environ["MODEL_CONFIG"]
 with open(model_config_path, "w") as f:
     json.dump(data, f)
+
+# Also patch the checkpoint config.json in-place so trtllm-build picks up the architecture key.
+with open(cfg, "w") as f:
+    json.dump(data, f)
+
 print(f"Wrote model config to {model_config_path} with architecture={arch}")
 print(open(model_config_path, "r").read())
 PY
