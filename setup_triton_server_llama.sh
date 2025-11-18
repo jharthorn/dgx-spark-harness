@@ -94,39 +94,85 @@ echo " Max input    : $MAX_INPUT_LEN tokens"
 echo " Max sequence : $MAX_SEQ_LEN tokens"
 echo " Output dir   : $ENGINE_DIR"
 
-docker run --rm -it \
+docker run --rm \
   --gpus all \
   --ipc host \
   --network host \
   -e HF_TOKEN="$HF_TOKEN" \
   -e TRANSFORMERS_CACHE=/root/.cache/huggingface \
+  -e MODEL_HANDLE="$MODEL_HANDLE" \
+  -e MAX_INPUT_LEN="$MAX_INPUT_LEN" \
+  -e MAX_SEQ_LEN="$MAX_SEQ_LEN" \
+  -e ENGINE_SUBPATH="$ENGINE_SUBPATH" \
   -v "$HF_CACHE:/root/.cache/huggingface" \
   -v "$HARNESS_DIR:/workspace/harness" \
+  --entrypoint /bin/bash \
   "$TRT_LLM_IMAGE" \
-  bash -c "
-    set -euo pipefail
-    BUILD_DIR=/workspace/engine_build
-    rm -rf \"\$BUILD_DIR\"
-    mkdir -p \"\$BUILD_DIR\"
-    echo 'Downloading $MODEL_HANDLE ...'
-    huggingface-cli download \"$MODEL_HANDLE\" --cache-dir /root/.cache/huggingface --resume-download >/tmp/hf_download.log 2>&1
-    echo 'Running trtllm-build ...'
-    trtllm-build \
-      --hf-model \"$MODEL_HANDLE\" \
-      --max-input-len $MAX_INPUT_LEN \
-      --max-seq-len $MAX_SEQ_LEN \
-      --world-size 1 \
-      --tp-size 1 \
-      --pp-size 1 \
-      --output-dir \"\$BUILD_DIR\" \
-      --quantization-mode force_fp4 \
-      --enable-gemm-plugin \
-      --use-fused-mha
-    echo 'Copying engine artifacts...'
-    rm -rf \"/workspace/harness/$ENGINE_SUBPATH\"
-    mkdir -p \"/workspace/harness/$ENGINE_SUBPATH\"
-    cp -r \"\$BUILD_DIR\"/* \"/workspace/harness/$ENGINE_SUBPATH\"
-  "
+  -s <<'EOS'
+	set -euxo pipefail
+BUILD_DIR=/workspace/engine_build
+ENGINE_DIR="/workspace/harness/${ENGINE_SUBPATH}"
+rm -rf "$BUILD_DIR"
+mkdir -p "$BUILD_DIR"
+echo "Downloading ${MODEL_HANDLE} ..."
+huggingface-cli download "$MODEL_HANDLE" --cache-dir /root/.cache/huggingface --resume-download >/tmp/hf_download.log 2>&1
+CKPT_DIR=$(python3 - <<'PY'
+import glob, os
+handle = os.environ.get("MODEL_HANDLE", "").replace("/", "--")
+paths = glob.glob(f"/root/.cache/huggingface/hub/models--{handle}*/snapshots/*")
+paths = [p for p in paths if os.path.isdir(p)]
+paths.sort(key=os.path.getmtime, reverse=True)
+print(paths[0] if paths else "")
+PY
+)
+if [[ -z "$CKPT_DIR" ]]; then
+  echo "ERROR: could not locate checkpoint directory in HF cache" >&2
+  exit 1
+fi
+MODEL_CONFIG=/tmp/model_config.json
+export CKPT_DIR MODEL_CONFIG
+python3 - <<'PY'
+import json, os
+ckpt = os.environ["CKPT_DIR"]
+cfg = os.path.join(ckpt, "config.json")
+with open(cfg, "r") as f:
+data = json.load(f)
+arch = data.get("architecture")
+if not arch:
+    arch_candidates = data.get("architectures") or []
+    arch = arch_candidates[0] if arch_candidates else data.get("model_type", "")
+if not arch:
+    arch = "LlamaForCausalLM"
+data["architecture"] = arch
+data["architectures"] = [arch]
+model_config_path = os.environ["MODEL_CONFIG"]
+with open(model_config_path, "w") as f:
+    json.dump(data, f)
+print(f"Wrote model config to {model_config_path} with architecture={arch}")
+print(open(model_config_path, "r").read())
+PY
+echo "Using checkpoint: $CKPT_DIR"
+echo "Running trtllm-build ..."
+trtllm-build \
+  --checkpoint_dir "$CKPT_DIR" \
+  --output_dir "$BUILD_DIR" \
+  --max_batch_size 64 \
+  --max_input_len "$MAX_INPUT_LEN" \
+  --max_seq_len "$MAX_SEQ_LEN" \
+  --model_config "$MODEL_CONFIG" \
+  --gemm_plugin nvfp4 \
+  --remove_input_padding enable \
+  --context_fmha enable \
+  --kv_cache_type paged
+echo "Copying engine artifacts..."
+rm -rf "$ENGINE_DIR"
+mkdir -p "$ENGINE_DIR"
+cp -r "$BUILD_DIR"/* "$ENGINE_DIR"
+echo "Build dir contents:"
+ls -la "$BUILD_DIR"
+echo "Engine dir contents:"
+ls -la "$ENGINE_DIR"
+EOS
 
 echo "--- Syncing Triton model_repository ---"
 rm -rf -- "$MODEL_REPO_TARGET"

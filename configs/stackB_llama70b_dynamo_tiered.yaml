@@ -10,22 +10,23 @@ endpoint:
 runtime:
   kv_sharing_enabled: true
   dynamo:
-    kv_block_size_bytes: 131072           # plan Appendix example
+    kv_block_size_bytes: 65536
     eviction_policy: fifo
     tier0:
-      type: hbm
+      type: uma          # instead of hbm, treat this as "hot" UMA region
       capacity_bytes: 8GiB
     tier1:
       type: uma
-      capacity_bytes: 32GiB
+      capacity_bytes: 24GiB
     tier2:
       type: nvme
-      path: /nvme/dynamo_kv
+      path: /nvme/kvbm/l70b
       allocate_bytes: 512GiB
     telemetry_enable: true
-    telemetry_interval_ms: 5000
+    telemetry_interval_ms: 200  # shrink from 5 s so you get useful time series
 telemetry:
   collect_gpu: true
   collect_nvme: true
   collect_sysmon: true
   collect_dynkv: true
+
