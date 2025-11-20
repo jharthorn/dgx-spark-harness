@@ -25,14 +25,11 @@ stop_sysmon() {
 
 start_dynkv() {
   local run_dir=$1
-  : > "$run_dir/dynkv.jsonl"
-  ( while :; do echo "{\"ts\":\"$(date -Is)\",\"tier\":\"nvme\",\"iops\":0}" >> "$run_dir/dynkv.jsonl"; sleep 2; done ) &
-  echo $! > "$run_dir/dynkv.pid"
+  # TODO: replace with real Dynamo/KVBM telemetry ingestion.
+  echo "{}" > "$run_dir/dynkv.jsonl"
 }
 
 stop_dynkv() {
   local run_dir=$1
-  if [[ -f "$run_dir/dynkv.pid" ]]; then
-    kill "$(cat "$run_dir/dynkv.pid")" 2>/dev/null || true
-  fi
+  return 0
 }

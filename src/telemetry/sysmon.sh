@@ -52,15 +52,22 @@ collect_sample() {
   fi
   read -r rps wps rMB wMB await avgrq avgqu util <<<"${io_line:-0 0 0 0 0 0 0 0}"
 
+  gpu_util=0
+  gpu_mem_used=0
+  gpu_mem_total=0
   if [[ $NVIDIA_OK -eq 1 ]]; then
+    # Primary: query util/mem via nvidia-smi; some GB/UMA platforms report mem as N/A.
     gpu_line=$(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -d ' %MiB') || gpu_line=""
-  else
-    gpu_line=""
+    read -r gpu_util gpu_mem_used gpu_mem_total <<<"${gpu_line:-0 0 0}"
+    gpu_util=$(sanitize_num "$gpu_util")
+    # Fallback: if util is zero and mem is N/A/0 (UMA reporting), try dmon for util only.
+    if [[ "$gpu_util" == "0" ]]; then
+      dmon_line=$(nvidia-smi dmon -s u -c 1 2>/dev/null | awk 'NR==3{print $2}') || dmon_line=""
+      gpu_util=$(sanitize_num "${dmon_line:-$gpu_util}")
+    fi
+    gpu_mem_used=$(sanitize_num "$gpu_mem_used")
+    gpu_mem_total=$(sanitize_num "$gpu_mem_total")
   fi
-  read -r gpu_util gpu_mem_used gpu_mem_total <<<"${gpu_line:-0 0 0}"
-  gpu_util=$(sanitize_num "$gpu_util")
-  gpu_mem_used=$(sanitize_num "$gpu_mem_used")
-  gpu_mem_total=$(sanitize_num "$gpu_mem_total")
   usr=$(sanitize_num "$usr"); sys=$(sanitize_num "$sys"); iowait=$(sanitize_num "$iowait")
   memAvail=$(sanitize_num "$memAvail"); memCached=$(sanitize_num "$memCached"); swapTotal=$(sanitize_num "$swapTotal"); swapFree=$(sanitize_num "$swapFree")
   rps=$(sanitize_num "$rps"); rMB=$(sanitize_num "$rMB"); await=$(sanitize_num "$await"); avgqu=$(sanitize_num "$avgqu"); util=$(sanitize_num "$util")
