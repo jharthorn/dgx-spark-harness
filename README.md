@@ -114,6 +114,79 @@ Known-good sequence to avoid malformed discovery and HF 404s:
    If the model list is empty, verify the namespace (`DYN_NAMESPACE`) and etcd keys under `v1/mdc/dynamo/tensorrt_llm`.
 7) Runner scripts: point Stack B endpoints at `http://127.0.0.1:9000` and use the model name `meta-llama/Meta-Llama-3.1-8B-Instruct` to match discovery.
 
+### Quick reset when bringing frontend back up
+If discovery was polluted or you restart from a clean state, reseed the card:
+```bash
+docker exec deploy-etcd-server-1 etcdctl del --prefix v1/mdc/dynamo/tensorrt_llm
+docker exec -i deploy-etcd-server-1 etcdctl put \
+  v1/mdc/dynamo/tensorrt_llm/generate/694d9aa7979575ab \
+  < ~/dgx_spark_harness/cards/Llama-3.1-8B-Instruct.json
+```
+Then restart the frontend with `HF_TOKEN`, `DYN_DISCOVERY_BACKEND=kv_store`, `DYN_STORE_KV=etcd`, `DYN_NAMESPACE=dynamo`.
+Start the worker with the served name including the org prefix to avoid HF 404s:
+```bash
+docker run --gpus all --ipc host --network host --rm -it \
+  -e HF_TOKEN="$(<~/hftoken.txt)" \
+  -e DYN_KVBM_TIER2_PATH=/nvme/kvbm/l8b \
+  -v /nvme/kvbm:/nvme/kvbm \
+  -v ~/dgx_spark_harness/configs/kvbm_llm_api_8b.yaml:/workspace/kvbm_llm_api_config.yaml \
+  -v ~/dgx_spark_harness:/workspace/harness \
+  -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+  spark-dynamo-worker \
+  bash -lc "cd /workspace/harness/scripts && ./patch_nixl_opt_in.sh && \
+            python3 -m dynamo.trtllm \
+              --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+              --served-model-name meta-llama/Meta-Llama-3.1-8B-Instruct \
+              --max-num-tokens 8192 --max-batch-size 2 --kv-block-size 32 \
+              --extra-engine-args /workspace/kvbm_llm_api_config.yaml"
+```
+If you want to keep the card static and only register endpoints, set `-e DYN_DISCOVERY_KV_EXPORT_ENABLED=false` in that docker run.
+
+### Minimal “known good” flow for Stack B (H2B) after fixes
+1. Infra: `docker compose -f ~/dynamo/deploy/docker-compose.yml up -d` (etcd + nats).
+2. Seed discovery:
+   ```bash
+   docker exec deploy-etcd-server-1 etcdctl del --prefix v1/mdc/dynamo/tensorrt_llm
+   docker exec -i deploy-etcd-server-1 etcdctl put \
+     v1/mdc/dynamo/tensorrt_llm/generate/694d9aa7979575ab \
+     < ~/dgx_spark_harness/cards/Llama-3.1-8B-Instruct.json
+   ```
+3. Frontend (host venv):
+   ```bash
+   export HF_TOKEN="$(<~/hftoken.txt)"
+   export DYN_DISCOVERY_BACKEND=kv_store
+   export DYN_STORE_KV=etcd
+   export DYN_NAMESPACE=dynamo
+   python3 -m dynamo.frontend --http-port 9000
+   ```
+4. Worker (container, no card export, higher token admit):
+   ```bash
+   docker run --gpus all --ipc host --network host --rm -it \
+     -e HF_TOKEN="$(<~/hftoken.txt)" \
+     -e DYN_DISCOVERY_KV_EXPORT_ENABLED=false \
+     -e DYN_KVBM_TIER2_PATH=/nvme/kvbm/l8b \
+     -v /nvme/kvbm:/nvme/kvbm \
+     -v ~/dgx_spark_harness/configs/kvbm_llm_api_8b.yaml:/workspace/kvbm_llm_api_config.yaml \
+     -v ~/dgx_spark_harness:/workspace/harness \
+     -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+     spark-dynamo-worker:latest \
+     bash -lc "cd /workspace/harness/scripts && ./patch_nixl_opt_in.sh && \
+               python3 -m dynamo.trtllm \
+                 --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+                 --served-model-name meta-llama/Meta-Llama-3.1-8B-Instruct \
+                 --max-num-tokens 4096 --max-batch-size 2 --kv-block-size 32 \
+                 --extra-engine-args /workspace/kvbm_llm_api_config.yaml"
+   ```
+5. Sanity checks:
+   ```bash
+   curl -s http://127.0.0.1:9000/v1/models | jq .
+   curl -i -X POST http://127.0.0.1:9000/v1/completions \
+     -H "Content-Type: application/json" \
+     -d '{"model":"meta-llama/Meta-Llama-3.1-8B-Instruct","prompt":"Hello","max_tokens":16}'
+   ```
+6. Run H2B (local defaults): `MODEL=meta-llama/Meta-Llama-3.1-8B-Instruct ENDPOINT=http://127.0.0.1:9000/v1/completions CONCURRENCY=4 DURATION=30 ./runs/run_H2B_dynamo_kv_pressure.sh`
+   - If your prompts exceed the worker admit, bump `--max-num-tokens` on the worker (e.g., 8192 for 6k+ prompt lengths).
+
 ### Persist a worker image pinned to ai-dynamo 0.7.0
 Avoid re-installing wheels every run by baking a tagged image:
 ```bash
@@ -192,13 +265,6 @@ Discovery card for Llama 3.1 8B (static file or etcd payload)
 --------------------------------------------------------------
 We standardize on the canonical HF repo `meta-llama/Llama-3.1-8B-Instruct`. A ready-to-use card is in `cards/Llama-3.1-8B-Instruct.json`; it includes the correct paths/checksums to the cached snapshot (`0e9e39f...`). Use one of the two flows:
 
-- Static discovery (frontend):
-  ```bash
-  DYNAMO_DISCOVERY_BACKEND=static \
-  DYNAMO_DISCOVERY_STATIC_DIR=~/dgx_spark_harness/cards \
-  python3 -m dynamo.frontend --http-port 9000
-  ```
-
 - Etcd discovery (push from host):
   ```bash
   docker exec deploy-etcd-server-1 etcdctl del --prefix v1/mdc/dynamo/tensorrt_llm
@@ -218,20 +284,12 @@ docker run --gpus all --ipc host --network host --rm -it \
   -v ~/dgx_spark_harness:/workspace/harness \
   -v $HOME/.cache/huggingface:/root/.cache/huggingface \
   spark-dynamo-worker \
-  bash
-```
-
-If you restart a clean worker image, re-apply the NIXL opt-in patch and stay in the shell:
-```bash
-docker run --gpus all --ipc host --network host --rm -it \
-  -e HF_TOKEN="$(<~/hftoken.txt)" \
-  -e DYN_KVBM_TIER2_PATH=/nvme/kvbm/l8b \
-  -v /nvme/kvbm:/nvme/kvbm \
-  -v ~/dgx_spark_harness/configs/kvbm_llm_api_8b.yaml:/workspace/kvbm_llm_api_config.yaml \
-  -v ~/dgx_spark_harness:/workspace/harness \
-  -v $HOME/.cache/huggingface:/root/.cache/huggingface \
-  spark-dynamo-worker \
-  bash -lc "cd /workspace/harness/scripts && ./patch_nixl_opt_in.sh && exec bash"
+  bash -lc "cd /workspace/harness/scripts && ./patch_nixl_opt_in.sh && \
+            python3 -m dynamo.trtllm \
+              --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+              --served-model-name meta-llama/Meta-Llama-3.1-8B-Instruct \
+              --max-num-tokens 512 --max-batch-size 2 --kv-block-size 32 \
+              --extra-engine-args /workspace/kvbm_llm_api_config.yaml"
 ```
 
 Run worker without NIXL connect (KVBM enabled, CUDA KV off):

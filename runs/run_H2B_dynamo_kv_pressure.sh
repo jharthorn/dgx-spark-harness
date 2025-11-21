@@ -11,7 +11,7 @@ MODEL=${MODEL:-meta-llama/Meta-Llama-3.1-8B-Instruct}
 WORKLOAD="fixed_context"
 CONCURRENCY=${CONCURRENCY:-32}
 DURATION=${DURATION:-180}
-ENDPOINT=${ENDPOINT:-http://stackB-dynamo:9000/v1/completions}
+ENDPOINT=${ENDPOINT:-http://127.0.0.1:9000/v1/completions}
 
 PROMPTS=(1024 2048 4096 6144)
 RESULTS_BASE=${RESULTS_BASE:-$HARNESS_DIR/results}

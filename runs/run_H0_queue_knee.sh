@@ -6,7 +6,8 @@ set -euo pipefail
 HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 source "$HARNESS_DIR/runs/_lib.sh"
 
-ENDPOINT=${ENDPOINT:-${1:-http://stackA-baseline:8355/v1/completions}}
+# Stack A default (localhost smoke) is 8355; override via ENDPOINT for cluster
+ENDPOINT=${ENDPOINT:-${1:-http://127.0.0.1:8355/v1/completions}}
 STACK="stackA"
 MODEL="L70B"
 WORKLOAD="fixed_context"

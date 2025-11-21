@@ -12,6 +12,7 @@ WORKLOAD="fixed_context"
 CTX=256
 CONCURRENCY=32
 DURATION=120
+ENDPOINT=${ENDPOINT:-http://127.0.0.1:8355/v1/completions}
 RESULTS_BASE=${RESULTS_BASE:-$HARNESS_DIR/results}
 
 for PHASE in COLD WARM; do
@@ -26,7 +27,7 @@ workload: ${WORKLOAD}
 context_tokens: ${CTX}
 concurrency: ${CONCURRENCY}
 duration_s: ${DURATION}
-endpoint: http://stackA-baseline:8355/v1/completions
+endpoint: ${ENDPOINT}
 nonce_per_user: false
 seed: 42
 phase: ${PHASE}

@@ -25,11 +25,28 @@ stop_sysmon() {
 
 start_dynkv() {
   local run_dir=$1
-  # TODO: replace with real Dynamo/KVBM telemetry ingestion.
-  echo "{}" > "$run_dir/dynkv.jsonl"
+  local tier_path=${DYN_KVBM_TIER2_PATH:-/nvme/kvbm}
+  local interval=${DYN_KV_TELEMETRY_INTERVAL:-5}
+
+  (
+    while :; do
+      ts=$(date -Ins)
+      size_bytes=$(du -sb "$tier_path" 2>/dev/null | awk '{print $1+0}')
+      if [[ -z "$size_bytes" ]]; then size_bytes=0; fi
+      df_line=$(df -B1 "$tier_path" 2>/dev/null | awk 'NR==2{print $2,$3,$4}')
+      read -r fs_size fs_used fs_avail <<<"${df_line:-0 0 0}"
+      cat <<EOF >> "$run_dir/dynkv.jsonl"
+{"ts":"${ts}","tier_path":"${tier_path}","bytes_used":${size_bytes},"fs_total_bytes":${fs_size:-0},"fs_used_bytes":${fs_used:-0},"fs_avail_bytes":${fs_avail:-0}}
+EOF
+      sleep "$interval"
+    done
+  ) >"$run_dir/dynkv.log" 2>&1 &
+  echo $! > "$run_dir/dynkv.pid"
 }
 
 stop_dynkv() {
   local run_dir=$1
-  return 0
+  if [[ -f "$run_dir/dynkv.pid" ]]; then
+    kill "$(cat "$run_dir/dynkv.pid")" 2>/dev/null || true
+  fi
 }

@@ -12,6 +12,7 @@ WORKLOAD="fixed_context"
 CTX=2048
 CONCURRENCY=32
 DURATION=180
+ENDPOINT=${ENDPOINT:-http://127.0.0.1:9000/v1/completions}
 RESULTS_BASE=${RESULTS_BASE:-$HARNESS_DIR/results}
 
 for PHASE in baseline qos_degraded; do
@@ -26,7 +27,7 @@ workload: ${WORKLOAD}
 context_tokens: ${CTX}
 concurrency: ${CONCURRENCY}
 duration_s: ${DURATION}
-endpoint: http://stackB-dynamo:9000/v1/completions
+endpoint: ${ENDPOINT}
 nonce_per_user: true
 seed: 42
 phase: ${PHASE}
