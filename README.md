@@ -114,11 +114,69 @@ pip install /workspace/harness/wheelhouse/nixl/*.whl
 pip install /workspace/harness/wheelhouse/kvbm*.whl   # if present
 ```
 
+# Install ai-dynamo CLI in the frontend venv (uses local wheels)
+```bash
+source ~/dyn-venv/bin/activate
+pip install ~/dgx_spark_harness/wheelhouse/ai_dynamo_runtime-0.7.0-*.whl
+pip install ~/dgx_spark_harness/wheelhouse/ai_dynamo-0.7.0-py3-none-any.whl
+```
+
+Start Dynamo frontend
+```bash
+python3 -m dynamo.frontend --http-port 9000
+```
+
+Discovery card for Llama 3.1 8B (static file or etcd payload)
+--------------------------------------------------------------
+We standardize on the canonical HF repo `meta-llama/Llama-3.1-8B-Instruct`. A ready-to-use card is in `cards/llama3-8b.json`; it includes the correct paths/checksums to the cached snapshot (`0e9e39f...`). Use one of the two flows:
+
+- Static discovery (frontend):
+  ```bash
+  DYNAMO_DISCOVERY_BACKEND=static \
+  DYNAMO_DISCOVERY_STATIC_DIR=~/dgx_spark_harness/cards \
+  python3 -m dynamo.frontend --http-port 9000
+  ```
+
+- Etcd discovery (push from host):
+  ```bash
+  docker exec deploy-etcd-server-1 etcdctl del --prefix v1/mdc/dynamo/tensorrt_llm
+  docker exec -i deploy-etcd-server-1 etcdctl put \
+    v1/mdc/dynamo/tensorrt_llm/generate/7587890969240119941 \
+    < cards/llama3-8b.json
+  ```
+  (If the worker is exporting discovery automatically, you can skip the manual put; otherwise this forces a clean, parseable entry.)
+
+TRT-LLM worker container example (interactive):
+```bash
+docker run --gpus all --ipc host --network host --rm -it \
+  -e HF_TOKEN="$(<~/hftoken.txt)" \
+  -e DYN_KVBM_TIER2_PATH=/nvme/kvbm/l8b \
+  -v /nvme/kvbm:/nvme/kvbm \
+  -v ~/dgx_spark_harness/configs/kvbm_llm_api_8b.yaml:/workspace/kvbm_llm_api_config.yaml \
+  -v ~/dgx_spark_harness:/workspace/harness \
+  -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+  spark-dynamo-worker \
+  bash
+```
+
+If you restart a clean worker image, re-apply the NIXL opt-in patch and stay in the shell:
+```bash
+docker run --gpus all --ipc host --network host --rm -it \
+  -e HF_TOKEN="$(<~/hftoken.txt)" \
+  -e DYN_KVBM_TIER2_PATH=/nvme/kvbm/l8b \
+  -v /nvme/kvbm:/nvme/kvbm \
+  -v ~/dgx_spark_harness/configs/kvbm_llm_api_8b.yaml:/workspace/kvbm_llm_api_config.yaml \
+  -v ~/dgx_spark_harness:/workspace/harness \
+  -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+  spark-dynamo-worker \
+  bash -lc "cd /workspace/harness/scripts && ./patch_nixl_opt_in.sh && exec bash"
+```
+
 Run worker without NIXL connect (KVBM enabled, CUDA KV off):
 ```bash
 python3 -m dynamo.trtllm \
   --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
-  --served-model-name llama3-8b \
+  --served-model-name Llama-3.1-8B-Instruct \
   --max-num-tokens 512 \
   --max-batch-size 2 \
   --kv-block-size 32 \

@@ -22,6 +22,9 @@ analysis/tables
 
 archives/
 
+# Wheel builds
+wheelhouse/
+
 # Master log file
 
 master_run.log
