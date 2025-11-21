@@ -126,9 +126,17 @@ Start Dynamo frontend
 python3 -m dynamo.frontend --http-port 9000
 ```
 
+One-time infra (etcd + nats) using docker compose
+-------------------------------------------------
+Run on the host once per system so the discovery and request plane services are up:
+```bash
+cd ~/dynamo
+docker compose -f deploy/docker-compose.yml up -d
+```
+
 Discovery card for Llama 3.1 8B (static file or etcd payload)
 --------------------------------------------------------------
-We standardize on the canonical HF repo `meta-llama/Llama-3.1-8B-Instruct`. A ready-to-use card is in `cards/llama3-8b.json`; it includes the correct paths/checksums to the cached snapshot (`0e9e39f...`). Use one of the two flows:
+We standardize on the canonical HF repo `meta-llama/Llama-3.1-8B-Instruct`. A ready-to-use card is in `cards/Llama-3.1-8B-Instruct.json`; it includes the correct paths/checksums to the cached snapshot (`0e9e39f...`). Use one of the two flows:
 
 - Static discovery (frontend):
   ```bash
@@ -142,9 +150,9 @@ We standardize on the canonical HF repo `meta-llama/Llama-3.1-8B-Instruct`. A re
   docker exec deploy-etcd-server-1 etcdctl del --prefix v1/mdc/dynamo/tensorrt_llm
   docker exec -i deploy-etcd-server-1 etcdctl put \
     v1/mdc/dynamo/tensorrt_llm/generate/7587890969240119941 \
-    < cards/llama3-8b.json
+    < cards/Llama-3.1-8B-Instruct.json
   ```
-  (If the worker is exporting discovery automatically, you can skip the manual put; otherwise this forces a clean, parseable entry.)
+  (Run this only after a fresh/cleared etcd or if a bad record was written. In steady state you seed once unless you wipe or corrupt the discovery store. If the worker exports clean records you can skip the manual put.)
 
 TRT-LLM worker container example (interactive):
 ```bash
@@ -176,12 +184,19 @@ Run worker without NIXL connect (KVBM enabled, CUDA KV off):
 ```bash
 python3 -m dynamo.trtllm \
   --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
-  --served-model-name Llama-3.1-8B-Instruct \
+  --served-model-name Meta-Llama-3.1-8B-Instruct \
   --max-num-tokens 512 \
   --max-batch-size 2 \
   --kv-block-size 32 \
   --extra-engine-args /workspace/kvbm_llm_api_config.yaml
 # omit --use-nixl-connect to keep NIXL transport off
+```
+
+Example request (matches the slug in the discovery card):
+```bash
+curl -X POST http://localhost:9000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"llama-3-1-8b-instruct","messages":[{"role":"user","content":"hello"}],"max_tokens":32}'
 ```
 
 ## Prompt length guardrail (16k engine)

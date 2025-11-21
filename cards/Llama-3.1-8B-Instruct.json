@@ -5,9 +5,10 @@
   "endpoint": "generate",
   "instance_id": 7587890969240119941,
   "card_json": {
-    "display_name": "Llama-3.1-8B-Instruct",
-    "slug": "Llama-3.1-8B-Instruct",
+    "display_name": "meta-llama/Llama-3.1-8B-Instruct",
+    "slug": "llama-3-1-8b-instruct",
     "hf_repo_id": "meta-llama/Llama-3.1-8B-Instruct",
+    "model_name": "meta-llama/Llama-3.1-8B-Instruct",
     "model_info": {
       "hf_config_json": {
         "path": "/root/.cache/huggingface/hub/models--meta-llama--Meta-Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659/config.json",
@@ -47,3 +48,5 @@
     }
   }
 }
+
+
