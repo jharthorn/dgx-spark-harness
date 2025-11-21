@@ -74,6 +74,60 @@ docker run --gpus all -it --rm \
 - **Stack B (Dynamo tiered KV)**: TRT-LLM + Dynamo KV manager with tier0 (hbm), tier1 (uma), tier2 (nvme). Endpoint default: 9000. Use `stackB_llama70b_dynamo_tiered.yaml`. Telemetry stubs exist; QoS/tier controls to be implemented.
 - **Stack B (8B testbed)**: Use `stackB_llama8b_dynamo_tiered.yaml` plus `serve_llama31_8b_fp4.sh` (or your own Dynamo front-end) for Llama 3.1 8B FP4 when 70B is too heavy.
 
+## Stack B (Dynamo) reproducible bring-up for Llama 3.1 8B
+Known-good sequence to avoid malformed discovery and HF 404s:
+
+1) Versions: ensure frontend and worker both use ai-dynamo/ai-dynamo-runtime 0.7.0 (`pip show ai-dynamo ai-dynamo-runtime` in both containers).
+2) Infra: `docker compose -f ~/dynamo/deploy/docker-compose.yml up -d` (etcd + nats).
+3) Seed discovery with the canonical card (one-time after a clean etcd):
+   ```bash
+   docker exec deploy-etcd-server-1 etcdctl del --prefix v1/mdc/dynamo/tensorrt_llm
+   docker exec -i deploy-etcd-server-1 etcdctl put \
+     v1/mdc/dynamo/tensorrt_llm/generate/694d9aa7979575ab \
+     < ~/dgx_spark_harness/cards/Llama-3.1-8B-Instruct.json
+   ```
+   The card uses `hf_repo_id: meta-llama/Meta-Llama-3.1-8B-Instruct` and snapshot paths.
+4) Frontend (host venv):
+   ```bash
+   export HF_TOKEN="$(<~/hftoken.txt)"
+   export DYN_DISCOVERY_BACKEND=kv_store
+   export DYN_STORE_KV=etcd
+   export DYN_NAMESPACE=dynamo
+   python3 -m dynamo.frontend --http-port 9000
+   ```
+5) Worker (container):
+   ```bash
+   python3 -m dynamo.trtllm \
+     --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+     --served-model-name Meta-Llama-3.1-8B-Instruct \
+     --max-num-tokens 512 --max-batch-size 2 --kv-block-size 32 \
+     --extra-engine-args /workspace/kvbm_llm_api_config.yaml
+   ```
+   Mount HF cache (`-v $HOME/.cache/huggingface:/root/.cache/huggingface`) and set `HF_TOKEN` in the container.
+6) Smoke test:
+   ```bash
+   curl -s http://127.0.0.1:9000/v1/models | jq .
+   curl -s -X POST http://127.0.0.1:9000/v1/chat/completions \
+     -H "Content-Type: application/json" \
+     -d '{"model":"meta-llama/Meta-Llama-3.1-8B-Instruct","messages":[{"role":"user","content":"Hello!"}],"max_tokens":64}'
+   ```
+   If the model list is empty, verify the namespace (`DYN_NAMESPACE`) and etcd keys under `v1/mdc/dynamo/tensorrt_llm`.
+7) Runner scripts: point Stack B endpoints at `http://127.0.0.1:9000` and use the model name `meta-llama/Meta-Llama-3.1-8B-Instruct` to match discovery.
+
+### Persist a worker image pinned to ai-dynamo 0.7.0
+Avoid re-installing wheels every run by baking a tagged image:
+```bash
+# Start a temp container, upgrade wheels from wheelhouse, and commit
+docker run --gpus all --ipc host --network host --rm -d --name spark-worker-setup \
+  -v ~/dgx_spark_harness:/workspace/harness \
+  -v $HOME/.cache/huggingface:/root/.cache/huggingface \
+  spark-dynamo-worker sleep infinity
+docker exec spark-worker-setup bash -lc "pip install --no-cache-dir /workspace/harness/wheelhouse/ai_dynamo_runtime-0.7.0-*.whl /workspace/harness/wheelhouse/ai_dynamo-0.7.0-*.whl"
+docker commit spark-worker-setup spark-dynamo-worker:0.7.0
+docker rm -f spark-worker-setup
+```
+Use `spark-dynamo-worker:0.7.0` in runner/env variables so future runs always launch the correct Dynamo version.
+
 ## Custom Dynamo image with KVBM (arm64)
 
 Upstream Dockerfile: https://github.com/ai-dynamo/dynamo/blob/main/container/Dockerfile  
@@ -190,6 +244,11 @@ python3 -m dynamo.trtllm \
   --kv-block-size 32 \
   --extra-engine-args /workspace/kvbm_llm_api_config.yaml
 # omit --use-nixl-connect to keep NIXL transport off
+```
+If the worker writes malformed discovery records while we debug, start it with export disabled:
+```bash
+DYNAMO_DISCOVERY_KV_EXPORT_ENABLED=false \
+python3 -m dynamo.trtllm ...
 ```
 
 Example request (matches the slug in the discovery card):

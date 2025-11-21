@@ -9,6 +9,9 @@ STACK_TAG=${2:-A}
 OUT="$RUN_DIR/sysmon.jsonl"
 NVME_DEVICE=${NVME_DEVICE:-nvme0n1}
 
+# TODO: add per-GPU metrics when multiple devices are present; capture GPU memory bandwidth if available.
+# TODO: add network telemetry (bytes/pps) and NUMA locality markers for KV pressure runs.
+# TODO: add NVMe namespace detection instead of fixed ${NVME_DEVICE}.
 SAMPLE_INTERVAL=0.5
 
 MPSTAT_OK=0
