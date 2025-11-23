@@ -13,7 +13,7 @@ runtime:
     kv_block_size_bytes: 65536
     eviction_policy: fifo
     tier0:
-      type: uma          # instead of hbm, treat this as "hot" UMA region
+      type: uma
       capacity_bytes: 4GiB
     tier1:
       type: uma

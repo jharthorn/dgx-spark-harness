@@ -259,6 +259,8 @@ export DYN_NAMESPACE=dynamo
 python3 -m dynamo.frontend --http-port 9000
 ```
 
+The worker commands below pass `--extra-engine-args /workspace/kvbm_llm_api_config.yaml`, which mounts `configs/kvbm_llm_api_8b.yaml` or `configs/kvbm_llm_api_70b.yaml` into the container and applies their KV cache / CUDA graph settings. If you change those files, restart the worker to pick them up.
+
 ## Worker (8B)
 
 ```bash
@@ -273,12 +275,12 @@ docker run --gpus all --ipc host --network host --rm -it \
   spark-dynamo-worker:latest \
   bash -lc "cd /workspace/harness/scripts && ./patch_nixl_opt_in.sh && \
             python3 -m dynamo.trtllm \
-              --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
-              --served-model-name meta-llama/Meta-Llama-3.1-8B-Instruct \
+              --model-path nvidia/Llama-3.1-8B-Instruct-NVFP4 \
+              --served-model-name nvidia/Llama-3.1-8B-Instruct-NVFP4 \
               --max-num-tokens 8192 \
               --max-batch-size 2 \
-              --kv-block-size 32 \
-              --extra-engine-args /workspace/kvbm_llm_api_config.yaml"
+                --kv-block-size 32 \
+                --extra-engine-args /workspace/kvbm_llm_api_config.yaml"
 ```
 
 ## Worker (70B)
@@ -295,10 +297,10 @@ docker run --gpus all --ipc host --network host --rm -it \
   spark-dynamo-worker:latest \
   bash -lc "cd /workspace/harness/scripts && ./patch_nixl_opt_in.sh && \
             python3 -m dynamo.trtllm \
-              --model-path meta-llama/Llama-3.3-70B-Instruct \
-              --served-model-name meta-llama/Llama-3.3-70B-Instruct \
-              --max-num-tokens 8192 \
-              --max-batch-size 2 \
+              --model-path nvidia/Llama-3.3-70B-Instruct-NVFP4 \
+              --served-model-name nvidia/Llama-3.3-70B-Instruct-NVFP4 \
+              --max-num-tokens 256 \
+              --max-batch-size 1 \
               --kv-block-size 32 \
               --extra-engine-args /workspace/kvbm_llm_api_config.yaml"
 ```
@@ -316,13 +318,13 @@ Simple completion:
 ```bash
 curl -i -X POST http://127.0.0.1:9000/v1/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"meta-llama/Meta-Llama-3.1-8B-Instruct","prompt":"Hello","max_tokens":16}'
+  -d '{"model":"nvidia/Llama-3.1-8B-Instruct-NVFP4","prompt":"Hello","max_tokens":16}'
 ```
 
 Run H2B:
 
 ```bash
-MODEL=meta-llama/Meta-Llama-3.1-8B-Instruct \
+MODEL=nvidia/Llama-3.1-8B-Instruct-NVFP4 \
 ENDPOINT=http://127.0.0.1:9000/v1/completions \
 CONCURRENCY=4 \
 DURATION=30 \
@@ -429,3 +431,4 @@ pip install ~/dgx_spark_harness/wheelhouse/ai_dynamo-0.7.0-py3-none-any.whl
 * Enhance `analysis/process_results.py` to correlate sysmon and dynkv.
 * Add KV hit/miss and tier residency tracking once telemetry is integrated.
 * Custom TRT engine instructions can be added in a separate doc if extended admits become required.
+* Runner gap: Stack B tier0/1/2 sizing/path in `configs/stackB_*_dynamo_tiered.yaml` is not wired into the worker launch; add a shim to read those YAMLs and export tier capacities/paths for the worker.

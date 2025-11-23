@@ -7,7 +7,7 @@ HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 source "$HARNESS_DIR/runs/_lib.sh"
 
 STACK="stackB"
-MODEL=${MODEL:-meta-llama/Meta-Llama-3.1-8B-Instruct}
+MODEL=${MODEL:-nvidia/Llama-3.1-8B-Instruct-NVFP4}
 WORKLOAD="fixed_context"
 CONCURRENCY=${CONCURRENCY:-32}
 DURATION=${DURATION:-180}
