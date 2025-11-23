@@ -10,6 +10,11 @@ ensure_run_dir() {
   mkdir -p "$dir"
 }
 
+record_pid() {
+  local pid=$1 run_dir=$2
+  echo "$pid" >>"$run_dir/telemetry.pids"
+}
+
 start_sysmon() {
   local run_dir=$1 stack_tag=$2
   bash "$HARNESS_DIR/src/telemetry/sysmon.sh" "$run_dir" "$stack_tag" >"$run_dir/sysmon.log" 2>&1 &
@@ -23,30 +28,42 @@ stop_sysmon() {
   fi
 }
 
-start_dynkv() {
+start_telemetry() {
   local run_dir=$1
-  local tier_path=${DYN_KVBM_TIER2_PATH:-/nvme/kvbm}
-  local interval=${DYN_KV_TELEMETRY_INTERVAL:-5}
+  local interval=${TELEMETRY_INTERVAL:-0.2}
+  local nvme_dev=${NVME_DEVICE:-nvme0n1}
+  local metrics_port=${DYN_KVBM_METRICS_PORT:-6880}
+  : >"$run_dir/telemetry.pids"
 
-  (
-    while :; do
-      ts=$(date -Ins)
-      size_bytes=$(du -sb "$tier_path" 2>/dev/null | awk '{print $1+0}')
-      if [[ -z "$size_bytes" ]]; then size_bytes=0; fi
-      df_line=$(df -B1 "$tier_path" 2>/dev/null | awk 'NR==2{print $2,$3,$4}')
-      read -r fs_size fs_used fs_avail <<<"${df_line:-0 0 0}"
-      cat <<EOF >> "$run_dir/dynkv.jsonl"
-{"ts":"${ts}","tier_path":"${tier_path}","bytes_used":${size_bytes},"fs_total_bytes":${fs_size:-0},"fs_used_bytes":${fs_used:-0},"fs_avail_bytes":${fs_avail:-0}}
-EOF
-      sleep "$interval"
-    done
-  ) >"$run_dir/dynkv.log" 2>&1 &
-  echo $! > "$run_dir/dynkv.pid"
+  # NVMe
+  python3 "$HARNESS_DIR/src/telemetry/nvme_iostat.py" \
+    --device "$nvme_dev" \
+    --interval-seconds "$interval" \
+    --output "$run_dir/nvme.jsonl" \
+    >"$run_dir/nvme.log" 2>&1 &
+  record_pid $! "$run_dir"
+
+  # GPU/UMA
+  python3 "$HARNESS_DIR/src/telemetry/gpu_poll.py" \
+    --interval-seconds "$interval" \
+    --output "$run_dir/gpu.jsonl" \
+    >"$run_dir/gpu.log" 2>&1 &
+  record_pid $! "$run_dir"
+
+  # Dynamo KV metrics (Prometheus endpoint exposed when DYN_KVBM_METRICS=true)
+  python3 "$HARNESS_DIR/src/telemetry/dynkv_ingest.py" \
+    --url "http://127.0.0.1:${metrics_port}/metrics" \
+    --interval-seconds "$interval" \
+    --output "$run_dir/dynkv.jsonl" \
+    >"$run_dir/dynkv.log" 2>&1 &
+  record_pid $! "$run_dir"
 }
 
-stop_dynkv() {
+stop_telemetry() {
   local run_dir=$1
-  if [[ -f "$run_dir/dynkv.pid" ]]; then
-    kill "$(cat "$run_dir/dynkv.pid")" 2>/dev/null || true
+  if [[ -f "$run_dir/telemetry.pids" ]]; then
+    while read -r pid; do
+      kill "$pid" 2>/dev/null || true
+    done <"$run_dir/telemetry.pids"
   fi
 }

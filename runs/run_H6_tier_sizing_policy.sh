@@ -7,7 +7,8 @@ HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 source "$HARNESS_DIR/runs/_lib.sh"
 
 STACK="stackB"
-MODEL="L70B"
+# Default to Llama 3.3 70B FP4; override MODEL env to switch.
+MODEL=${MODEL:-nvidia/Llama-3.3-70B-Instruct-NVFP4}
 WORKLOAD="fixed_context"
 CTX=1024
 CONCURRENCY=32
@@ -36,8 +37,8 @@ eviction_policy: ${POLICY}
 EOF
 
   start_sysmon "$RUN_DIR" "B"
-  start_dynkv "$RUN_DIR"
+  start_telemetry "$RUN_DIR"
   python3 "$HARNESS_DIR/src/loadgen.py" --config "$RUN_DIR/config.yaml" --run-id "$RUN_ID" --output-dir "$RUN_DIR"
   stop_sysmon "$RUN_DIR"
-  stop_dynkv "$RUN_DIR"
+  stop_telemetry "$RUN_DIR"
 done

@@ -264,11 +264,19 @@ The worker commands below pass `--extra-engine-args /workspace/kvbm_llm_api_conf
 ## Worker (8B)
 
 ```bash
+eval "$(python3 scripts/stackB_tier_env.py --config configs/stackB_llama8b_dynamo_tiered.yaml)"
+TIER2_ROOT=$(dirname "$DYN_KVBM_TIER2_PATH")
+
 docker run --gpus all --ipc host --network host --rm -it \
   -e HF_TOKEN="$(<~/hftoken.txt)" \
+  -e DYN_KVBM_METRICS=true \
+  -e DYN_KVBM_METRICS_PORT=${DYN_KVBM_METRICS_PORT:-6880} \
+  -e DYN_KVBM_TIER0_BYTES="$DYN_KVBM_TIER0_BYTES" \
+  -e DYN_KVBM_TIER1_BYTES="$DYN_KVBM_TIER1_BYTES" \
+  -e DYN_KVBM_TIER2_BYTES="$DYN_KVBM_TIER2_BYTES" \
   -e DYN_DISCOVERY_KV_EXPORT_ENABLED=false \
-  -e DYN_KVBM_TIER2_PATH=/nvme/kvbm/l8b \
-  -v /nvme/kvbm:/nvme/kvbm \
+  -e DYN_KVBM_TIER2_PATH="$DYN_KVBM_TIER2_PATH" \
+  -v "$TIER2_ROOT":"$TIER2_ROOT" \
   -v ~/dgx_spark_harness/configs/kvbm_llm_api_8b.yaml:/workspace/kvbm_llm_api_config.yaml \
   -v ~/dgx_spark_harness:/workspace/harness \
   -v $HOME/.cache/huggingface:/root/.cache/huggingface \
@@ -286,11 +294,19 @@ docker run --gpus all --ipc host --network host --rm -it \
 ## Worker (70B)
 
 ```bash
+eval "$(python3 scripts/stackB_tier_env.py --config configs/stackB_llama70b_dynamo_tiered.yaml)"
+TIER2_ROOT=$(dirname "$DYN_KVBM_TIER2_PATH")
+
 docker run --gpus all --ipc host --network host --rm -it \
   -e HF_TOKEN="$(<~/hftoken.txt)" \
+  -e DYN_KVBM_METRICS=true \
+  -e DYN_KVBM_METRICS_PORT=${DYN_KVBM_METRICS_PORT:-6880} \
+  -e DYN_KVBM_TIER0_BYTES="$DYN_KVBM_TIER0_BYTES" \
+  -e DYN_KVBM_TIER1_BYTES="$DYN_KVBM_TIER1_BYTES" \
+  -e DYN_KVBM_TIER2_BYTES="$DYN_KVBM_TIER2_BYTES" \
   -e DYN_DISCOVERY_KV_EXPORT_ENABLED=false \
-  -e DYN_KVBM_TIER2_PATH=/nvme/kvbm/l70b \
-  -v /nvme/kvbm:/nvme/kvbm \
+  -e DYN_KVBM_TIER2_PATH="$DYN_KVBM_TIER2_PATH" \
+  -v "$TIER2_ROOT":"$TIER2_ROOT" \
   -v ~/dgx_spark_harness/configs/kvbm_llm_api_70b.yaml:/workspace/kvbm_llm_api_config.yaml \
   -v ~/dgx_spark_harness:/workspace/harness \
   -v $HOME/.cache/huggingface:/root/.cache/huggingface \
@@ -330,6 +346,10 @@ CONCURRENCY=4 \
 DURATION=30 \
 ./runs/run_H2B_dynamo_kv_pressure.sh
 ```
+
+For 70B, set `MODEL=nvidia/Llama-3.3-70B-Instruct-NVFP4` and launch the worker with `configs/stackB_llama70b_dynamo_tiered.yaml` via `stackB_tier_env.py`.
+
+Runners start telemetry automatically and write JSONL into `results/<run_id>/`: `sysmon.jsonl` (CPU/mem/NVMe/gpu summary), `nvme.jsonl` (iostat-derived), `gpu.jsonl` (per-GPU util/memory), and `dynkv.jsonl` (KVBM Prometheus scrape).
 
 ---
 

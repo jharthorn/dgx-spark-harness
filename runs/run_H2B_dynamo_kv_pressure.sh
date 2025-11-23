@@ -7,6 +7,7 @@ HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 source "$HARNESS_DIR/runs/_lib.sh"
 
 STACK="stackB"
+# Default to 8B dev path; set MODEL=nvidia/Llama-3.3-70B-Instruct-NVFP4 for the 70B sweep.
 MODEL=${MODEL:-nvidia/Llama-3.1-8B-Instruct-NVFP4}
 WORKLOAD="fixed_context"
 CONCURRENCY=${CONCURRENCY:-32}
@@ -49,8 +50,8 @@ EOF
   echo "  input_len_margin : ${INPUT_LEN_MARGIN}"
 
   start_sysmon "$RUN_DIR" "B"
-  start_dynkv "$RUN_DIR"
+  start_telemetry "$RUN_DIR"
   python3 "$HARNESS_DIR/src/loadgen.py" --config "$RUN_DIR/config.yaml" --run-id "$RUN_ID" --output-dir "$RUN_DIR"
   stop_sysmon "$RUN_DIR"
-  stop_dynkv "$RUN_DIR"
+  stop_telemetry "$RUN_DIR"
 done
