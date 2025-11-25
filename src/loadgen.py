@@ -45,7 +45,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workload", default="fixed_context", choices=["fixed_context", "sessioned_chat"])
     parser.add_argument("--context_tokens", type=int, required=False)
     parser.add_argument("--concurrency", type=int, required=False)
-    parser.add_argument("--duration_s", type=int, default=60)
+    parser.add_argument(
+        "--duration_s",
+        type=int,
+        default=None,
+        help="Run duration seconds; required unless provided via --config",
+    )
     parser.add_argument("--max_input_len", type=int, default=None, help="Token-level guard (truncate prompt to this many tokens)")
     parser.add_argument("--tokenizer", default=None, help="HF tokenizer name_or_path; required with --max_input_len for accurate truncation")
     parser.add_argument("--input_len_margin", type=int, default=64, help="Safety margin tokens below max_input_len to avoid BOS/extra tokens overflow")

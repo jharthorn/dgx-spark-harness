@@ -288,7 +288,7 @@ docker run --gpus all --ipc host --network host --rm -it \
             python3 -m dynamo.trtllm \
               --model-path nvidia/Llama-3.1-8B-Instruct-NVFP4 \
               --served-model-name nvidia/Llama-3.1-8B-Instruct-NVFP4 \
-              --max-num-tokens 8192 \
+              --max-num-tokens 16000 \
               --max-batch-size 2 \
               --kv-block-size 32 \
               --extra-engine-args /workspace/kvbm_llm_api_config.yaml"
@@ -321,8 +321,8 @@ docker run --gpus all --ipc host --network host --rm -it \
             python3 -m dynamo.trtllm \
               --model-path nvidia/Llama-3.3-70B-Instruct-NVFP4 \
               --served-model-name nvidia/Llama-3.3-70B-Instruct-NVFP4 \
-              --max-num-tokens 256 \
-              --max-batch-size 1 \
+              --max-num-tokens 16000 \
+              --max-batch-size 4 \
               --kv-block-size 32 \
               --extra-engine-args /workspace/kvbm_llm_api_config.yaml"
 ```
@@ -463,3 +463,10 @@ pip install ~/dgx_spark_harness/wheelhouse/ai_dynamo-0.7.0-py3-none-any.whl
 * Add KV hit/miss and tier residency tracking once telemetry is integrated.
 * Custom TRT engine instructions can be added in a separate doc if extended admits become required.
 * Runner gap: Stack B tier0/1/2 sizing/path in `configs/stackB_*_dynamo_tiered.yaml` is not wired into the worker launch; add a shim to read those YAMLs and export tier capacities/paths for the worker.
+If you ever see HF cache permission errors (common after running containerized servers that wrote root-owned files under `~/.cache/huggingface`), either chown the cache `sudo chown -R $USER:$USER ~/.cache/huggingface` or keep a harness-local cache by exporting:
+
+```bash
+mkdir -p .cache/hf
+export HF_HOME=$PWD/.cache/hf
+export HF_HUB_CACHE=$PWD/.cache/hf
+```
