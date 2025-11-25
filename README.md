@@ -274,11 +274,14 @@ docker run --gpus all --ipc host --network host --rm -it \
   -e DYN_KVBM_TIER0_BYTES="$DYN_KVBM_TIER0_BYTES" \
   -e DYN_KVBM_TIER1_BYTES="$DYN_KVBM_TIER1_BYTES" \
   -e DYN_KVBM_TIER2_BYTES="$DYN_KVBM_TIER2_BYTES" \
+  -e DYN_KVBM_CPU_CACHE_GB=12 \
+  -e DYN_KVBM_DISK_CACHE_GB=256 \
   -e DYN_DISCOVERY_KV_EXPORT_ENABLED=false \
   -e DYN_KVBM_TIER2_PATH="$DYN_KVBM_TIER2_PATH" \
+  -p ${DYN_KVBM_METRICS_PORT:-6880}:${DYN_KVBM_METRICS_PORT:-6880} \
   -v "$TIER2_ROOT":"$TIER2_ROOT" \
-  -v ~/dgx_spark_harness/configs/kvbm_llm_api_8b.yaml:/workspace/kvbm_llm_api_config.yaml \
   -v ~/dgx_spark_harness:/workspace/harness \
+  -v ~/dgx_spark_harness/configs/kvbm_llm_api_8b.yaml:/workspace/kvbm_llm_api_config.yaml \
   -v $HOME/.cache/huggingface:/root/.cache/huggingface \
   spark-dynamo-worker:latest \
   bash -lc "cd /workspace/harness/scripts && ./patch_nixl_opt_in.sh && \
@@ -287,8 +290,8 @@ docker run --gpus all --ipc host --network host --rm -it \
               --served-model-name nvidia/Llama-3.1-8B-Instruct-NVFP4 \
               --max-num-tokens 8192 \
               --max-batch-size 2 \
-                --kv-block-size 32 \
-                --extra-engine-args /workspace/kvbm_llm_api_config.yaml"
+              --kv-block-size 32 \
+              --extra-engine-args /workspace/kvbm_llm_api_config.yaml"
 ```
 
 ## Worker (70B)
@@ -304,8 +307,11 @@ docker run --gpus all --ipc host --network host --rm -it \
   -e DYN_KVBM_TIER0_BYTES="$DYN_KVBM_TIER0_BYTES" \
   -e DYN_KVBM_TIER1_BYTES="$DYN_KVBM_TIER1_BYTES" \
   -e DYN_KVBM_TIER2_BYTES="$DYN_KVBM_TIER2_BYTES" \
+  -e DYN_KVBM_CPU_CACHE_GB=12 \
+  -e DYN_KVBM_DISK_CACHE_GB=256 \
   -e DYN_DISCOVERY_KV_EXPORT_ENABLED=false \
   -e DYN_KVBM_TIER2_PATH="$DYN_KVBM_TIER2_PATH" \
+  -p ${DYN_KVBM_METRICS_PORT:-6880}:${DYN_KVBM_METRICS_PORT:-6880} \
   -v "$TIER2_ROOT":"$TIER2_ROOT" \
   -v ~/dgx_spark_harness/configs/kvbm_llm_api_70b.yaml:/workspace/kvbm_llm_api_config.yaml \
   -v ~/dgx_spark_harness:/workspace/harness \
@@ -334,7 +340,12 @@ Simple completion:
 ```bash
 curl -i -X POST http://127.0.0.1:9000/v1/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"nvidia/Llama-3.1-8B-Instruct-NVFP4","prompt":"Hello","max_tokens":16}'
+  -d '{"model":"nvidia/Llama-3.1-8B-Instruct-NVFP4","prompt":"Hello","max_tokens":64}'
+```
+```bash
+curl -i -X POST http://127.0.0.1:9000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"nvidia/Llama-3.3-70B-Instruct-NVFP4","prompt":"Hello","max_tokens":64}'
 ```
 
 Run H2B:

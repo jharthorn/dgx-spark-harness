@@ -50,3 +50,4 @@ model_repository/
 
 trt_*/
 .hf_cache_fresh/
+scripts/cufile.log

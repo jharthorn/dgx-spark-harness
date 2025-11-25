@@ -5,7 +5,8 @@ if [[ -z "${HF_TOKEN:-}" ]] && [[ -f "$HOME/hftoken.txt" ]]; then
   export HF_TOKEN="$(<"$HOME/hftoken.txt")"
 fi
 export HF_TOKEN=${HF_TOKEN:?HF_TOKEN must be set}
-export MODEL_HANDLE="${MODEL_HANDLE:-nvidia/Llama-3.3-70B-Instruct-FP4}"
+# Default to NVIDIA's NVFP4 variant; override MODEL_HANDLE if needed.
+export MODEL_HANDLE="${MODEL_HANDLE:-nvidia/Llama-3.3-70B-Instruct-NVFP4}"
 export HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
 export ENGINE_DIR="${ENGINE_DIR:-}"                 # Optional: host path to a prebuilt TRT-LLM engine dir
 export TOKENIZER_DIR="${TOKENIZER_DIR:-}"           # Optional: host path to tokenizer (defaults to HF cache)

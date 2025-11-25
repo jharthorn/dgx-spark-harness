@@ -25,23 +25,26 @@ def query_gpus() -> List[Dict[str, object]]:
         print(f"[gpu_poll] nvidia-smi failed: {exc}", file=sys.stderr)
         return []
 
+    def parse_num(val: str) -> float:
+        try:
+            return float(val)
+        except Exception:
+            return 0.0
+
     gpus: List[Dict[str, object]] = []
     reader = csv.reader(out.splitlines())
     for row in reader:
         if len(row) < 4:
             continue
         uuid, mem_used, mem_total, util = [item.strip() for item in row[:4]]
-        try:
-            gpus.append(
-                {
-                    "uuid": uuid,
-                    "mem_used_mb": float(mem_used),
-                    "mem_total_mb": float(mem_total),
-                    "util_pct": float(util),
-                }
-            )
-        except ValueError:
-            continue
+        gpus.append(
+            {
+                "uuid": uuid,
+                "mem_used_mb": parse_num(mem_used),
+                "mem_total_mb": parse_num(mem_total),
+                "util_pct": parse_num(util),
+            }
+        )
     return gpus
 
 
