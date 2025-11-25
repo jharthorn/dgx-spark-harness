@@ -300,6 +300,15 @@ docker run --gpus all --ipc host --network host --rm -it \
 eval "$(python3 scripts/stackB_tier_env.py --config configs/stackB_llama70b_dynamo_tiered.yaml)"
 TIER2_ROOT=$(dirname "$DYN_KVBM_TIER2_PATH")
 
+# Optional: shrink tiers to force spill for H2B storage pressure runs
+export DYN_KVBM_TIER0_BYTES=${DYN_KVBM_TIER0_BYTES:-$((2 * 1024**3))}
+export DYN_KVBM_TIER1_BYTES=${DYN_KVBM_TIER1_BYTES:-$((8 * 1024**3))}
+export DYN_KVBM_TIER2_BYTES=${DYN_KVBM_TIER2_BYTES:-$((64 * 1024**3))}
+export DYN_KVBM_CPU_CACHE_GB=${DYN_KVBM_CPU_CACHE_GB:-4}
+export DYN_KVBM_DISK_CACHE_GB=${DYN_KVBM_DISK_CACHE_GB:-128}
+# Let dynkv_ingest derive bytes accurately
+export DYN_KVBM_KV_BLOCK_SIZE_BYTES=${DYN_KVBM_KV_BLOCK_SIZE_BYTES:-65536}
+
 docker run --gpus all --ipc host --network host --rm -it \
   -e HF_TOKEN="$(<~/hftoken.txt)" \
   -e DYN_KVBM_METRICS=true \

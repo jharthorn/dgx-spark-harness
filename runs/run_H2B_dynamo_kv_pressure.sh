@@ -14,7 +14,7 @@ CONCURRENCY=${CONCURRENCY:-32}
 DURATION=${DURATION:-180}
 ENDPOINT=${ENDPOINT:-http://127.0.0.1:9000/v1/completions}
 
-PROMPTS=(1024 2048 4096 6144)
+PROMPTS=(1024 2048 4096 6144 8192)
 RESULTS_BASE=${RESULTS_BASE:-$HARNESS_DIR/results}
 # Tokenizer-aware truncation (align with Stack B engine admit, defaults assume Llama-3.1-8B build at 8k).
 TOKENIZER=${TOKENIZER:-$MODEL}

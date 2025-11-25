@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import csv
 from pathlib import Path
 from typing import Dict, List
 
@@ -40,6 +41,83 @@ def load_jsonl(path: Path) -> List[Dict]:
     return records
 
 
+def load_dynkv_kv(run_dir: Path) -> Dict[str, float]:
+    """Load normalized KV CSV (if present) and derive aggregates using available metrics."""
+    path = run_dir / "dynkv_kv.csv"
+    if not path.exists():
+        return {}
+    total_offload = 0.0
+    total_onboard = 0.0
+    max_hit_rate_disk = None
+    max_hit_rate_host = None
+    with path.open("r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            def val(key: str):
+                v = row.get(key)
+                if v in (None, ""):
+                    return None
+                try:
+                    return float(v)
+                except ValueError:
+                    return None
+
+            off_d2h = val("derived_offload_bytes_d2h")
+            off_h2d = val("derived_offload_bytes_h2d")
+            off_d2d = val("derived_offload_bytes_d2d")
+            on_d2d = val("derived_onboard_bytes_d2d")
+            on_h2d = val("derived_onboard_bytes_h2d")
+
+            for v in (off_d2h, off_h2d, off_d2d):
+                if v is not None:
+                    total_offload += v
+            for v in (on_d2d, on_h2d):
+                if v is not None:
+                    total_onboard += v
+
+            hr_disk = val("hit_rate_disk")
+            hr_host = val("hit_rate_host")
+            if hr_disk is not None:
+                max_hit_rate_disk = hr_disk if max_hit_rate_disk is None else max(max_hit_rate_disk, hr_disk)
+            if hr_host is not None:
+                max_hit_rate_host = hr_host if max_hit_rate_host is None else max(max_hit_rate_host, hr_host)
+
+    return {
+        "kv_total_offload_bytes": total_offload,
+        "kv_total_onboard_bytes": total_onboard,
+        "kv_max_hit_rate_disk": max_hit_rate_disk,
+        "kv_max_hit_rate_host": max_hit_rate_host,
+    }
+
+
+def load_nvme(run_dir: Path) -> Dict[str, float]:
+    """Load NVMe JSONL samples and derive peak utilization/latency/queue depth."""
+    path = run_dir / "nvme.jsonl"
+    if not path.exists():
+        return {}
+    util = []
+    await_r = []
+    await_w = []
+    qdepth = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            data = rec.get("data", {})
+            util.append(data.get("util_pct", 0.0))
+            await_r.append(data.get("r_await_ms", 0.0))
+            await_w.append(data.get("w_await_ms", 0.0))
+            qdepth.append(data.get("avg_queue_depth", 0.0))
+    return {
+        "nvme_max_util_pct": max(util) if util else None,
+        "nvme_max_r_await_ms": max(await_r) if await_r else None,
+        "nvme_max_w_await_ms": max(await_w) if await_w else None,
+        "nvme_max_queue_depth": max(qdepth) if qdepth else None,
+    }
+
+
 def aggregate(run_dir: Path) -> Dict[str, object]:
     metrics = load_jsonl(run_dir / "metrics.jsonl")
     sysmon = load_jsonl(run_dir / "sysmon.jsonl")
@@ -50,7 +128,7 @@ def aggregate(run_dir: Path) -> Dict[str, object]:
     if not ttft or not e2e:
         return {}
     sample = metrics[0]
-    return {
+    result = {
         "run_id": sample.get("run_id"),
         "stack": sample.get("stack"),
         "model": sample.get("model"),
@@ -66,6 +144,9 @@ def aggregate(run_dir: Path) -> Dict[str, object]:
         "samples": len(e2e),
         "sysmon_samples": len(sysmon),
     }
+    result.update(load_dynkv_kv(run_dir))
+    result.update(load_nvme(run_dir))
+    return result
 
 
 def main() -> int:
@@ -94,6 +175,14 @@ def main() -> int:
         "p99_e2e_ms",
         "samples",
         "sysmon_samples",
+        "kv_total_offload_bytes",
+        "kv_total_onboard_bytes",
+        "kv_max_hit_rate_disk",
+        "kv_max_hit_rate_host",
+        "nvme_max_util_pct",
+        "nvme_max_r_await_ms",
+        "nvme_max_w_await_ms",
+        "nvme_max_queue_depth",
     ]
     with summary_path.open("w", encoding="utf-8") as out:
         out.write(",".join(headers) + "\n")

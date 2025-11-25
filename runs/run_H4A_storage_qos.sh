@@ -33,8 +33,28 @@ seed: 42
 phase: ${PHASE}
 EOF
 
+  # Optional QoS perturbation: run a background fio load during qos_degraded to demonstrate UMA insensitivity.
+  qos_pid=""
+  if [[ "$PHASE" == "qos_degraded" && "${H4A_QOS_FIO:-1}" == "1" ]]; then
+    QOS_PATH=${QOS_PATH:-/nvme/kvbm/l70b}
+    QOS_FILE=${QOS_FILE:-"$QOS_PATH/.qos_noise"}
+    QOS_SIZE=${QOS_SIZE:-4G}
+    QOS_IODEPTH=${QOS_IODEPTH:-8}
+    QOS_BS=${QOS_BS:-128k}
+    QOS_RW=${QOS_RW:-randread}
+    mkdir -p "$QOS_PATH"
+    fio --name=qos_noise --filename="$QOS_FILE" --size="$QOS_SIZE" --rw="$QOS_RW" \
+        --direct=1 --ioengine=libaio --iodepth="$QOS_IODEPTH" --bs="$QOS_BS" \
+        --time_based --runtime="$DURATION" --group_reporting --numjobs=1 \
+        >"$RUN_DIR/qos_fio.log" 2>&1 &
+    qos_pid=$!
+    echo "$qos_pid" >"$RUN_DIR/qos_fio.pid"
+  fi
+
   start_sysmon "$RUN_DIR" "A"
-  # TODO: apply fio QoS profile for ${PHASE} when implemented.
   python3 "$HARNESS_DIR/src/loadgen.py" --config "$RUN_DIR/config.yaml" --run-id "$RUN_ID" --output-dir "$RUN_DIR"
   stop_sysmon "$RUN_DIR"
+  if [[ -n "$qos_pid" ]]; then
+    kill "$qos_pid" 2>/dev/null || true
+  fi
 done

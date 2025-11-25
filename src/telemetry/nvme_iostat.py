@@ -40,7 +40,7 @@ def run_iostat(device: str) -> Optional[Dict[str, float]]:
         except Exception:
             return 0.0
 
-    return {
+    sample = {
         "device": device,
         "r_mb_s": get("rMB/s") if "rMB/s" in col_map else get("rkB/s") / 1024,
         "w_mb_s": get("wMB/s") if "wMB/s" in col_map else get("wkB/s") / 1024,
@@ -48,6 +48,13 @@ def run_iostat(device: str) -> Optional[Dict[str, float]]:
         "w_await_ms": get("w_await") if "w_await" in col_map else get("await"),
         "util_pct": get("%util") if "%util" in col_map else 0.0,
     }
+    if "avgqu-sz" in col_map:
+        sample["avg_queue_depth"] = get("avgqu-sz")
+    elif "aqu-sz" in col_map:
+        sample["avg_queue_depth"] = get("aqu-sz")
+    else:
+        sample["avg_queue_depth"] = 0.0
+    return sample
 
 
 def parse_args() -> argparse.Namespace:
