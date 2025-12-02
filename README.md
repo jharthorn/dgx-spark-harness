@@ -1,154 +1,37 @@
 # DGX Spark LLM Storage Harness
 
-Full-detail working reference for maintaining and running Stack A (TRT-LLM UMA) and Stack B (Dynamo tiered KV) under Test_Plan_v3.0.
+Implements the DGX Spark LLM Storage Harness for **Test Plan v3.3** (docs/Test_Plan_v3.3.md). v3.0 is superseded. Supports:
+- **Stack A** – UMA-only TRT-LLM (control)
+- **Stack B** – Dynamo + tiered KV (treatment)
 
-This harness drives UMA, KV cache, and NVMe under realistic LLM inference workloads on unified memory systems. It measures TTFT and E2E latency under queue pressure, context scaling, KV tiering, NVMe QoS perturbations, and KV working set growth.
-
----
-
-# Table of contents
-
-1. [Overview](#overview)
-2. [Repository layout](#repository-layout)
-3. [Requirements](#requirements)
-4. [Quick start (Stack A, H0 smoke test)](#quick-start-stack-a-h0-smoke-test)
-5. [Stack overview](#stack-overview)
-6. [Stack B bring-up (Dynamo tiered KV)](#stack-b-bring-up-dynamo-tiered-kv)
-
-   * [Infrastructure and discovery](#infrastructure-and-discovery)
-   * [Frontend](#frontend)
-   * [Worker (8B)](#worker-8b)
-   * [Worker (70B)](#worker-70b)
-   * [Sanity checks and H2B](#sanity-checks-and-h2b)
-7. [Prompt length guardrail](#prompt-length-guardrail)
-8. [Advanced: building a custom Dynamo + KVBM worker image](#advanced-building-a-custom-dynamo--kvbm-worker-image)
-9. [Notes and TODOs](#notes-and-todos)
+Designed to drive Comfy / Spill / Stress profiles across H0–H9 to measure queue knees (U_work), KV spill behavior, NVMe QoS sensitivity, context collapse points, and LoRA churn/resume behavior.
 
 ---
 
-# Overview
+## Overview
+- Harness = loadgen, runners, telemetry, analysis for Stack A/B side-by-side.
+- Uses long prompts, sessioned chat, and tier-aware env helpers.
+- Runners live in `runs/`; configs in `configs/`; telemetry + analysis in `analysis/`.
 
-This repository implements the v3 test harness defined in `Test_Plan_v3.0.md`.
-It supports two serving stacks:
+## Test Plan & Hypotheses
+- Current plan: `docs/Test_Plan_v3.3.md` (v3.0 kept only for history).
+- H0–H9 implemented via runner scripts listed below.
 
-### Stack A (TRT-LLM UMA only)
+## Environment Setup
 
-* Triton + TRT-LLM
-* UMA only; no Dynamo; no tiered KV
-* Uses TRT engines and checkpoints if present
-* Used for UMA control data: H0, H1, H2A, H3, H4A, H8A
-
-### Stack B (Dynamo tiered KV)
-
-* Dynamo frontend (HTTP) + `dynamo.trtllm` worker
-* Tiered KV cache (HBM → UMA → NVMe)
-* Does not use any TRT artifacts from Stack A
-* Used for KV and storage tests: H0, H2B, H3, H4B, H5, H6, H7, H8B
-
-The harness includes a load generator, realistic long prompts, concurrency and sessioned workloads, telemetry collectors, runner scripts, and summary analysis.
-
----
-
-# Repository layout
-
-```
-configs/
-  stackA_llama70b_baseline.yaml
-  stackB_llama70b_dynamo_tiered.yaml
-  stackB_llama8b_dynamo_tiered.yaml
-  kvbm_llm_api_8b.yaml
-  kvbm_llm_api_70b.yaml
-
-src/
-  loadgen.py
-  workloads/
-    fixed_context.py
-    sessioned_chat.py
-  telemetry/
-    sysmon.sh
-    (NVMe, GPU, Dynamo stubs)
-
-runs/
-  run_H0_queue_knee.sh
-  run_H1_coldwarm_lora.sh
-  run_H2A_uma_pressure.sh
-  run_H2B_dynamo_kv_pressure.sh
-  run_H4A_storage_qos.sh
-  run_H4B_dynamo_storage_qos.sh
-  run_H5_kv_workingset_scaling.sh
-  run_H6_tier_sizing_policy.sh
-  run_H7_kv_telemetry_sweep.sh
-  _lib.sh
-
-analysis/
-  process_results.py
-  backfill_summary.py
-  figures/
-
-inputs/
-  prompts/        (128 to 64k token realistic incident prompts)
-  lora_lists/
-
-cards/
-  Llama-3.1-8B-Instruct.json   (discovery card for Dynamo)
-
-scripts/
-  archive_results.sh
-  patch_nixl_opt_in.sh
-```
-
----
-
-# Requirements
-
-### Hardware
-
-* UMA GPU system such as DGX Spark
-* 128 GB unified memory recommended
-* NVMe local storage for KV tier 2
-
-### Software
-
-* Ubuntu 22.04 or DGX OS
-* Python 3.10 or 3.12
-* Docker and docker compose
-* Hugging Face token for:
-
-  * meta-llama/Meta-Llama-3.1-8B-Instruct
-  * meta-llama/Llama-3.3-70B-Instruct
-
-Set your token:
-
-```bash
-export HF_TOKEN="$(<~/hftoken.txt)"
-```
-
----
-
-# Quick start (Stack A, H0 smoke test)
-
-This validates the harness against a UMA-only TRT LLM endpoint on port 8355.
-
-### 1. Python environment
-
+Python virtualenv:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Start a TRT-LLM server
-
-Example:
-
+HF token:
 ```bash
-bash ./serve_llama33_70b_fp4.sh
+export HF_TOKEN="$(<~/hftoken.txt)"
 ```
 
-Ensure the endpoint matches `configs/stackA_llama70b_baseline.yaml`.
-
-### 3. Optional: harness inside container
-
+Optional: run the harness inside a container:
 ```bash
 docker run --gpus all -it --rm \
   --network host --ipc host \
@@ -158,96 +41,44 @@ docker run --gpus all -it --rm \
   nvcr.io/nvidia/pytorch:xx.xx-py3
 ```
 
-### 4. Run H0 queue knee
+## Stacks & Profiles
 
+### Stack A – UMA-only (TRT-LLM control)
+- TRT-LLM on UMA; no tiered KV.
+- Intended for H0, H2A, H4A, H8A and baselines.
+- Config: `configs/stackA_llama70b_baseline.yaml` (endpoint must match your TRT server).
+
+### Stack B – Dynamo tiered KV (treatment)
+- Dynamo frontend + `dynamo.trtllm` worker with KVBM.
+- KV tiers: Tier0/Tier1 in UMA, Tier2 on NVMe.
+- Used for H0, H2B, H3, H4B, H5, H6, H7, H8, and LoRA/H9 paths when supported.
+
+### Profiles (Comfy / Spill / Stress)
+- **Comfy** – KV fits in UMA; minimal Tier2 usage.
+- **Spill** – tiering active; realistic KV spill.
+- **Stress** – heavy spill, high concurrency, often with background I/O.
+
+Profile configs:
+- `configs/stackB_llama70b_dynamo_tiered.yaml` → Comfy
+- `configs/stackB_llama70b_dynamo_tiered_spill.yaml` → Spill
+- `configs/stackB_llama70b_dynamo_tiered_stress.yaml` → Stress
+
+`scripts/stackB_tier_env.py` now accepts `--profile` and is used by runners to set `DYN_KVBM_TIER*` envs for each profile.
+
+## Launching Servers
+
+### Stack A backend (TRT-LLM UMA)
 ```bash
-./runs/run_H0_queue_knee.sh http://127.0.0.1:8355/v1/completions
+bash ./serve_llama33_70b_fp4.sh
 ```
+Listens on port **8355** by default. Ensure `configs/stackA_llama70b_baseline.yaml` matches the endpoint and model handle.
 
-Output appears under:
-
-```
-results/<timestamp>_H0_stackA_*/{config.yaml,metrics.jsonl,sysmon.jsonl}
-```
-
-### 5. Analyze
-
-```bash
-python3 analysis/process_results.py
-cat analysis/figures/summary_v3.csv
-```
-
-### 6. Archive results
-
-```bash
-./scripts/archive_results.sh
-```
-
----
-
-# Stack overview
-
-## Stack A: UMA only, TRT-LLM
-
-* Endpoint: 8355
-* Config: `configs/stackA_llama70b_baseline.yaml`
-* Uses TRT engines and checkpoints if present
-* Test coverage: H0, H1, H2A, H3, H4A, H8A
-* Default TRT engine is normally sufficient; custom engines only required if:
-
-  * You need > default max sequence or input length
-  * You want specific max_tokens limits for experiments
-
-## Stack B: Dynamo tiered KV
-
-* Endpoint: 9000
-* Configs:
-
-  * `stackB_llama70b_dynamo_tiered.yaml`
-  * `stackB_llama8b_dynamo_tiered.yaml`
-* KV cache tiers:
-
-  * tier0: GPU HBM
-  * tier1: UMA
-  * tier2: NVMe
-* Does not use any TRT engines from Stack A
-* Test coverage: H0, H2B, H3, H4B, H5, H6, H7, H8B
-
-## 8B testbed
-
-* Lighter worker for development
-* Uses `configs/stackB_llama8b_dynamo_tiered.yaml`
-* Good for early H2B, QoS, and discovery validation
-
----
-
-# Stack B bring-up (Dynamo tiered KV)
-
-This section describes reliable bring-up for 8B and 70B stacks with Dynamo 0.7.0.
-
-## Infrastructure and discovery
-
-Start etcd + nats:
-
+### Stack B frontend
+Start discovery services (etcd + nats) once per host:
 ```bash
 cd ~/dynamo
-docker compose -f deploy/docker-compose.yml up -d
+docker compose -f deploy/docker-compose.yml up -d   # starts etcd + nats
 ```
-
-Seed the discovery store (only after a reset or if discovery is corrupt):
-
-```bash
-docker exec deploy-etcd-server-1 etcdctl del --prefix v1/mdc/dynamo/tensorrt_llm
-
-docker exec -i deploy-etcd-server-1 etcdctl put \
-  v1/mdc/dynamo/tensorrt_llm/generate/694d9aa7979575ab \
-  < ~/dgx_spark_harness/cards/Llama-3.1-8B-Instruct.json
-```
-
-## Frontend
-
-Run in a venv with the local wheels installed:
-
 ```bash
 source ~/dyn-venv/bin/activate
 
@@ -259,12 +90,12 @@ export DYN_NAMESPACE=dynamo
 python3 -m dynamo.frontend --http-port 9000
 ```
 
-The worker commands below pass `--extra-engine-args /workspace/kvbm_llm_api_config.yaml`, which mounts `configs/kvbm_llm_api_8b.yaml` or `configs/kvbm_llm_api_70b.yaml` into the container and applies their KV cache / CUDA graph settings. If you change those files, restart the worker to pick them up.
-
-## Worker (8B)
-
+### Stack B worker (profile-aware)
+Bring-up that applies profile KV sizing and mounts the KV config:
 ```bash
-eval "$(python3 scripts/stackB_tier_env.py --config configs/stackB_llama8b_dynamo_tiered.yaml)"
+PROFILE=spill  # comfy|spill|stress
+CONFIG=configs/stackB_llama70b_dynamo_tiered_${PROFILE}.yaml
+eval "$(python3 scripts/stackB_tier_env.py --profile "$PROFILE" --config "$CONFIG")"
 TIER2_ROOT=$(dirname "$DYN_KVBM_TIER2_PATH")
 
 docker run --gpus all --ipc host --network host --rm -it \
@@ -274,208 +105,97 @@ docker run --gpus all --ipc host --network host --rm -it \
   -e DYN_KVBM_TIER0_BYTES="$DYN_KVBM_TIER0_BYTES" \
   -e DYN_KVBM_TIER1_BYTES="$DYN_KVBM_TIER1_BYTES" \
   -e DYN_KVBM_TIER2_BYTES="$DYN_KVBM_TIER2_BYTES" \
-  -e DYN_KVBM_CPU_CACHE_GB=12 \
-  -e DYN_KVBM_DISK_CACHE_GB=256 \
-  -e DYN_DISCOVERY_KV_EXPORT_ENABLED=false \
+  -e DYN_KVBM_KV_BLOCK_SIZE_BYTES=${DYN_KVBM_KV_BLOCK_SIZE_BYTES:-65536} \
   -e DYN_KVBM_TIER2_PATH="$DYN_KVBM_TIER2_PATH" \
+  -e DYN_DISCOVERY_KV_EXPORT_ENABLED=false \
   -p ${DYN_KVBM_METRICS_PORT:-6880}:${DYN_KVBM_METRICS_PORT:-6880} \
   -v "$TIER2_ROOT":"$TIER2_ROOT" \
   -v ~/dgx_spark_harness:/workspace/harness \
-  -v ~/dgx_spark_harness/configs/kvbm_llm_api_8b.yaml:/workspace/kvbm_llm_api_config.yaml \
-  -v $HOME/.cache/huggingface:/root/.cache/huggingface \
-  spark-dynamo-worker:latest \
-  bash -lc "cd /workspace/harness/scripts && ./patch_nixl_opt_in.sh && \
-            python3 -m dynamo.trtllm \
-              --model-path nvidia/Llama-3.1-8B-Instruct-NVFP4 \
-              --served-model-name nvidia/Llama-3.1-8B-Instruct-NVFP4 \
-              --max-num-tokens 16000 \
-              --max-batch-size 2 \
-              --kv-block-size 32 \
-              --extra-engine-args /workspace/kvbm_llm_api_config.yaml"
-```
-
-## Worker (70B)
-
-```bash
-eval "$(python3 scripts/stackB_tier_env.py --config configs/stackB_llama70b_dynamo_tiered.yaml)"
-TIER2_ROOT=$(dirname "$DYN_KVBM_TIER2_PATH")
-
-# Optional: shrink tiers to force spill for H2B storage pressure runs
-export DYN_KVBM_TIER0_BYTES=${DYN_KVBM_TIER0_BYTES:-$((2 * 1024**3))}
-export DYN_KVBM_TIER1_BYTES=${DYN_KVBM_TIER1_BYTES:-$((8 * 1024**3))}
-export DYN_KVBM_TIER2_BYTES=${DYN_KVBM_TIER2_BYTES:-$((64 * 1024**3))}
-export DYN_KVBM_CPU_CACHE_GB=${DYN_KVBM_CPU_CACHE_GB:-4}
-export DYN_KVBM_DISK_CACHE_GB=${DYN_KVBM_DISK_CACHE_GB:-128}
-# Let dynkv_ingest derive bytes accurately
-export DYN_KVBM_KV_BLOCK_SIZE_BYTES=${DYN_KVBM_KV_BLOCK_SIZE_BYTES:-65536}
-
-docker run --gpus all --ipc host --network host --rm -it \
-  -e HF_TOKEN="$(<~/hftoken.txt)" \
-  -e DYN_KVBM_METRICS=true \
-  -e DYN_KVBM_METRICS_PORT=${DYN_KVBM_METRICS_PORT:-6880} \
-  -e DYN_KVBM_TIER0_BYTES="$DYN_KVBM_TIER0_BYTES" \
-  -e DYN_KVBM_TIER1_BYTES="$DYN_KVBM_TIER1_BYTES" \
-  -e DYN_KVBM_TIER2_BYTES="$DYN_KVBM_TIER2_BYTES" \
-  -e DYN_KVBM_CPU_CACHE_GB=12 \
-  -e DYN_KVBM_DISK_CACHE_GB=256 \
-  -e DYN_DISCOVERY_KV_EXPORT_ENABLED=false \
-  -e DYN_KVBM_TIER2_PATH="$DYN_KVBM_TIER2_PATH" \
-  -p ${DYN_KVBM_METRICS_PORT:-6880}:${DYN_KVBM_METRICS_PORT:-6880} \
-  -v "$TIER2_ROOT":"$TIER2_ROOT" \
   -v ~/dgx_spark_harness/configs/kvbm_llm_api_70b.yaml:/workspace/kvbm_llm_api_config.yaml \
-  -v ~/dgx_spark_harness:/workspace/harness \
   -v $HOME/.cache/huggingface:/root/.cache/huggingface \
   spark-dynamo-worker:latest \
   bash -lc "cd /workspace/harness/scripts && ./patch_nixl_opt_in.sh && \
             python3 -m dynamo.trtllm \
-              --model-path nvidia/Llama-3.3-70B-Instruct-NVFP4 \
-              --served-model-name nvidia/Llama-3.3-70B-Instruct-NVFP4 \
-              --max-num-tokens 16000 \
-              --max-batch-size 4 \
-              --kv-block-size 32 \
+              --model-path ${MODEL_HANDLE:-nvidia/Llama-3.3-70B-Instruct-NVFP4} \
+              --served-model-name ${MODEL_HANDLE:-nvidia/Llama-3.3-70B-Instruct-NVFP4} \
+              --kv-block-size ${KV_BLOCK_SIZE:-32} \
               --extra-engine-args /workspace/kvbm_llm_api_config.yaml"
 ```
+Simplified 8B dev worker: set `PROFILE=comfy` and `CONFIG=configs/stackB_llama8b_dynamo_tiered.yaml`, then change `MODEL_HANDLE` to `nvidia/Llama-3.1-8B-Instruct-NVFP4` and mount `configs/kvbm_llm_api_8b.yaml`.
 
-## Sanity checks and H2B
+## Running Tests (H0–H9)
 
-Check models:
-
+### Quick path (v3.3)
 ```bash
-curl -s http://127.0.0.1:9000/v1/models | jq .
+# After Stack A (8355) and Stack B (9000) are online:
+./runs/run_H0_queue_knee.sh          # Stack A/B; computes U_work
+./runs/run_H2B_dynamo_kv_pressure.sh # KV spill behavior (Spill/Stress)
+./runs/run_H4B_dynamo_storage_qos.sh # QoS under storage noise
+./runs/run_H8_hero_scenario.sh       # Hero Stack A vs Stack B
+
+python3 analysis/process_results.py
 ```
+Shows U_work queue knees, spill behavior, storage sensitivity, and Stack A vs B hero comparison.
 
-Simple completion:
+### Hypothesis → runner map
+- H0 — `run_H0_queue_knee.sh` (Stack A/B, Comfy) — finds U_work queue knee.
+- H1 — `run_H1_lora_thrash.sh` (Stack B + LoRA proxy, Spill) — adapter churn + Tier2 traffic.
+- H2A — `run_H2A_uma_pressure.sh` (Stack A, Comfy/Spill) — UMA pressure vs U_work.
+- H2B — `run_H2B_dynamo_kv_pressure.sh` (Stack B, Spill/Stress) — KV spill pressure.
+- H3 — `run_H3_context_envelope.sh` (Stack A/B, Stress) — context window collapse limits.
+- H4A — `run_H4A_storage_qos.sh` (Stack A, Spill) — storage QoS without tiering.
+- H4B — `run_H4B_dynamo_storage_qos.sh` (Stack B, Spill/Stress + fio) — NVMe QoS impact.
+- H5 — `run_H5_kv_workingset_scaling.sh` (Stack B, Spill + LoRA proxy) — KV working set growth.
+- H6 — `run_H6_tier_sizing_policy.sh` (Stack B, Spill) — Tier0/1 sizing sweeps.
+- H7 — `run_H7_kv_telemetry_sweep.sh` (Stack B, Stress) — telemetry cadence + collapse.
+- H8 — `run_H8_hero_scenario.sh` (Stack A vs B, mixed) — side-by-side hero comparison.
+- H9 — `run_H9_rehydration.sh` (Stack B, Stress) — session resume; currently blocked (see status).
 
+## LoRA Adapter Churn (H1, H5)
+H1/H5 simulate high-cardinality LoRA usage by adding per-request `adapter_id` plus Tier2 I/O:
+- Loadgen flags: `--lora_adapter_count`, `--lora_adapter_list`, `--lora_churn_mode`, `--lora_hot_ratio`, `--lora_hot_prob`.
+- `adapter_id` is carried into metrics for churn analysis.
+
+`scripts/adapter_proxy.py`:
+- Listens on port 9100.
+- Accepts OpenAI-style requests with `adapter_id`, strips it, forwards to the real backend (e.g., `http://127.0.0.1:9000/v1/completions`).
+- For each adapter, performs a 1 MiB write + read under `$DYN_KVBM_TIER2_PATH/lora/<adapter_id>` to drive Tier2 traffic.
+
+Usage:
 ```bash
-curl -i -X POST http://127.0.0.1:9000/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"nvidia/Llama-3.1-8B-Instruct-NVFP4","prompt":"Hello","max_tokens":64}'
+# Terminal 1
+BACKEND_URL=http://127.0.0.1:9000/v1/completions \
+DYN_KVBM_TIER2_PATH=/nvme/kvbm/l70b \
+python3 scripts/adapter_proxy.py
+
+# Terminal 2
+ENDPOINT=http://127.0.0.1:9100/v1/completions \
+./runs/run_H1_lora_thrash.sh
 ```
+Synthetic but storage-realistic: churn hits Tier2 even though the worker does not yet natively load LoRA weights.
+
+## Telemetry & Analysis
+- Per-run outputs under `results/<run_id>/`:
+  - `metrics.jsonl` (request-level metrics incl. adapter_id, workload, session info)
+  - `sysmon.jsonl` (CPU, memory, NVMe, GPU)
+  - `dynkv.jsonl` + `dynkv_kv.csv` (KV movement, tier2_bytes_in_delta, etc.)
+- Aggregate and derive U_work / knees / storage heuristics:
 ```bash
-curl -i -X POST http://127.0.0.1:9000/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"nvidia/Llama-3.3-70B-Instruct-NVFP4","prompt":"Hello","max_tokens":64}'
+python3 analysis/process_results.py
 ```
+Writes `analysis/figures/summary_v3.csv`, `analysis/figures/uwork.csv`, and per-hypothesis CSVs (H4B_p99_vs_nvme.csv, H2, H5, H8, H9 as implemented).
 
-Run H2B:
+## Known Limitations / Status per Hypothesis
+- H0/H2/H4/H5/H6/H7/H8: runnable under v3.3 harness; see Test Plan for nuances.
+- H1: LoRA behavior simulated via adapter proxy; Tier2 churn is real but worker does not natively load LoRA adapters.
+- H9: Blocked by current Dynamo OpenAI frontend; harness sends `session_id`/resume metadata but frontend 400s it, so full KV rehydration requires stack changes.
 
-```bash
-MODEL=nvidia/Llama-3.1-8B-Instruct-NVFP4 \
-ENDPOINT=http://127.0.0.1:9000/v1/completions \
-CONCURRENCY=4 \
-DURATION=30 \
-./runs/run_H2B_dynamo_kv_pressure.sh
-```
-
-For 70B, set `MODEL=nvidia/Llama-3.3-70B-Instruct-NVFP4` and launch the worker with `configs/stackB_llama70b_dynamo_tiered.yaml` via `stackB_tier_env.py`.
-
-Runners start telemetry automatically and write JSONL into `results/<run_id>/`: `sysmon.jsonl` (CPU/mem/NVMe/gpu summary), `nvme.jsonl` (iostat-derived), `gpu.jsonl` (per-GPU util/memory), and `dynkv.jsonl` (KVBM Prometheus scrape).
-
----
-
-# Prompt length guardrail
-
-For Stack A or Stack B, use tokenizer-aware truncation:
-
-```bash
-python3 src/loadgen.py \
-  --endpoint http://127.0.0.1:8355/v1/completions \
-  --stack stackA \
-  --model nvidia/Llama-3.3-70B-Instruct-FP4 \
-  --tokenizer nvidia/Llama-3.3-70B-Instruct-FP4 \
-  --max_input_len 16000 \
-  --input_len_margin 64 \
-  --workload fixed_context \
-  --context_tokens 16384 \
-  --prompt-file inputs/prompts/16384_tokens.txt \
-  --concurrency 1 \
-  --duration_s 20 \
-  --nonce_per_user
-```
-
-`MAX_INPUT_LEN` also controls H2A behavior in runner scripts.
-
----
-
-# Advanced: building a custom Dynamo + KVBM worker image
-
-This accelerates rebuilds and ensures workers always start with known-good wheel versions.
-
-### Build wheels
-
-Local Dockerfile: `container/Dockerfile`
-
-Example:
-
-```bash
-cd ~/dynamo
-
-BASE_IMAGE=nvcr.io/nvidia/cuda
-BASE_IMAGE_TAG=12.6.3-devel-ubuntu22.04
-
-./container/build.sh \
-  --framework none \
-  --enable-kvbm \
-  --tag kvbm-wheel \
-  --build-arg ARCH=arm64 \
-  --build-arg ARCH_ALT=aarch64 \
-  --build-arg BASE_IMAGE=$BASE_IMAGE \
-  --build-arg BASE_IMAGE_TAG=$BASE_IMAGE_TAG \
-  --build-arg NIXL_UCX_REF=1.20.0 \
-  --platform linux/arm64
-```
-
-Extract wheels:
-
-```bash
-docker create --name kvbm-wheel kvbm-wheel
-docker cp kvbm-wheel:/opt/dynamo/wheelhouse ./wheelhouse
-docker rm kvbm-wheel
-```
-
-### Persist a worker image
-
-```bash
-docker run --gpus all --ipc host --network host --rm -d \
-  --name spark-worker-setup \
-  -v ~/dgx_spark_harness:/workspace/harness \
-  -v $HOME/.cache/huggingface:/root/.cache/huggingface \
-  spark-dynamo-worker sleep infinity
-
-docker exec spark-worker-setup bash -lc "\
-  pip install --no-cache-dir \
-    /workspace/harness/wheelhouse/ai_dynamo_runtime-0.7.0-*.whl \
-    /workspace/harness/wheelhouse/ai_dynamo-0.7.0-*.whl \
-    /workspace/harness/wheelhouse/nixl/*.whl \
-    /workspace/harness/wheelhouse/kvbm*.whl || true"
-
-docker commit spark-worker-setup spark-dynamo-worker:0.7.0
-docker rm -f spark-worker-setup
-```
-
-### Frontend using local wheels
-
-```bash
-source ~/dyn-venv/bin/activate
-
-pip install ~/dgx_spark_harness/wheelhouse/ai_dynamo_runtime-0.7.0-*.whl
-pip install ~/dgx_spark_harness/wheelhouse/ai_dynamo-0.7.0-py3-none-any.whl
-```
-
----
-
-# Notes and TODOs
-
-* Stack B telemetry is partially stubbed; expand NVMe, GPU, Dynamo ingestion.
-* Extend `sessioned_chat.py` for multi turn state reuse.
-* Enhance `analysis/process_results.py` to correlate sysmon and dynkv.
-* Add KV hit/miss and tier residency tracking once telemetry is integrated.
-* Custom TRT engine instructions can be added in a separate doc if extended admits become required.
-* Runner gap: Stack B tier0/1/2 sizing/path in `configs/stackB_*_dynamo_tiered.yaml` is not wired into the worker launch; add a shim to read those YAMLs and export tier capacities/paths for the worker.
-If you ever see HF cache permission errors (common after running containerized servers that wrote root-owned files under `~/.cache/huggingface`), either chown the cache `sudo chown -R $USER:$USER ~/.cache/huggingface` or keep a harness-local cache by exporting:
-
-```bash
-mkdir -p .cache/hf
-export HF_HOME=$PWD/.cache/hf
-export HF_HUB_CACHE=$PWD/.cache/hf
-```
+## Advanced Topics
+- Custom worker images or wheel builds (see `container/` and `wheelhouse/` for local builds).
+- HF cache permissions: if container runs leave root-owned files, fix with `sudo chown -R $USER:$USER ~/.cache/huggingface` or set a harness-local cache via:
+  ```bash
+  mkdir -p .cache/hf
+  export HF_HOME=$PWD/.cache/hf
+  export HF_HUB_CACHE=$PWD/.cache/hf
+  ```
+- Prompt length guardrails and TRT engine overrides remain in the runner/env defaults; adjust `STACKB_MAX_*` and `DYN_KVBM_*` before launching workers for custom admits.

@@ -7,13 +7,14 @@ set -euo pipefail
 #
 # Usage:
 #   ./setup_triton_server_llama.sh L70B --max-input-len 16384 --max-seq-len 32768 --max-num-tokens 16384
+#   PROFILE=spill ./setup_triton_server_llama.sh L70B   # pick tier env + context limits from spill profile
 #   ./setup_triton_server_llama.sh L8B   # uses defaults (8192/16384/8192)
 #
 # The script launches an NVIDIA TensorRT-LLM container, downloads the Hugging Face checkpoint,
 # builds the engine with the requested sequence lengths, and syncs it into model_repository/.
 
 if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <L8B|L70B> [--max-input-len TOKENS] [--max-seq-len TOKENS] [--max-num-tokens TOKENS] [--engine-dir PATH]" >&2
+  echo "Usage: $0 <L8B|L70B> [--profile comfy|spill|stress] [--max-input-len TOKENS] [--max-seq-len TOKENS] [--max-num-tokens TOKENS] [--engine-dir PATH]" >&2
   exit 1
 fi
 
@@ -40,14 +41,17 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 export HARNESS_DIR=${HARNESS_DIR:-$SCRIPT_DIR}
 MODEL_TAG="$1"; shift
 
-MAX_INPUT_LEN=${MAX_INPUT_LEN:-8192}
-MAX_SEQ_LEN=${MAX_SEQ_LEN:-16384}
-MAX_NUM_TOKENS=${MAX_NUM_TOKENS:-8192}
+PROFILE=${PROFILE:-}
+MAX_INPUT_LEN=${MAX_INPUT_LEN:-}
+MAX_SEQ_LEN=${MAX_SEQ_LEN:-}
+MAX_NUM_TOKENS=${MAX_NUM_TOKENS:-}
 ENGINE_DIR_OVERRIDE=""
 CKPT_DIR_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --profile)
+      PROFILE="$2"; shift 2;;
     --max-input-len)
       MAX_INPUT_LEN="$2"; shift 2;;
     --max-seq-len)
@@ -62,6 +66,26 @@ while [[ $# -gt 0 ]]; do
       echo "Unknown option: $1" >&2; exit 1;;
   esac
 done
+
+if [[ -n "$PROFILE" ]]; then
+  STACKB_PROFILE="$PROFILE"
+  TIER_ENV_SCRIPT="$HARNESS_DIR/scripts/stackB_tier_env.py"
+  if [[ -x "$TIER_ENV_SCRIPT" ]]; then
+    echo "--- Loading Stack B env for profile '$PROFILE' ---"
+    if env_output=$(python3 "$TIER_ENV_SCRIPT" --profile "$PROFILE"); then
+      eval "$env_output"
+    else
+      echo "ERROR: failed to load Stack B env for profile '$PROFILE'" >&2
+      exit 1
+    fi
+  else
+    echo "Warning: $TIER_ENV_SCRIPT not found; skipping profile env load" >&2
+  fi
+fi
+
+MAX_INPUT_LEN=${STACKB_MAX_INPUT_LEN:-${MAX_INPUT_LEN:-8192}}
+MAX_SEQ_LEN=${STACKB_MAX_SEQ_LEN:-${MAX_SEQ_LEN:-16384}}
+MAX_NUM_TOKENS=${STACKB_MAX_NUM_TOKENS:-${MAX_NUM_TOKENS:-8192}}
 
 validate_positive_int "$MAX_INPUT_LEN"
 validate_positive_int "$MAX_SEQ_LEN"
@@ -98,6 +122,7 @@ case "$MODEL_REPO_TARGET" in
 esac
 
 ENGINE_SUBPATH=${ENGINE_DIR#"$HARNESS_DIR"/}
+CKPT_DIR_CONTAINER=${CKPT_DIR_HOST:+/workspace/ckpt_override}
 
 mkdir -p "$HF_CACHE" "$ENGINE_DIR"
 
@@ -108,6 +133,7 @@ echo " Max sequence : $MAX_SEQ_LEN tokens"
 echo " Max tokens   : $MAX_NUM_TOKENS tokens (build_config.max_num_tokens)"
 echo " Output dir   : $ENGINE_DIR"
 [[ -n "$CKPT_DIR_HOST" ]] && echo " Checkpoint   : $CKPT_DIR_HOST"
+[[ -n "$STACKB_PROFILE" ]] && echo " Profile env  : ${STACKB_PROFILE:-custom} (${STACKB_TIER_CONFIG:-manual})"
 
 docker run --rm -i \
   --gpus all \
@@ -121,9 +147,10 @@ docker run --rm -i \
   -e MAX_SEQ_LEN="$MAX_SEQ_LEN" \
   -e MAX_NUM_TOKENS="$MAX_NUM_TOKENS" \
   -e ENGINE_SUBPATH="$ENGINE_SUBPATH" \
-  ${CKPT_DIR_HOST:+-e CKPT_DIR_OVERRIDE="/workspace/harness/${CKPT_DIR_HOST#$HARNESS_DIR/}"} \
+  ${CKPT_DIR_CONTAINER:+-e CKPT_DIR_OVERRIDE="$CKPT_DIR_CONTAINER"} \
   -v "$HF_CACHE:/root/.cache/huggingface" \
   -v "$HARNESS_DIR:/workspace/harness" \
+  ${CKPT_DIR_HOST:+-v "$CKPT_DIR_HOST":"$CKPT_DIR_CONTAINER":ro} \
   --entrypoint /bin/bash \
   "$TRT_LLM_IMAGE" \
   -s <<'EOS'
@@ -135,6 +162,14 @@ mkdir -p "$BUILD_DIR"
 if [[ -n "${CKPT_DIR_OVERRIDE:-}" ]]; then
   CKPT_DIR="$CKPT_DIR_OVERRIDE"
   echo "Using provided checkpoint directory: $CKPT_DIR"
+  # If the checkpoint is mounted read-only (common when bind-mounting host snapshots), copy to a writable location
+  # so we can patch config.json for architecture metadata.
+  CKPT_RW=/workspace/ckpt_rw
+  rm -rf "$CKPT_RW"
+  mkdir -p "$CKPT_RW"
+  rsync -a "$CKPT_DIR"/ "$CKPT_RW"/
+  CKPT_DIR="$CKPT_RW"
+  echo "Checkpoint copied to writable path: $CKPT_DIR"
 else
   echo "Downloading ${MODEL_HANDLE} ..."
   DOWNLOAD_LOG=/tmp/hf_download.log

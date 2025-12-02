@@ -1,4 +1,4 @@
-# Stack A (UMA-only) config per Test_Plan_v3.0.md Section 4.1
+# Stack A (UMA-only) config per Test_Plan_v3.3 Section 4.1
 stack: stackA_uma_only
 model:
   name: llama3-70b

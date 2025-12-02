@@ -1,13 +1,14 @@
-# Stack B (Dynamo tiered KV) Comfy profile (Test_Plan_v3.3)
-# - UMA KV budget: ~16 GiB (T0+T1) for transparency vs Stack A
-# - Context window: 2k–4k; safe defaults for H0B/H2B Comfy and hero baselines
+# Stack B (Dynamo tiered KV) Stress profile for H3/H7/H8/H9 (Test_Plan_v3.3)
+# - UMA KV budget: 1–2 GiB (T0+T1) to force heavy tier2 fetch latency
+# - Context window: up to 8k (requires matching worker build)
 stack: stackB_dynamo_tiered
 model:
   name: llama3-70b
   precision: fp4
-  max_input_len: 4096
+  max_input_len: 8192
   max_seq_len: 16384
-  max_num_tokens: 16384  # rebuilt engine recommended
+  max_num_tokens: 32000
+  max_batch_size: 2
 endpoint:
   url: http://stackB-dynamo:9000/v1/completions  # Triton + Dynamo front-end
   protocol: triton_dynamo
@@ -18,14 +19,14 @@ runtime:
     eviction_policy: lru
     tier0:
       type: uma
-      capacity_bytes: 8GiB
+      capacity_bytes: 512MiB
     tier1:
       type: uma
-      capacity_bytes: 8GiB
+      capacity_bytes: 1GiB
     tier2:
       type: nvme
       path: /nvme/kvbm/l70b
-      allocate_bytes: 256GiB
+      allocate_bytes: 128GiB
     telemetry_enable: true
     telemetry_interval_ms: 200  # v3.3 cadence
 telemetry:

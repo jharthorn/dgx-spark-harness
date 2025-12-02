@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# H4A storage QoS sensitivity (Test_Plan_v3.0 Section 8.4A, Stack A control)
+# H4A storage QoS sensitivity (Test_Plan_v3.3 Section 8.4A, Stack A control)
 
 HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 source "$HARNESS_DIR/runs/_lib.sh"
 
 STACK="stackA"
-MODEL="L70B"
+# Default to Llama 3.3 70B NVFP4; override MODEL env to switch (e.g., 8B for smoke).
+MODEL=${MODEL:-nvidia/Llama-3.3-70B-Instruct-NVFP4}
 WORKLOAD="fixed_context"
 CTX=2048
 CONCURRENCY=32
 DURATION=180
 ENDPOINT=${ENDPOINT:-http://127.0.0.1:8355/v1/completions}
 RESULTS_BASE=${RESULTS_BASE:-$HARNESS_DIR/results}
+PROFILE=${PROFILE:-comfy}
 
 for PHASE in baseline qos_degraded; do
   RUN_ID="$(rt_ts)_H4A_${PHASE}_${STACK}_${MODEL}"
@@ -22,6 +24,7 @@ for PHASE in baseline qos_degraded; do
 
   cat > "$RUN_DIR/config.yaml" <<EOF
 stack: ${STACK}
+profile: ${PROFILE}
 model: ${MODEL}
 workload: ${WORKLOAD}
 context_tokens: ${CTX}

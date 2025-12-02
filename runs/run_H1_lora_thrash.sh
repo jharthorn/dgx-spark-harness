@@ -1,28 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# H7 KV telemetry sweep (Test_Plan_v3.3 Section 8.7, Stack B)
+# H1 LoRA bandwidth / adapter churn ("Infinite LoRA") per Test_Plan_v3.3
+# Stack B Spill profile with Tier2-backed adapters and nonce_per_user enabled.
 
 HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 source "$HARNESS_DIR/runs/_lib.sh"
 
 STACK="stackB"
-PROFILE=${PROFILE:-stress}  # Stress profile to maximize tier2 fetches for telemetry cadence sweeps
+PROFILE=${PROFILE:-spill}  # Spill profile to force tier2-backed adapters during churn
 apply_profile_env "$PROFILE"
-# Default to Llama 3.3 70B NVFP4; override MODEL env to switch.
+
 MODEL=${MODEL:-nvidia/Llama-3.3-70B-Instruct-NVFP4}
 MODEL_TAG=${MODEL_TAG:-$(model_tag "$MODEL")}
 WORKLOAD="fixed_context"
-CTX=1024
-CONCURRENCY=32
-DURATION=120
+CTX=${CTX:-4096}
+CONCURRENCY=${CONCURRENCY:-32}
+DURATION=${DURATION:-180}
 ENDPOINT=${ENDPOINT:-http://127.0.0.1:9000/v1/completions}
 RESULTS_BASE=${RESULTS_BASE:-$HARNESS_DIR/results}
+ADAPTER_COUNTS=(${ADAPTER_COUNTS:-100 200 300})
+LORA_CHURN_MODE=${LORA_CHURN_MODE:-random}
 
-TELEMETRY_INTERVALS=(${TELEMETRY_INTERVALS:-0.1 0.2 0.5 1 5})
-
-for INTERVAL in "${TELEMETRY_INTERVALS[@]}"; do
-  RUN_ID="$(rt_ts)_H7_${PROFILE}_${STACK}_${MODEL_TAG}_${INTERVAL}s"
+for COUNT in "${ADAPTER_COUNTS[@]}"; do
+  RUN_ID="$(rt_ts)_H1_${PROFILE}_${STACK}_${MODEL_TAG}_${COUNT}adpt"
   RUN_DIR="$RESULTS_BASE/${RUN_ID}"
   ensure_run_dir "$RUN_DIR"
 
@@ -37,11 +38,13 @@ duration_s: ${DURATION}
 endpoint: ${ENDPOINT}
 nonce_per_user: true
 seed: 42
+lora_adapter_count: ${COUNT}
+lora_churn_mode: ${LORA_CHURN_MODE}
 EOF
 
-  TELEMETRY_INTERVAL="$INTERVAL" start_sysmon "$RUN_DIR" "B"
-  TELEMETRY_INTERVAL="$INTERVAL" start_telemetry "$RUN_DIR"
-  TELEMETRY_INTERVAL="$INTERVAL" python3 "$HARNESS_DIR/src/loadgen.py" --config "$RUN_DIR/config.yaml" --run-id "$RUN_ID" --output-dir "$RUN_DIR"
+  start_sysmon "$RUN_DIR" "B"
+  start_telemetry "$RUN_DIR"
+  python3 "$HARNESS_DIR/src/loadgen.py" --config "$RUN_DIR/config.yaml" --run-id "$RUN_ID" --output-dir "$RUN_DIR"
   stop_sysmon "$RUN_DIR"
   stop_telemetry "$RUN_DIR"
 done

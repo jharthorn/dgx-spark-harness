@@ -1,5 +1,7 @@
 # DGX Spark Storage-Aware Inference Test Plan (v3.0)
 
+> Superseded by `docs/Test_Plan_v3.3.md` (kept for historical reference)
+
 Target platform: **NVIDIA DGX Spark**, GB10 Grace Blackwell
 128 GB coherent unified memory • 4 TB NVMe • 8B and 70B Llama models
 *(Source: Test Plan 3.0 ODT)* 
@@ -312,8 +314,11 @@ Each test corresponds directly to the hypotheses in Section 2.
 
 ### 8.7 H4B — Storage QoS (Tiered KV)
 
-* Tier2 hit rate ≥ 20–30 percent
-* p99 tracks `tier2_fetch_p95_ms`
+* Tier2 hit rate ≥ 20–30 percent with 4k prompts (`STACKB_MAX_INPUT_LEN>=4096`, `STACKB_MAX_SEQ_LEN≈16384`, `STACKB_MAX_NUM_TOKENS≈32000`, `STACKB_MAX_BATCH_SIZE=4`)
+* Use spill config `configs/stackB_llama70b_dynamo_tiered_spill.yaml` (T0≈512 MiB, T1≈1 GiB, T2≈64 GiB, block_size=64 KiB) to guarantee tier2 traffic on UMA
+* Run H4B with `H4B_CONTEXT_TOKENS` unset (defaults to 4096 when high-context envs are present) and `CONCURRENCY=32`
+* fio QoS workload: randrw 70/30, 16k, iodepth 32, 4 jobs on tier2 path
+* p99 tracks `tier2_fetch_p95_ms`; NVMe util/latency rises above fio-only baseline
 
 ### 8.8 H5 — KV Working-Set Scaling
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# sysmon_v3.sh -- Test_Plan_v3.0 Section 6.4
-# Collects host + GPU + NVMe stats into sysmon.jsonl for v3 runs (Stack A/B).
+# sysmon_v3.sh -- Test_Plan_v3.3 Section 6.4
+# Collects host + GPU + NVMe stats into sysmon.jsonl for v3 runs (Stack A/B) at ~200 ms cadence.
 # Usage: sysmon_v3.sh <run_dir> <stack_tag>
 set -euo pipefail
 
@@ -12,7 +12,7 @@ NVME_DEVICE=${NVME_DEVICE:-nvme0n1}
 # TODO: add per-GPU metrics when multiple devices are present; capture GPU memory bandwidth if available.
 # TODO: add network telemetry (bytes/pps) and NUMA locality markers for KV pressure runs.
 # TODO: add NVMe namespace detection instead of fixed ${NVME_DEVICE}.
-SAMPLE_INTERVAL=0.5
+SAMPLE_INTERVAL=${SYS_SAMPLE_INTERVAL:-${TELEMETRY_INTERVAL:-0.2}}
 
 MPSTAT_OK=0
 IOSTAT_OK=0
@@ -25,6 +25,7 @@ mkdir -p "$RUN_DIR"
 : > "$OUT"
 
 ts() { date -Ins; }
+ts_float() { date +%s.%N; }
 
 sanitize_num() {
   local v=$1
@@ -36,8 +37,8 @@ sanitize_num() {
 }
 
 collect_sample() {
-  local TS usr sys iowait memAvail memCached swapTotal swapFree rps wps rMB wMB await avgrq avgqu util gpu_util gpu_mem_used gpu_mem_total
-  TS=$(ts)
+  local TS=${TS_NOW:-$(ts_float)}
+  local usr sys iowait memAvail memCached swapTotal swapFree rps wps rMB wMB await avgrq avgqu util gpu_util gpu_mem_used gpu_mem_total
 
   if [[ $MPSTAT_OK -eq 1 ]]; then
     mp_line=$(mpstat 1 1 2>/dev/null | awk '/Average:/ {print $3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13}') || mp_line=""
@@ -76,13 +77,14 @@ collect_sample() {
   rps=$(sanitize_num "$rps"); rMB=$(sanitize_num "$rMB"); await=$(sanitize_num "$await"); avgqu=$(sanitize_num "$avgqu"); util=$(sanitize_num "$util")
 
   cat <<EOF >> "$OUT"
-{"ts":"${TS}","stack":"${STACK_TAG}","cpu":{"user":${usr:-0},"system":${sys:-0},"iowait":${iowait:-0}},"mem":{"MemAvailable":${memAvail:-0},"Cached":${memCached:-0},"SwapTotal":${swapTotal:-0},"SwapFree":${swapFree:-0}},"nvme":{"rps":${rps:-0},"rMBs":${rMB:-0},"r_await_ms":${await:-0},"aqu_sz":${avgqu:-0},"util_pct":${util:-0}},"gpu":{"util":${gpu_util:-0},"mem_used_bytes":$(( (${gpu_mem_used:-0}) * 1024 * 1024 ))}}
+{"ts":${TS},"stack":"${STACK_TAG}","cpu":{"user":${usr:-0},"system":${sys:-0},"iowait":${iowait:-0}},"mem":{"MemAvailable":${memAvail:-0},"Cached":${memCached:-0},"SwapTotal":${swapTotal:-0},"SwapFree":${swapFree:-0}},"nvme":{"rps":${rps:-0},"rMBs":${rMB:-0},"r_await_ms":${await:-0},"aqu_sz":${avgqu:-0},"util_pct":${util:-0}},"gpu":{"util":${gpu_util:-0},"mem_used_bytes":$(( (${gpu_mem_used:-0}) * 1024 * 1024 ))}}
 EOF
 }
 
 trap 'exit 0' INT TERM
 
 while :; do
+  TS_NOW=$(ts_float)
   collect_sample
   sleep "$SAMPLE_INTERVAL"
 done

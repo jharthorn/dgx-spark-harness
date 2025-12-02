@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# H2A UMA pressure (Test_Plan_v3.0 Section 8.2A, Stack A control)
+# H2A UMA pressure (Test_Plan_v3.3 Section 8.2A, Stack A control)
 
 HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 source "$HARNESS_DIR/runs/_lib.sh"
@@ -9,14 +9,16 @@ source "$HARNESS_DIR/runs/_lib.sh"
 # Stack A default (localhost smoke) is 8355; override via ENDPOINT for cluster
 ENDPOINT=${ENDPOINT:-${1:-http://127.0.0.1:8355/v1/completions}}
 STACK="stackA"
-MODEL="L70B"
+# Default to Llama 3.3 70B NVFP4; override MODEL env to switch (e.g., 8B for smoke).
+MODEL=${MODEL:-nvidia/Llama-3.3-70B-Instruct-NVFP4}
 WORKLOAD="fixed_context"
 CONCURRENCY=${CONCURRENCY:-32}
 DURATION=${DURATION:-180}
-PROMPTS=(512 1024 2048 4096)
+PROFILE=${PROFILE:-comfy}
+PROMPTS=(1024 2048 4096)
 RESULTS_BASE=${RESULTS_BASE:-$HARNESS_DIR/results}
 # Optional tokenizer-aware truncation for large contexts (helps keep prompts <= engine admit).
-TOKENIZER=${TOKENIZER:-nvidia/Llama-3.3-70B-Instruct-FP4}
+TOKENIZER=${TOKENIZER:-nvidia/Llama-3.3-70B-Instruct-NVFP4}
 MAX_INPUT_LEN=${MAX_INPUT_LEN:-}
 INPUT_LEN_MARGIN=${INPUT_LEN_MARGIN:-64}
 
@@ -27,6 +29,7 @@ for CTX in "${PROMPTS[@]}"; do
 
   cat > "$RUN_DIR/config.yaml" <<EOF
 stack: ${STACK}
+profile: ${PROFILE}
 model: ${MODEL}
 workload: ${WORKLOAD}
 context_tokens: ${CTX}

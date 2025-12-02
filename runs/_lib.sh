@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Runner helper (Test_Plan_v3.0 Section 8 scaffolding)
+# Runner helper (Test_Plan_v3.3 Section 8 scaffolding)
 
 rt_ts() { date -u +"%Y%m%d_%H%M%S"; }
 
 ensure_run_dir() {
   local dir=$1
   mkdir -p "$dir"
+}
+
+model_tag() {
+  local name=$1
+  echo "${name//\//-}"
 }
 
 record_pid() {
@@ -30,7 +35,7 @@ stop_sysmon() {
 
 start_telemetry() {
   local run_dir=$1
-  local interval=${TELEMETRY_INTERVAL:-0.2}
+  local interval=${TELEMETRY_INTERVAL:-0.2} # 200 ms default per v3.3
   local nvme_dev=${NVME_DEVICE:-nvme0n1}
   local metrics_port=${DYN_KVBM_METRICS_PORT:-6880}
   : >"$run_dir/telemetry.pids"
@@ -66,4 +71,55 @@ stop_telemetry() {
       kill "$pid" 2>/dev/null || true
     done <"$run_dir/telemetry.pids"
   fi
+}
+
+# Apply Stack B profile defaults unless already exported by caller.
+apply_profile_env() {
+  local profile=${1:-comfy}
+  local tier_env_script="${HARNESS_DIR:-}/scripts/stackB_tier_env.py"
+
+  if [[ -f "$tier_env_script" ]]; then
+    if env_output=$(python3 "$tier_env_script" --profile "$profile"); then
+      eval "$env_output"
+    else
+      echo "Warning: failed to load Stack B tier env for profile '${profile}'" >&2
+    fi
+  fi
+
+  case "$profile" in
+    comfy)
+      export STACKB_PROFILE=${STACKB_PROFILE:-comfy}
+      export STACKB_MAX_INPUT_LEN=${STACKB_MAX_INPUT_LEN:-4096}
+      export STACKB_MAX_SEQ_LEN=${STACKB_MAX_SEQ_LEN:-16384}
+      export STACKB_MAX_NUM_TOKENS=${STACKB_MAX_NUM_TOKENS:-16384}
+      export DYN_KVBM_TIER0_BYTES=${DYN_KVBM_TIER0_BYTES:-$((8 * 1024**3))}
+      export DYN_KVBM_TIER1_BYTES=${DYN_KVBM_TIER1_BYTES:-$((8 * 1024**3))}
+      export DYN_KVBM_TIER2_BYTES=${DYN_KVBM_TIER2_BYTES:-$((256 * 1024**3))}
+      ;;
+    spill)
+      export STACKB_PROFILE=${STACKB_PROFILE:-spill}
+      export STACKB_MAX_INPUT_LEN=${STACKB_MAX_INPUT_LEN:-4096}
+      export STACKB_MAX_SEQ_LEN=${STACKB_MAX_SEQ_LEN:-16384}
+      export STACKB_MAX_NUM_TOKENS=${STACKB_MAX_NUM_TOKENS:-32000}
+      export DYN_KVBM_TIER0_BYTES=${DYN_KVBM_TIER0_BYTES:-$((2 * 1024**3))}
+      export DYN_KVBM_TIER1_BYTES=${DYN_KVBM_TIER1_BYTES:-$((4 * 1024**3))}
+      export DYN_KVBM_TIER2_BYTES=${DYN_KVBM_TIER2_BYTES:-$((64 * 1024**3))}
+      ;;
+    stress)
+      export STACKB_PROFILE=${STACKB_PROFILE:-stress}
+      export STACKB_MAX_INPUT_LEN=${STACKB_MAX_INPUT_LEN:-8192}
+      export STACKB_MAX_SEQ_LEN=${STACKB_MAX_SEQ_LEN:-16384}
+      export STACKB_MAX_NUM_TOKENS=${STACKB_MAX_NUM_TOKENS:-32000}
+      export DYN_KVBM_TIER0_BYTES=${DYN_KVBM_TIER0_BYTES:-$((512 * 1024**2))}
+      export DYN_KVBM_TIER1_BYTES=${DYN_KVBM_TIER1_BYTES:-$((1 * 1024**3))}
+      export DYN_KVBM_TIER2_BYTES=${DYN_KVBM_TIER2_BYTES:-$((128 * 1024**3))}
+      ;;
+    *)
+      echo "Unknown profile '$profile' (expected comfy|spill|stress)" >&2
+      return 1
+      ;;
+  esac
+  export DYN_KVBM_KV_BLOCK_SIZE_BYTES=${DYN_KVBM_KV_BLOCK_SIZE_BYTES:-65536}
+  export DYN_KVBM_TIER2_PATH=${DYN_KVBM_TIER2_PATH:-/nvme/kvbm/l70b}
+  export DYN_KVBM_METRICS_PORT=${DYN_KVBM_METRICS_PORT:-6880}
 }

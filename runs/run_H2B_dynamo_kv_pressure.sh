@@ -1,33 +1,40 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# H2B Dynamo KV pressure (Test_Plan_v3.0 Section 8.2B, Stack B tiered)
+# H2B Dynamo KV pressure (Test_Plan_v3.3 Section 8.2B, Stack B tiered)
 
 HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 source "$HARNESS_DIR/runs/_lib.sh"
 
 STACK="stackB"
-# Default to 8B dev path; set MODEL=nvidia/Llama-3.3-70B-Instruct-NVFP4 for the 70B sweep.
-MODEL=${MODEL:-nvidia/Llama-3.1-8B-Instruct-NVFP4}
+PROFILE=${PROFILE:-spill}  # Spill profile to drive steady tier2 IO for KV pressure
+apply_profile_env "$PROFILE"
+# Default to 70B dev path; set MODEL=nvidia/Llama-3.1-8B-Instruct-NVFP4 for the 8B sweep.
+MODEL=${MODEL:-nvidia/Llama-3.3-70B-Instruct-NVFP4}
+MODEL_TAG=${MODEL_TAG:-$(model_tag "$MODEL")}
 WORKLOAD="fixed_context"
+if [[ -z "${CONCURRENCY:-}" ]] && [[ -f "$HARNESS_DIR/runs/H0/uwork.txt" ]]; then
+  CONCURRENCY="$(<"$HARNESS_DIR/runs/H0/uwork.txt")"
+fi
 CONCURRENCY=${CONCURRENCY:-32}
 DURATION=${DURATION:-180}
 ENDPOINT=${ENDPOINT:-http://127.0.0.1:9000/v1/completions}
 
-PROMPTS=(1024 2048 4096 6144 8192)
+PROMPTS=(${PROMPTS_OVERRIDE:-256 512 1024 2048 4096})
 RESULTS_BASE=${RESULTS_BASE:-$HARNESS_DIR/results}
-# Tokenizer-aware truncation (align with Stack B engine admit, defaults assume Llama-3.1-8B build at 8k).
+# Tokenizer-aware truncation (align with Stack B engine admit per profile).
 TOKENIZER=${TOKENIZER:-$MODEL}
-MAX_INPUT_LEN=${MAX_INPUT_LEN:-8192}
+MAX_INPUT_LEN=${MAX_INPUT_LEN:-${STACKB_MAX_INPUT_LEN:-4096}}
 INPUT_LEN_MARGIN=${INPUT_LEN_MARGIN:-64}
 
 for CTX in "${PROMPTS[@]}"; do
-  RUN_ID="$(rt_ts)_H2B_${STACK}_${MODEL}_${CTX}"
+  RUN_ID="$(rt_ts)_H2B_${STACK}_${MODEL_TAG}_${CTX}"
   RUN_DIR="$RESULTS_BASE/${RUN_ID}"
   ensure_run_dir "$RUN_DIR"
 
   cat > "$RUN_DIR/config.yaml" <<EOF
 stack: ${STACK}
+profile: ${PROFILE}
 model: ${MODEL}
 workload: ${WORKLOAD}
 context_tokens: ${CTX}
