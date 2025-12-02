@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
+# Hypothesis: H7 – KV telemetry cadence sweep on Stack B
+# Typical profile: Stress
+# Expected behavior: maximize tier2 fetches to validate telemetry cadence impact and overhead.
+# See docs/Test_Plan_v3.3.md, section H7 (8.7).
 set -euo pipefail
-
-# H7 KV telemetry sweep (Test_Plan_v3.3 Section 8.7, Stack B)
 
 HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 source "$HARNESS_DIR/runs/_lib.sh"

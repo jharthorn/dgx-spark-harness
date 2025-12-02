@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
+# Hypothesis: H5 – KV working-set scaling on Stack B
+# Typical profile: Spill
+# Expected behavior: mixed-context load scaling adapter sets; expect Tier2 churn with growing working set.
+# See docs/Test_Plan_v3.3.md, section H5 (8.5).
 set -euo pipefail
-
-# H5 KV working-set scaling (Test_Plan_v3.3 Section 8.5, Stack B)
 
 HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 source "$HARNESS_DIR/runs/_lib.sh"

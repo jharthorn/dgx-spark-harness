@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
+# Hypothesis: H6 – Tier sizing and eviction policy on Stack B
+# Typical profile: Spill
+# Expected behavior: stress tier sizing and eviction policy under fixed-context load.
+# See docs/Test_Plan_v3.3.md, section H6 (8.6).
 set -euo pipefail
-
-# H6 tier sizing & policy (Test_Plan_v3.3 Section 8.6, Stack B)
 
 HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 source "$HARNESS_DIR/runs/_lib.sh"

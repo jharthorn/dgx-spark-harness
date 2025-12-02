@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
+# Hypothesis: H2A – UMA KV pressure control on Stack A
+# Typical profile: Comfy
+# Expected behavior: UMA-only baseline for KV pressure and latency; control vs H2B tiered runs.
+# See docs/Test_Plan_v3.3.md, section H2A (8.2A).
 set -euo pipefail
-
-# H2A UMA pressure (Test_Plan_v3.3 Section 8.2A, Stack A control)
 
 HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 source "$HARNESS_DIR/runs/_lib.sh"

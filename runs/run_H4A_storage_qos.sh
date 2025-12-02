@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
+# Hypothesis: H4A – Storage QoS sensitivity control on Stack A
+# Typical profile: Comfy
+# Expected behavior: baseline NVMe QoS sensitivity without tiering; control vs H4B.
+# See docs/Test_Plan_v3.3.md, section H4A (8.4A).
 set -euo pipefail
-
-# H4A storage QoS sensitivity (Test_Plan_v3.3 Section 8.4A, Stack A control)
 
 HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 source "$HARNESS_DIR/runs/_lib.sh"

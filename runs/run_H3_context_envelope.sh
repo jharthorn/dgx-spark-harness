@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
+# Hypothesis: H3 – Context scaling envelope across Stack A/B
+# Typical profile: Stress (per-stack override allowed)
+# Expected behavior: sweep context lengths to find collapse/limit points for each stack.
+# See docs/Test_Plan_v3.3.md, section H3.
 set -euo pipefail
-
-# H3 context scaling envelope (Test_Plan_v3.3 Section 6)
-# Sweeps context to collapse/limit for Stack A and/or Stack B.
 
 HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 source "$HARNESS_DIR/runs/_lib.sh"

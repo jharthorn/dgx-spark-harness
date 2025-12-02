@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
+# Hypothesis: H2B – Dynamo KV pressure on Stack B
+# Typical profile: Spill
+# Expected behavior: sustained Tier2 traffic with gradual latency degradation vs H2A UMA control.
+# See docs/Test_Plan_v3.3.md, section H2B (8.2B).
 set -euo pipefail
-
-# H2B Dynamo KV pressure (Test_Plan_v3.3 Section 8.2B, Stack B tiered)
 
 HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 source "$HARNESS_DIR/runs/_lib.sh"

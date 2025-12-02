@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
+# Hypothesis: H0 – Queue knee baseline for Stack A/B
+# Typical profile: Comfy
+# Expected behavior: establish U_work queue knee for transparency checks and to seed other runs.
+# See docs/Test_Plan_v3.3.md, section H0 (8.0).
 set -euo pipefail
-
-# H0 queue knee (Test_Plan_v3.3 Section 8.0, Stack A/B Comfy)
 
 HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 source "$HARNESS_DIR/runs/_lib.sh"

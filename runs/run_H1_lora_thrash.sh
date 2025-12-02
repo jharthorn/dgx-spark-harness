@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
+# Hypothesis: H1 – LoRA bandwidth/adapter churn ("Infinite LoRA")
+# Typical profile: Spill (Stack B)
+# Expected behavior: Tier2-backed adapters, nonce_per_user on; expect adapter churn bandwidth limits.
+# See docs/Test_Plan_v3.3.md, section H1.
 set -euo pipefail
-
-# H1 LoRA bandwidth / adapter churn ("Infinite LoRA") per Test_Plan_v3.3
-# Stack B Spill profile with Tier2-backed adapters and nonce_per_user enabled.
 
 HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 source "$HARNESS_DIR/runs/_lib.sh"

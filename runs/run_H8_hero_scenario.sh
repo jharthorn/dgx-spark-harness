@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
+# Hypothesis: H8 – Hero side-by-side Stack A vs Stack B
+# Typical profile: Spill
+# Expected behavior: mixed-context hero run with aligned UMA budgets; compare Stack A/B behavior.
+# See docs/Test_Plan_v3.3.md, section H8.
 set -euo pipefail
-
-# H8 hero scenario (Test_Plan_v3.3 Section 6)
-# Side-by-side Stack A vs Stack B at comparable UMA budgets.
 
 HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 source "$HARNESS_DIR/runs/_lib.sh"

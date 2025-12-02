@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
+# Hypothesis: H4B – Dynamo storage QoS sensitivity on Stack B
+# Typical profile: Spill
+# Expected behavior: observe NVMe QoS impact with tiered KV; compare against H4A control.
+# See docs/Test_Plan_v3.3.md, section H4B (8.4B).
 set -euo pipefail
-
-# H4B Dynamo storage QoS (Test_Plan_v3.3 Section 8.4B, Stack B)
 
 HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 source "$HARNESS_DIR/runs/_lib.sh"

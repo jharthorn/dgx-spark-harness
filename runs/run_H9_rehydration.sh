@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
+# Hypothesis: H9 – Context re-hydration on Stack B
+# Typical profile: Stress
+# Expected behavior: build session, allow tiered eviction, then resume; currently blocked by frontend session_id behavior.
+# See docs/Test_Plan_v3.3.md, section H9.
 set -euo pipefail
-
-# H9 context re-hydration (Test_Plan_v3.3 Section 6)
-# Build a session, allow KV eviction to Tier2, then resume.
 
 HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 source "$HARNESS_DIR/runs/_lib.sh"
