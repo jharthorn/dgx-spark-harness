@@ -91,12 +91,22 @@ python3 -m dynamo.frontend --http-port 9000
 ```
 
 ### Stack B worker (profile-aware)
-Bring-up that applies profile KV sizing and mounts the KV config:
+Bring-up that applies profile KV sizing and mounts the KV config. Use the base config for comfy; use the spill/stress variants for those profiles. Ensure `DYN_KVBM_TIER2_PATH` is absolute before launching.
 ```bash
-PROFILE=spill  # comfy|spill|stress
-CONFIG=configs/stackB_llama70b_dynamo_tiered_${PROFILE}.yaml
+PROFILE=comfy  # comfy|spill|stress
+CONFIG=configs/stackB_llama70b_dynamo_tiered.yaml
+if [[ "$PROFILE" == "spill" || "$PROFILE" == "stress" ]]; then
+  CONFIG=configs/stackB_llama70b_dynamo_tiered_${PROFILE}.yaml
+fi
 eval "$(python3 scripts/stackB_tier_env.py --profile "$PROFILE" --config "$CONFIG")"
+# Preflight: verify tier envs are populated and Tier2 path exists; missing values will cause
+# `KVBM Configuration Error: At least one cache tier must be configured.`
+echo "T0=$DYN_KVBM_TIER0_BYTES T1=$DYN_KVBM_TIER1_BYTES T2=$DYN_KVBM_TIER2_BYTES PATH=$DYN_KVBM_TIER2_PATH"
+mkdir -p "$DYN_KVBM_TIER2_PATH"
 TIER2_ROOT=$(dirname "$DYN_KVBM_TIER2_PATH")
+# Configure a cache tier (required). Disk cache aligns with NVMe Tier2; set a size that fits the device.
+export DYN_KVBM_DISK_CACHE_GB=${DYN_KVBM_DISK_CACHE_GB:-256}
+export DYN_KVBM_DISK_CACHE_OVERRIDE_NUM_BLOCKS=${DYN_KVBM_DISK_CACHE_OVERRIDE_NUM_BLOCKS:-0}
 
 docker run --gpus all --ipc host --network host --rm -it \
   -e HF_TOKEN="$(<~/hftoken.txt)" \
@@ -107,6 +117,8 @@ docker run --gpus all --ipc host --network host --rm -it \
   -e DYN_KVBM_TIER2_BYTES="$DYN_KVBM_TIER2_BYTES" \
   -e DYN_KVBM_KV_BLOCK_SIZE_BYTES=${DYN_KVBM_KV_BLOCK_SIZE_BYTES:-65536} \
   -e DYN_KVBM_TIER2_PATH="$DYN_KVBM_TIER2_PATH" \
+  -e DYN_KVBM_DISK_CACHE_GB="$DYN_KVBM_DISK_CACHE_GB" \
+  -e DYN_KVBM_DISK_CACHE_OVERRIDE_NUM_BLOCKS="$DYN_KVBM_DISK_CACHE_OVERRIDE_NUM_BLOCKS" \
   -e DYN_DISCOVERY_KV_EXPORT_ENABLED=false \
   -p ${DYN_KVBM_METRICS_PORT:-6880}:${DYN_KVBM_METRICS_PORT:-6880} \
   -v "$TIER2_ROOT":"$TIER2_ROOT" \
