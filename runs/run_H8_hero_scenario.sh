@@ -27,19 +27,21 @@ MIX_LONG_MIN=${MIX_LONG_MIN:-2500}
 MIX_LONG_MAX=${MIX_LONG_MAX:-3200}
 BURSTINESS=${BURSTINESS:-bursty}
 BURST_PAUSE_S=${BURST_PAUSE_S:-1.5}
+STACKS=(${STACKS:-stackA stackB})  # Allow running only stackA or stackB by setting STACKS env.
 
 # Stack A (control)
-STACKA_PROFILE=${STACKA_PROFILE:-comfy}
-STACKA_MODEL=${STACKA_MODEL:-nvidia/Llama-3.3-70B-Instruct-NVFP4}
-STACKA_MODEL_TAG=${STACKA_MODEL_TAG:-$(model_tag "$STACKA_MODEL")}
-STACKA_ENDPOINT=${STACKA_ENDPOINT:-http://127.0.0.1:8355/v1/completions}
-STACKA_CONTEXT=${STACKA_CONTEXT:-2048}
+if [[ " ${STACKS[*]} " == *" stackA "* ]]; then
+  STACKA_PROFILE=${STACKA_PROFILE:-comfy}
+  STACKA_MODEL=${STACKA_MODEL:-nvidia/Llama-3.3-70B-Instruct-NVFP4}
+  STACKA_MODEL_TAG=${STACKA_MODEL_TAG:-$(model_tag "$STACKA_MODEL")}
+  STACKA_ENDPOINT=${STACKA_ENDPOINT:-http://127.0.0.1:8355/v1/completions}
+  STACKA_CONTEXT=${STACKA_CONTEXT:-2048}
 
-RUN_ID_A="$(rt_ts)_H8_${STACKA_PROFILE}_stackA_${STACKA_MODEL_TAG}_${STACKA_CONTEXT}"
-RUN_DIR_A="$RESULTS_BASE/${RUN_ID_A}"
-ensure_run_dir "$RUN_DIR_A"
+  RUN_ID_A="$(rt_ts)_H8_${STACKA_PROFILE}_stackA_${STACKA_MODEL_TAG}_${STACKA_CONTEXT}"
+  RUN_DIR_A="$RESULTS_BASE/${RUN_ID_A}"
+  ensure_run_dir "$RUN_DIR_A"
 
-cat > "$RUN_DIR_A/config.yaml" <<EOF
+  cat > "$RUN_DIR_A/config.yaml" <<EOF
 stack: stackA
 profile: ${STACKA_PROFILE}
 model: ${STACKA_MODEL}
@@ -63,23 +65,25 @@ burstiness: ${BURSTINESS}
 burst_pause_s: ${BURST_PAUSE_S}
 EOF
 
-start_sysmon "$RUN_DIR_A" "A"
-python3 "$HARNESS_DIR/src/loadgen.py" --config "$RUN_DIR_A/config.yaml" --run-id "$RUN_ID_A" --output-dir "$RUN_DIR_A" --endpoint "${STACKA_ENDPOINT}"
-stop_sysmon "$RUN_DIR_A"
+  start_sysmon "$RUN_DIR_A" "A"
+  python3 "$HARNESS_DIR/src/loadgen.py" --config "$RUN_DIR_A/config.yaml" --run-id "$RUN_ID_A" --output-dir "$RUN_DIR_A" --endpoint "${STACKA_ENDPOINT}"
+  stop_sysmon "$RUN_DIR_A"
+fi
 
 # Stack B (tiered)
-STACKB_PROFILE=${STACKB_PROFILE:-spill}  # Spill profile to mirror H4B/H5 steady-state tier2 behavior
-apply_profile_env "$STACKB_PROFILE"
-STACKB_MODEL=${STACKB_MODEL:-nvidia/Llama-3.3-70B-Instruct-NVFP4}
-STACKB_MODEL_TAG=${STACKB_MODEL_TAG:-$(model_tag "$STACKB_MODEL")}
-STACKB_ENDPOINT=${STACKB_ENDPOINT:-http://127.0.0.1:9000/v1/completions}
-STACKB_CONTEXT=${STACKB_CONTEXT:-4096}
+if [[ " ${STACKS[*]} " == *" stackB "* ]]; then
+  STACKB_PROFILE=${STACKB_PROFILE:-spill}  # Spill profile to mirror H4B/H5 steady-state tier2 behavior
+  apply_profile_env "$STACKB_PROFILE"
+  STACKB_MODEL=${STACKB_MODEL:-nvidia/Llama-3.3-70B-Instruct-NVFP4}
+  STACKB_MODEL_TAG=${STACKB_MODEL_TAG:-$(model_tag "$STACKB_MODEL")}
+  STACKB_ENDPOINT=${STACKB_ENDPOINT:-http://127.0.0.1:9000/v1/completions}
+  STACKB_CONTEXT=${STACKB_CONTEXT:-4096}
 
-RUN_ID_B="$(rt_ts)_H8_${STACKB_PROFILE}_stackB_${STACKB_MODEL_TAG}_${STACKB_CONTEXT}"
-RUN_DIR_B="$RESULTS_BASE/${RUN_ID_B}"
-ensure_run_dir "$RUN_DIR_B"
+  RUN_ID_B="$(rt_ts)_H8_${STACKB_PROFILE}_stackB_${STACKB_MODEL_TAG}_${STACKB_CONTEXT}"
+  RUN_DIR_B="$RESULTS_BASE/${RUN_ID_B}"
+  ensure_run_dir "$RUN_DIR_B"
 
-cat > "$RUN_DIR_B/config.yaml" <<EOF
+  cat > "$RUN_DIR_B/config.yaml" <<EOF
 stack: stackB
 profile: ${STACKB_PROFILE}
 model: ${STACKB_MODEL}
@@ -103,8 +107,9 @@ burstiness: ${BURSTINESS}
 burst_pause_s: ${BURST_PAUSE_S}
 EOF
 
-start_sysmon "$RUN_DIR_B" "B"
-start_telemetry "$RUN_DIR_B"
-python3 "$HARNESS_DIR/src/loadgen.py" --config "$RUN_DIR_B/config.yaml" --run-id "$RUN_ID_B" --output-dir "$RUN_DIR_B" --endpoint "${STACKB_ENDPOINT}"
-stop_sysmon "$RUN_DIR_B"
-stop_telemetry "$RUN_DIR_B"
+  start_sysmon "$RUN_DIR_B" "B"
+  start_telemetry "$RUN_DIR_B"
+  python3 "$HARNESS_DIR/src/loadgen.py" --config "$RUN_DIR_B/config.yaml" --run-id "$RUN_ID_B" --output-dir "$RUN_DIR_B" --endpoint "${STACKB_ENDPOINT}"
+  stop_sysmon "$RUN_DIR_B"
+  stop_telemetry "$RUN_DIR_B"
+fi
