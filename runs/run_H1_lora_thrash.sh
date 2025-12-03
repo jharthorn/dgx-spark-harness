@@ -3,6 +3,7 @@
 # Typical profile: Spill (Stack B)
 # Expected behavior: Tier2-backed adapters, nonce_per_user on; expect adapter churn bandwidth limits.
 # See docs/Test_Plan_v3.3.md, section H1.
+# Warmup: send a small ping (e.g., single POST) after the worker finishes attention workspace resize before starting full load.
 set -euo pipefail
 
 HARNESS_DIR=${HARNESS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
