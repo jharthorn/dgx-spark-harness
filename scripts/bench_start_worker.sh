@@ -7,6 +7,7 @@ KVBM_CONFIG_IN_CONTAINER="${KVBM_CONFIG_IN_CONTAINER:-/tmp/kvbm_llm_api_config.y
 WORKER_LOG="${WORKER_LOG:-/tmp/bench-logs/worker.log}"
 KV_MODE="${BENCH_KV_MODE:-cpu_disk}"
 KVBM_METRICS_PORT="${DYN_KVBM_METRICS_PORT:-6880}"
+ENABLE_LOCAL_INDEXER="${BENCH_ENABLE_LOCAL_INDEXER:-false}"
 
 case "${KV_MODE}" in
   off)
@@ -51,11 +52,12 @@ nohup python3 -m dynamo.trtllm \
   --endpoint dyn://dynamo.tensorrt_llm.generate \
   ${EXTRA_ENGINE_ARGS} \
   ${STORE_KV_ARG} \
+  --enable-local-indexer '${ENABLE_LOCAL_INDEXER}' \
   > '${WORKER_LOG}' 2>&1 < /dev/null &
 "
 
 echo "Worker started in ${CONTAINER_NAME}. Log: ${WORKER_LOG}"
-echo "Resolved KV mode: ${KV_MODE} (cpu_cache_gb=${RESOLVED_CPU_CACHE_GB}, disk_cache_gb=${RESOLVED_DISK_CACHE_GB}, kvbm_metrics=${RESOLVED_KVBM_METRICS}, metrics_port=${KVBM_METRICS_PORT})"
+echo "Resolved KV mode: ${KV_MODE} (cpu_cache_gb=${RESOLVED_CPU_CACHE_GB}, disk_cache_gb=${RESOLVED_DISK_CACHE_GB}, kvbm_metrics=${RESOLVED_KVBM_METRICS}, metrics_port=${KVBM_METRICS_PORT}, local_indexer=${ENABLE_LOCAL_INDEXER})"
 docker exec "${CONTAINER_NAME}" bash -lc "
 sleep 2
 if ! pgrep -f '^python3 -m dynamo\\.trtllm( |$)' >/dev/null 2>&1; then

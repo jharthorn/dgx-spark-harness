@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import itertools
 import json
 import logging
@@ -156,13 +157,14 @@ def parse_args() -> argparse.Namespace:
         default=2.0,
         help="Polling interval while waiting for model discovery.",
     )
-    parser.add_argument("--scenario", choices=["standard", "eviction_replay"], default="standard")
+    parser.add_argument("--scenario", choices=["standard", "eviction_replay", "reuse_verify"], default="standard")
     parser.add_argument("--prompt-set", choices=["short", "long", "mixed"], default="short")
     parser.add_argument("--requests", type=int, default=64, help="Measured requests for standard scenario.")
     parser.add_argument("--warmup", type=int, default=8, help="Warmup requests (excluded from overall summary).")
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument(
         "--stop",
         action="append",
@@ -172,6 +174,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stream", action="store_true", help="Request streaming responses for TTFT proxy.")
     parser.add_argument("--timeout-s", type=float, default=600.0)
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument(
+        "--request-seed",
+        type=int,
+        default=None,
+        help="Optional seed passed to `/v1/completions` request payload.",
+    )
     parser.add_argument(
         "--tokenizer",
         default="auto",
@@ -187,6 +195,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eviction-b-requests", type=int, default=64, help="Phase B pressure request count.")
     parser.add_argument("--eviction-a-concurrency", type=int, default=None, help="Phase A/C concurrency.")
     parser.add_argument("--eviction-b-concurrency", type=int, default=None, help="Phase B concurrency.")
+    parser.add_argument(
+        "--reuse-repeat-count",
+        type=int,
+        default=3,
+        help="Identical sequential requests for reuse_verify scenario (2 or 3).",
+    )
+    parser.add_argument(
+        "--reuse-prompt-set",
+        choices=["short", "long"],
+        default="short",
+        help="Prompt set for reuse_verify scenario.",
+    )
 
     parser.add_argument("--kv-mode", choices=["off", "cpu_only", "cpu_disk"], default="cpu_disk")
     parser.add_argument("--kv-cpu-cache-gb", type=float, default=None, help="Resolved CPU cache size tag for artifacts.")
@@ -297,6 +317,7 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
     requests_path = run_dir / "requests.jsonl"
     request_counter = itertools.count(1)
     overall_rows: list[dict[str, Any]] = []
+    all_rows: list[dict[str, Any]] = []
     phase_summaries: list[dict[str, Any]] = []
     run_valid = True
     invalid_reason: Optional[str] = None
@@ -316,6 +337,14 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
         "tokenizer": estimator.tokenizer_name or "heuristic",
         "kv_mode": kv_mode_resolved,
         "preflight": preflight,
+        "client_request_parameters": {
+            "max_tokens": int(args.max_tokens),
+            "temperature": float(args.temperature),
+            "top_p": float(args.top_p),
+            "request_seed": (int(args.request_seed) if args.request_seed is not None else None),
+            "stop": list(args.stop),
+            "stream": bool(args.stream),
+        },
         "args": vars(args),
         "phases": [
             {
@@ -408,6 +437,7 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
                             summary["block_device"] = args.phase_io_device
                             summary["io_delta"] = io_delta
                         phase_summaries.append(summary)
+                        all_rows.extend(phase_rows)
                         if phase.include_in_overall:
                             overall_rows.extend(phase_rows)
 
@@ -455,6 +485,7 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
     )
 
     kvbm_summary = build_kvbm_metrics_summary(kvbm_snapshots, kvbm_phase_deltas, args.scenario, args.kv_mode)
+    request_identity_summary = analyze_request_identity(all_rows, args.scenario)
     if executed_workload and args.kv_mode != "off" and not args.allow_missing_kvbm_metrics and not kvbm_summary.get("available", False):
         run_valid = False
         if invalid_reason is None:
@@ -482,6 +513,9 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
     if args.scenario == "eviction_replay":
         overall_summary["eviction_replay_signal_io"] = analyze_eviction_signal_io(phase_summaries)
         overall_summary["eviction_replay_signal_kvbm"] = kvbm_summary.get("eviction_replay_signal")
+    if args.scenario == "reuse_verify":
+        overall_summary["reuse_verify_signal_kvbm"] = kvbm_summary.get("reuse_verify_signal")
+        overall_summary["reuse_verify_identity"] = request_identity_summary.get("reuse_verify_identity")
 
     fingerprint = collect_fingerprint(args.container_name)
     summary_payload = {
@@ -499,6 +533,7 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
         "phase_summaries": phase_summaries,
         "overall_summary": overall_summary,
         "kvbm_metrics": kvbm_summary,
+        "request_identity": request_identity_summary,
         "fingerprint": fingerprint,
         "notes": [
             "TTFT proxy is available only when --stream is enabled and the server emits stream chunks.",
@@ -607,6 +642,27 @@ def build_phase_plan(
         phases.append(PhasePlan(name="main", prompts=measured, concurrency=max(1, args.concurrency), include_in_overall=True))
         return phases
 
+    if args.scenario == "reuse_verify":
+        repeats = max(2, min(3, int(args.reuse_repeat_count)))
+        prompt_set = args.reuse_prompt_set
+        base_prompts = generate_prompt_set(
+            prompt_set=prompt_set,
+            count=1,
+            seed=args.seed,
+            estimator=estimator,
+            short_range=short_range,
+            long_range=long_range,
+            prompt_id_prefix="reuse",
+        )
+        if not base_prompts:
+            return phases
+        identical_prompt = base_prompts[0]
+        phases.append(PhasePlan(name="reuse_1", prompts=[identical_prompt], concurrency=1, include_in_overall=True))
+        phases.append(PhasePlan(name="reuse_2", prompts=[identical_prompt], concurrency=1, include_in_overall=True))
+        if repeats >= 3:
+            phases.append(PhasePlan(name="reuse_3", prompts=[identical_prompt], concurrency=1, include_in_overall=True))
+        return phases
+
     if args.warmup > 0:
         warmup_prompts = generate_prompt_set(
             prompt_set="long",
@@ -667,13 +723,25 @@ async def run_phase(
                 break
             request_idx = next(request_counter)
             start_ts = now_utc_iso()
+            request_identity = build_request_identity(
+                model_id=model_id,
+                prompt_text=prompt.prompt,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                stop=args.stop,
+                stream=bool(args.stream),
+                request_seed=args.request_seed,
+            )
             completion = await client.create_completion(
                 model=model_id,
                 prompt=prompt.prompt,
                 max_tokens=args.max_tokens,
                 temperature=args.temperature,
+                top_p=args.top_p,
                 stop=args.stop,
                 stream=bool(args.stream),
+                seed=args.request_seed,
             )
             end_ts = now_utc_iso()
             output_text = completion.text or ""
@@ -699,11 +767,17 @@ async def run_phase(
                 "prompt_set": prompt.prompt_set,
                 "prompt_target_tokens": prompt.target_tokens,
                 "prompt_tokens_est": prompt.prompt_tokens_est,
+                "prompt_sha256": request_identity["prompt_sha256"],
+                "generation_params": request_identity["generation_params"],
+                "generation_params_sha256": request_identity["generation_params_sha256"],
+                "request_identity_sha256": request_identity["request_identity_sha256"],
+                "request_payload_sha256": request_identity["request_payload_sha256"],
                 "output_len_chars": len(output_text),
                 "output_tokens_est": output_tokens_est,
                 "error": completion.error,
                 "stream": bool(args.stream),
                 "response_path": response_path,
+                "response_header_hints": completion.response_headers,
             }
             async with requests_lock:
                 requests_fp.write(json.dumps(row, sort_keys=True) + "\n")
@@ -810,6 +884,51 @@ def dedupe_prompts(prompts: list[PromptSpec]) -> list[PromptSpec]:
     return list(seen.values())
 
 
+def build_request_identity(
+    *,
+    model_id: str,
+    prompt_text: str,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    stop: list[str],
+    stream: bool,
+    request_seed: Optional[int],
+) -> dict[str, Any]:
+    generation_params: dict[str, Any] = {
+        "max_tokens": int(max_tokens),
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "stop": list(stop),
+        "stream": bool(stream),
+    }
+    if request_seed is not None:
+        generation_params["seed"] = int(request_seed)
+
+    prompt_sha = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+    payload = {
+        "model": model_id,
+        "prompt": prompt_text,
+        **generation_params,
+    }
+    identity_payload = {
+        "model": model_id,
+        "prompt_sha256": prompt_sha,
+        "generation_params": generation_params,
+    }
+    return {
+        "prompt_sha256": prompt_sha,
+        "generation_params": generation_params,
+        "generation_params_sha256": hashlib.sha256(_json_bytes(generation_params)).hexdigest(),
+        "request_payload_sha256": hashlib.sha256(_json_bytes(payload)).hexdigest(),
+        "request_identity_sha256": hashlib.sha256(_json_bytes(identity_payload)).hexdigest(),
+    }
+
+
+def _json_bytes(value: Any) -> bytes:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
 def read_block_device_stats(device: str) -> Optional[dict[str, Any]]:
     stat_path = Path("/sys/block") / device / "stat"
     if not stat_path.exists():
@@ -883,11 +1002,19 @@ def build_kvbm_metrics_summary(
     kv_mode: str,
 ) -> dict[str, Any]:
     available = any(bool(s.get("success")) and bool((s.get("metrics") or {})) for s in snapshots)
+    total_offload = sum(float((p or {}).get("offload_blocks_total_delta", 0.0)) for p in phase_deltas.values())
+    total_onboard = sum(float((p or {}).get("onboard_blocks_total_delta", 0.0)) for p in phase_deltas.values())
+    total_matched = sum(float((p or {}).get("kvbm_matched_tokens_delta", 0.0)) for p in phase_deltas.values())
     summary: dict[str, Any] = {
         "available": available,
         "snapshot_count": len(snapshots),
         "phase_deltas": phase_deltas,
         "kv_mode": kv_mode,
+        "rollup": {
+            "offload_blocks_total_delta": round(total_offload, 3),
+            "onboard_blocks_total_delta": round(total_onboard, 3),
+            "matched_tokens_total_delta": round(total_matched, 3),
+        },
     }
     if scenario == "eviction_replay":
         warm = phase_deltas.get("warm_A", {})
@@ -896,20 +1023,67 @@ def build_kvbm_metrics_summary(
         warm_onboard = float(warm.get("onboard_blocks_total_delta", 0.0))
         pressure_onboard = float(pressure.get("onboard_blocks_total_delta", 0.0))
         replay_onboard = float(replay.get("onboard_blocks_total_delta", 0.0))
+        warm_matched = float(warm.get("kvbm_matched_tokens_delta", 0.0))
+        pressure_matched = float(pressure.get("kvbm_matched_tokens_delta", 0.0))
+        replay_matched = float(replay.get("kvbm_matched_tokens_delta", 0.0))
         if replay_onboard > 0.0:
             signal = "disk_rehydrate_detected"
             interpretation = "Replay phase has non-zero onboard block counters."
+            reuse_gate = "reuse_present"
+        elif replay_matched <= 0.0:
+            signal = "no_onboard_no_reuse_signal"
+            interpretation = (
+                "Replay onboard counters are zero and matched tokens are zero; "
+                "rehydrate path was not eligible because cross-request reuse did not trigger."
+            )
+            reuse_gate = "reuse_absent"
         elif pressure_onboard > 0.0 or warm_onboard > 0.0:
             signal = "onboard_outside_replay"
             interpretation = "Onboard counters are non-zero, but replay was zero."
+            reuse_gate = "reuse_present"
         else:
             signal = "no_onboard_signal"
-            interpretation = "No onboard block counters observed."
+            interpretation = "No onboard block counters observed despite non-zero matched tokens."
+            reuse_gate = "reuse_present"
         summary["eviction_replay_signal"] = {
             "signal": signal,
             "warm_onboard_blocks": round(warm_onboard, 3),
             "pressure_onboard_blocks": round(pressure_onboard, 3),
             "replay_onboard_blocks": round(replay_onboard, 3),
+            "warm_matched_tokens": round(warm_matched, 3),
+            "pressure_matched_tokens": round(pressure_matched, 3),
+            "replay_matched_tokens": round(replay_matched, 3),
+            "replay_onboard_blocks_h2d": round(float(replay.get("kvbm_onboard_blocks_h2d_delta", 0.0)), 3),
+            "replay_onboard_blocks_d2d": round(float(replay.get("kvbm_onboard_blocks_d2d_delta", 0.0)), 3),
+            "reuse_gate": reuse_gate,
+            "interpretation": interpretation,
+        }
+    if scenario == "reuse_verify":
+        reuse_2 = phase_deltas.get("reuse_2", {})
+        reuse_3 = phase_deltas.get("reuse_3", {})
+        matched_2 = float(reuse_2.get("kvbm_matched_tokens_delta", 0.0))
+        matched_3 = float(reuse_3.get("kvbm_matched_tokens_delta", 0.0))
+        h2d_2 = float(reuse_2.get("kvbm_onboard_blocks_h2d_delta", 0.0))
+        h2d_3 = float(reuse_3.get("kvbm_onboard_blocks_h2d_delta", 0.0))
+        d2d_2 = float(reuse_2.get("kvbm_onboard_blocks_d2d_delta", 0.0))
+        d2d_3 = float(reuse_3.get("kvbm_onboard_blocks_d2d_delta", 0.0))
+        if matched_2 > 0.0 or matched_3 > 0.0:
+            signal = "prefix_reuse_detected"
+            interpretation = "Matched tokens are non-zero on repeated requests."
+        else:
+            signal = "no_prefix_reuse_signal"
+            interpretation = (
+                "Matched tokens are zero for repeated identical requests; "
+                "cross-request prefix reuse appears inactive in this serving path."
+            )
+        summary["reuse_verify_signal"] = {
+            "signal": signal,
+            "reuse_2_matched_tokens": round(matched_2, 3),
+            "reuse_3_matched_tokens": round(matched_3, 3),
+            "reuse_2_onboard_blocks_h2d": round(h2d_2, 3),
+            "reuse_3_onboard_blocks_h2d": round(h2d_3, 3),
+            "reuse_2_onboard_blocks_d2d": round(d2d_2, 3),
+            "reuse_3_onboard_blocks_d2d": round(d2d_3, 3),
             "interpretation": interpretation,
         }
     return summary
@@ -935,6 +1109,97 @@ def parse_prometheus_metrics(text: str) -> dict[str, float]:
 def append_jsonl(path: Path, row: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as fp:
         fp.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def analyze_request_identity(rows: list[dict[str, Any]], scenario: str) -> dict[str, Any]:
+    if not rows:
+        return {
+            "available": False,
+            "reason": "no_requests",
+            "total_requests": 0,
+        }
+
+    prompt_hashes = {str(r.get("prompt_sha256")) for r in rows if r.get("prompt_sha256")}
+    params_hashes = {str(r.get("generation_params_sha256")) for r in rows if r.get("generation_params_sha256")}
+    identity_hashes = {str(r.get("request_identity_sha256")) for r in rows if r.get("request_identity_sha256")}
+    payload_hashes = {str(r.get("request_payload_sha256")) for r in rows if r.get("request_payload_sha256")}
+
+    phase_identity: dict[str, dict[str, Any]] = {}
+    header_keys: set[str] = set()
+    for row in rows:
+        phase = str(row.get("phase") or "unknown")
+        item = phase_identity.setdefault(
+            phase,
+            {
+                "request_count": 0,
+                "request_identity_sha256": [],
+                "prompt_sha256": [],
+                "generation_params_sha256": [],
+            },
+        )
+        item["request_count"] += 1
+        if row.get("request_identity_sha256"):
+            item["request_identity_sha256"].append(str(row["request_identity_sha256"]))
+        if row.get("prompt_sha256"):
+            item["prompt_sha256"].append(str(row["prompt_sha256"]))
+        if row.get("generation_params_sha256"):
+            item["generation_params_sha256"].append(str(row["generation_params_sha256"]))
+        for key in (row.get("response_header_hints") or {}).keys():
+            header_keys.add(str(key))
+
+    phase_identity_sorted: dict[str, dict[str, Any]] = {}
+    for phase_name in sorted(phase_identity):
+        raw = phase_identity[phase_name]
+        phase_identity_sorted[phase_name] = {
+            "request_count": raw["request_count"],
+            "unique_request_identity_sha256": sorted(set(raw["request_identity_sha256"])),
+            "unique_prompt_sha256": sorted(set(raw["prompt_sha256"])),
+            "unique_generation_params_sha256": sorted(set(raw["generation_params_sha256"])),
+        }
+
+    summary: dict[str, Any] = {
+        "available": True,
+        "total_requests": len(rows),
+        "unique_prompt_sha256_count": len(prompt_hashes),
+        "unique_generation_params_sha256_count": len(params_hashes),
+        "unique_request_identity_sha256_count": len(identity_hashes),
+        "unique_request_payload_sha256_count": len(payload_hashes),
+        "response_header_keys_seen": sorted(header_keys),
+        "phase_identity": phase_identity_sorted,
+    }
+
+    if scenario == "reuse_verify":
+        reuse_rows = sorted(
+            [r for r in rows if str(r.get("phase", "")).startswith("reuse_")],
+            key=lambda r: int(r.get("request_index", 0)),
+        )
+        reuse_identity_hashes = [str(r.get("request_identity_sha256")) for r in reuse_rows if r.get("request_identity_sha256")]
+        reuse_prompt_hashes = [str(r.get("prompt_sha256")) for r in reuse_rows if r.get("prompt_sha256")]
+        reuse_params_hashes = [str(r.get("generation_params_sha256")) for r in reuse_rows if r.get("generation_params_sha256")]
+        same_identity = len(reuse_identity_hashes) >= 2 and len(set(reuse_identity_hashes)) == 1
+        same_prompt = len(reuse_prompt_hashes) >= 2 and len(set(reuse_prompt_hashes)) == 1
+        same_params = len(reuse_params_hashes) >= 2 and len(set(reuse_params_hashes)) == 1
+        if same_identity and same_prompt and same_params:
+            verdict = "identical_inputs_confirmed"
+            interpretation = "Prompt bytes and generation parameters were identical across reuse_verify requests."
+        else:
+            verdict = "identity_mismatch_detected"
+            interpretation = (
+                "Prompt or generation parameter identity differs across reuse_verify requests; "
+                "reuse counters are not directly comparable."
+            )
+        summary["reuse_verify_identity"] = {
+            "request_count": len(reuse_rows),
+            "request_identity_sha256": reuse_identity_hashes,
+            "prompt_sha256": reuse_prompt_hashes,
+            "generation_params_sha256": reuse_params_hashes,
+            "identical_request_identity": same_identity,
+            "identical_prompt_bytes": same_prompt,
+            "identical_generation_params": same_params,
+            "verdict": verdict,
+            "interpretation": interpretation,
+        }
+    return summary
 
 
 def has_status_code(rows: list[dict[str, Any]], code: int) -> bool:
@@ -988,6 +1253,33 @@ def render_report_markdown(summary: dict[str, Any]) -> str:
     invalid_details = summary.get("invalid_details", [])
     phase_summaries = summary.get("phase_summaries", [])
     kvbm = summary.get("kvbm_metrics", {})
+    request_identity = summary.get("request_identity", {})
+    phase_by_name = {str(p.get("phase")): p for p in phase_summaries}
+
+    def phase_kvbm_value(phase_name: str, key: str) -> float:
+        phase = phase_by_name.get(phase_name, {})
+        kv = (phase.get("kvbm_metrics_delta") or {}) if isinstance(phase, dict) else {}
+        try:
+            return float(kv.get(key, 0.0))
+        except Exception:
+            return 0.0
+
+    rollup = kvbm.get("rollup")
+    if not isinstance(rollup, dict):
+        rollup = {
+            "offload_blocks_total_delta": round(
+                sum(phase_kvbm_value(name, "offload_blocks_total_delta") for name in phase_by_name),
+                3,
+            ),
+            "onboard_blocks_total_delta": round(
+                sum(phase_kvbm_value(name, "onboard_blocks_total_delta") for name in phase_by_name),
+                3,
+            ),
+            "matched_tokens_total_delta": round(
+                sum(phase_kvbm_value(name, "kvbm_matched_tokens_delta") for name in phase_by_name),
+                3,
+            ),
+        }
 
     lines = [
         f"# Benchmark Report: {run_id}",
@@ -1025,6 +1317,9 @@ def render_report_markdown(summary: dict[str, Any]) -> str:
             f"- Throughput (req/s): `{overall.get('req_per_s')}`",
             f"- Output tokens/s (est): `{overall.get('output_tokens_per_s_est')}`",
             f"- Latency p50/p95/p99 (ms): `{(overall.get('latency_ms') or {}).get('p50')}` / `{(overall.get('latency_ms') or {}).get('p95')}` / `{(overall.get('latency_ms') or {}).get('p99')}`",
+            f"- KVBM rollup offload/onboard/matched: `{rollup.get('offload_blocks_total_delta')}` / "
+            f"`{rollup.get('onboard_blocks_total_delta')}` / "
+            f"`{rollup.get('matched_tokens_total_delta')}`",
         ]
     )
 
@@ -1037,19 +1332,85 @@ def render_report_markdown(summary: dict[str, Any]) -> str:
             f"- `{phase_name}`: err={phase.get('error_rate')} req/s={phase.get('req_per_s')} "
             f"nvme_write_mib={io_delta.get('write_mib_delta')} nvme_read_mib={io_delta.get('read_mib_delta')} "
             f"offload_blocks_delta={kvbm_delta.get('offload_blocks_total_delta')} "
-            f"onboard_blocks_delta={kvbm_delta.get('onboard_blocks_total_delta')}"
+            f"onboard_blocks_delta={kvbm_delta.get('onboard_blocks_total_delta')} "
+            f"matched_tokens_delta={kvbm_delta.get('kvbm_matched_tokens_delta')}"
         )
 
     lines.extend(["", "## KVBM Metrics Signal"])
     lines.append(f"- KVBM metrics available: `{kvbm.get('available')}`")
-    evict_signal = kvbm.get("eviction_replay_signal")
-    if isinstance(evict_signal, dict):
+    evict_signal_raw = kvbm.get("eviction_replay_signal")
+    evict_signal: dict[str, Any] = dict(evict_signal_raw) if isinstance(evict_signal_raw, dict) else {}
+    if evict_signal:
+        replay_matched = evict_signal.get("replay_matched_tokens")
+        if replay_matched is None:
+            replay_matched = round(phase_kvbm_value("replay_A", "kvbm_matched_tokens_delta"), 3)
+            evict_signal["replay_matched_tokens"] = replay_matched
+        replay_h2d = evict_signal.get("replay_onboard_blocks_h2d")
+        if replay_h2d is None:
+            replay_h2d = round(phase_kvbm_value("replay_A", "kvbm_onboard_blocks_h2d_delta"), 3)
+            evict_signal["replay_onboard_blocks_h2d"] = replay_h2d
+        replay_d2d = evict_signal.get("replay_onboard_blocks_d2d")
+        if replay_d2d is None:
+            replay_d2d = round(phase_kvbm_value("replay_A", "kvbm_onboard_blocks_d2d_delta"), 3)
+            evict_signal["replay_onboard_blocks_d2d"] = replay_d2d
+        reuse_gate = evict_signal.get("reuse_gate")
+        if reuse_gate is None:
+            reuse_gate = "reuse_absent" if float(replay_matched or 0.0) <= 0.0 else "reuse_present"
+            evict_signal["reuse_gate"] = reuse_gate
+        interpretation = str(evict_signal.get("interpretation") or "")
+        if reuse_gate == "reuse_absent" and (
+            not interpretation or interpretation.strip() == "No onboard block counters observed."
+        ):
+            evict_signal["interpretation"] = (
+                "Replay onboard counters are zero and matched tokens are zero; "
+                "rehydrate path was not eligible because cross-request reuse did not trigger."
+            )
+        elif not interpretation:
+            evict_signal["interpretation"] = "Replay onboard counters are zero despite non-zero matched tokens."
+
         lines.append(f"- Eviction replay signal: `{evict_signal.get('signal')}`")
+        lines.append(
+            f"- Replay matched/onboard(h2d,d2d): `{evict_signal.get('replay_matched_tokens')}` / "
+            f"`{evict_signal.get('replay_onboard_blocks_h2d')}`, `{evict_signal.get('replay_onboard_blocks_d2d')}`"
+        )
+        lines.append(f"- Reuse gate: `{evict_signal.get('reuse_gate')}`")
         lines.append(f"- Interpretation: {evict_signal.get('interpretation')}")
+    reuse_signal = kvbm.get("reuse_verify_signal")
+    if isinstance(reuse_signal, dict):
+        lines.append(f"- Reuse verify signal: `{reuse_signal.get('signal')}`")
+        lines.append(
+            f"- reuse_2 matched/onboard(h2d,d2d): `{reuse_signal.get('reuse_2_matched_tokens')}` / "
+            f"`{reuse_signal.get('reuse_2_onboard_blocks_h2d')}`, `{reuse_signal.get('reuse_2_onboard_blocks_d2d')}`"
+        )
+        lines.append(
+            f"- reuse_3 matched/onboard(h2d,d2d): `{reuse_signal.get('reuse_3_matched_tokens')}` / "
+            f"`{reuse_signal.get('reuse_3_onboard_blocks_h2d')}`, `{reuse_signal.get('reuse_3_onboard_blocks_d2d')}`"
+        )
+        lines.append(f"- Interpretation: {reuse_signal.get('interpretation')}")
+
+    lines.extend(["", "## Request Identity"])
+    if request_identity.get("available"):
+        lines.append(f"- Unique prompt hashes: `{request_identity.get('unique_prompt_sha256_count')}`")
+        lines.append(
+            f"- Unique generation param hashes: `{request_identity.get('unique_generation_params_sha256_count')}`"
+        )
+        lines.append(
+            f"- Unique request identity hashes: `{request_identity.get('unique_request_identity_sha256_count')}`"
+        )
+        reuse_identity = request_identity.get("reuse_verify_identity")
+        if isinstance(reuse_identity, dict):
+            lines.append(f"- Reuse identity verdict: `{reuse_identity.get('verdict')}`")
+            lines.append(f"- Interpretation: {reuse_identity.get('interpretation')}")
+    else:
+        lines.append("- Request identity data unavailable.")
 
     lines.extend(["", "## Anomalies + Limitations"])
     if not run_valid:
         lines.append("- Run is invalid and excluded from aggregate conclusions.")
+    if isinstance(evict_signal, dict) and evict_signal.get("reuse_gate") == "reuse_absent":
+        lines.append("- Offload/spill activity does not imply rehydrate readiness when matched tokens stay zero.")
+    if isinstance(reuse_signal, dict) and reuse_signal.get("signal") == "no_prefix_reuse_signal":
+        lines.append("- No prefix reuse signal: disk onboarding is gated behind cross-request matching.")
     lines.append("- TTFT remains a proxy unless streaming chunk emission is available.")
     lines.append("- NVMe counters are supporting evidence; KVBM counters are primary for offload/onboard proof.")
 

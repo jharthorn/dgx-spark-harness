@@ -4,8 +4,9 @@ This package adds a focused benchmark harness for DGX Spark Dynamo + TRT-LLM + K
 
 ## Files
 
-- `bench/run_bench.py`: benchmark CLI driver (standard + `eviction_replay` scenario).
+- `bench/run_bench.py`: benchmark CLI driver (`standard`, `eviction_replay`, `reuse_verify`).
   - Includes KVBM metrics snapshots/deltas by phase.
+  - Includes per-request identity hashes (prompt bytes + generation params).
   - Includes `--kv-mode {off,cpu_only,cpu_disk}` metadata.
   - Enforces prompt preflight guardrails against engine token limits.
   - Marks invalid runs explicitly and emits `report.md`.
@@ -73,7 +74,28 @@ python3 -m bench.run_bench \
   --container-name dyn
 ```
 
-### 4) Streaming TTFT proxy (best effort)
+### 4) Reuse verification scenario (identical request replay)
+
+```bash
+python3 -m bench.run_bench \
+  --base-url http://127.0.0.1:8000 \
+  --kv-mode cpu_disk \
+  --scenario reuse_verify \
+  --reuse-prompt-set short \
+  --reuse-repeat-count 3 \
+  --max-tokens 64 \
+  --temperature 0 \
+  --top-p 1 \
+  --request-seed 1337 \
+  --stop "<|eot_id|>"
+```
+
+Inspect:
+
+- `.overall_summary.reuse_verify_signal_kvbm`
+- `.request_identity.reuse_verify_identity`
+
+### 5) Streaming TTFT proxy (best effort)
 
 ```bash
 python3 -m bench.run_bench \
@@ -172,7 +194,7 @@ Signals of pressure/eviction:
 Known limitations:
 
 - TTFT is only a proxy unless streaming chunks are actually emitted.
-- If replay reads do not appear, reuse may be served from in-memory tiers, eviction may be insufficient, or disk rehydrate may not be active in this mode.
+- If replay reads do not appear and `kvbm_matched_tokens_delta` is zero, disk rehydrate is gated because no cross-request reuse path activated.
 
 ## Interactive Validation Notes (2026-02-08)
 

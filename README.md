@@ -81,6 +81,8 @@ Artifacts are written under `bench/results/<run_id>/`.
 
 - `bench/run_bench.py`: OpenAI-compatible `/v1/completions` benchmark runner with:
   - KVBM metrics snapshots/deltas
+  - `reuse_verify` scenario for identical-request prefix-reuse checks
+  - request identity hashes (prompt bytes + generation params)
   - `--kv-mode {off,cpu_only,cpu_disk}`
   - prompt preflight guardrails
   - invalid-run labeling

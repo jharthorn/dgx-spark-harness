@@ -260,6 +260,31 @@ Check replay signal:
 jq '.run_valid, .overall_summary.eviction_replay_signal_kvbm, .overall_summary.eviction_replay_signal_io' bench/results/eviction_replay_*/summary.json
 ```
 
+## 9a) Run Reuse Verification (Phase 1.5 Gate)
+
+This runs 3 identical sequential requests (`reuse_1`, `reuse_2`, `reuse_3`) and reports matched/onboard deltas per request window.
+
+```bash
+python3 -m bench.run_bench \
+  --base-url http://127.0.0.1:8000 \
+  --kv-mode cpu_disk \
+  --scenario reuse_verify \
+  --reuse-prompt-set short \
+  --reuse-repeat-count 3 \
+  --max-tokens 64 \
+  --temperature 0 \
+  --top-p 1 \
+  --request-seed 1337 \
+  --stop "<|eot_id|>" \
+  --run-id "reuse_verify_$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+Check reuse gate:
+
+```bash
+jq '.overall_summary.reuse_verify_signal_kvbm, .request_identity.reuse_verify_identity' bench/results/reuse_verify_*/summary.json
+```
+
 ## 9b) Baseline vs Offload Mode Compare
 
 Same workload, only KV mode changes:
@@ -300,6 +325,7 @@ scripts/bench_results_summary.sh "bench/results/*/summary.json"
 - NVMe writes increase under long-context and/or higher concurrency.
 - KVBM cache directory snapshots show active file churn and size movement.
 - Eviction replay run shows phase-level read deltas (`read_mib_delta`) if rehydrate happens.
+- If `kvbm_matched_tokens_delta` stays zero in replay/reuse verification, disk onboarding is gated and rehydrate cannot be observed.
 - If replay reads do not appear, document likely causes:
   - replay served from in-memory tiers,
   - insufficient eviction pressure,
