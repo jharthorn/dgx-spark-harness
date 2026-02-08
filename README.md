@@ -32,6 +32,16 @@ scripts/bench_start_frontend.sh
 scripts/bench_wait_ready.sh
 ```
 
+For KV-router control-plane bring-up (Phase 2), start NATS first and set router toggles:
+
+```bash
+scripts/bench_start_nats.sh
+scripts/bench_wait_nats_ready.sh
+BENCH_ENABLE_LOCAL_INDEXER=true BENCH_PUBLISH_EVENTS_AND_METRICS=0 scripts/bench_start_worker.sh
+BENCH_ROUTER_MODE=kv BENCH_KV_EVENTS=on scripts/bench_start_frontend.sh
+scripts/bench_wait_ready.sh
+```
+
 4. Verify health and run a completions smoke test:
 
 ```bash
@@ -92,6 +102,7 @@ Artifacts are written under `bench/results/<run_id>/`.
 - `bench/telemetry.py`: orchestration for telemetry script collectors.
 - `bench/scripts/`: `iostat`, `pidstat`, `nvidia-smi`, cache snapshots, docker/cufile logs.
 - `scripts/bench_*.sh`: operator wrappers for container lifecycle, health checks, smoke runs, and matrix execution.
+- `scripts/bench_start_nats.sh`, `scripts/bench_wait_nats_ready.sh`, `scripts/bench_stop_nats.sh`: NATS control-plane runbook helpers.
 - `scripts/bench_run_mode_compare.sh`: mode-controlled baseline vs offload runs.
 - `images/dyn/`: benchmark container Docker build context.
 - `kvbm/kvbm_llm_api_config.yaml`: tracked KVBM template used by `scripts/bench_prepare_host.sh`.

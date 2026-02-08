@@ -11,12 +11,11 @@ extract_count() {
   local payload="$1"
   local expr="$2"
   local out
-  if out="$(printf '%s' "${payload}" | jq -r "${expr}" 2>/dev/null)"; then
-    out="$(printf '%s' "${out}" | head -n1 | tr -dc '0-9')"
-    if [[ -n "${out}" ]]; then
-      printf '%s\n' "${out}"
-      return 0
-    fi
+  out="$(printf '%s' "${payload}" | jq -r "${expr}" 2>/dev/null || true)"
+  out="$(printf '%s' "${out}" | tr -dc '0-9')"
+  if [[ -n "${out}" ]]; then
+    printf '%s\n' "${out}"
+    return 0
   fi
   printf '0\n'
 }

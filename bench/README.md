@@ -117,6 +117,9 @@ For the scripted workflow around this harness, use:
 - `scripts/bench_container_up.sh`
 - `scripts/bench_start_worker.sh`
 - `scripts/bench_start_frontend.sh`
+- `scripts/bench_start_nats.sh`
+- `scripts/bench_wait_nats_ready.sh`
+- `scripts/bench_stop_nats.sh`
 - `scripts/bench_health.sh`
 - `scripts/bench_smoke_completion.sh`
 - `scripts/bench_run_smoke.sh`
@@ -173,6 +176,7 @@ bench/scripts/stop_iostat.sh "$RUN_DIR"
 bench/scripts/stop_pidstat.sh "$RUN_DIR"
 bench/scripts/stop_gpu_dmon.sh "$RUN_DIR"
 bench/scripts/collect_docker_logs.sh "$RUN_DIR" dyn
+bench/scripts/collect_nats_logs.sh "$RUN_DIR" bench-nats
 bench/scripts/collect_cufile_logs.sh "$RUN_DIR" dyn
 ```
 

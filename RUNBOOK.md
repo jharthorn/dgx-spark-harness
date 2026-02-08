@@ -25,6 +25,16 @@ BENCH_COMPARE_SKIP_READY=1 BENCH_KV_MODE_LIST="cpu_only cpu_disk" scripts/bench_
 scripts/bench_results_summary.sh
 ```
 
+KV-router prerequisite path:
+
+```bash
+scripts/bench_start_nats.sh
+scripts/bench_wait_nats_ready.sh
+BENCH_ENABLE_LOCAL_INDEXER=true BENCH_PUBLISH_EVENTS_AND_METRICS=0 scripts/bench_start_worker.sh
+BENCH_ROUTER_MODE=kv BENCH_KV_EVENTS=on scripts/bench_start_frontend.sh
+scripts/bench_wait_ready.sh
+```
+
 ## 1) Prepare Host Directories and Config
 
 ```bash
@@ -150,6 +160,21 @@ Expected:
 
 - `/health` returns healthy JSON.
 - `/v1/models` returns non-empty `.data`.
+
+Router-mode stability check (no benchmarking):
+
+```bash
+for i in $(seq 1 6); do
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+  curl -s http://localhost:8000/health | jq -c '{status, endpoint_count: (.endpoints|length), instance_count: (.instances|length)}'
+  curl -s http://localhost:8000/v1/models | jq -c '{model_count: (.data|length)}'
+  sleep 5
+done
+```
+
+Expected:
+
+- endpoint/model counts remain non-zero (no flap).
 
 ## 6) Smoke Test `/v1/completions`
 
@@ -313,6 +338,8 @@ Per run, inspect:
 - `bench/results/<run_id>/telemetry/kvbm_*`
 - `bench/results/<run_id>/telemetry/cufile_*`
 - `bench/results/<run_id>/telemetry/docker_dyn_logs.txt`
+- `bench/results/<run_id>/telemetry/nats_server.log` (when NATS scripts are used)
+- `bench/results/<run_id>/telemetry/docker_bench-nats_logs.txt` (when NATS scripts are used)
 
 Quick summary helper:
 
@@ -341,3 +368,11 @@ scripts/bench_results_summary.sh "bench/results/*/summary.json"
 - Compare run exits early with "No models returned by /v1/models":
   - rerun with a larger model resolve timeout:
     `BENCH_COMPARE_MODEL_RESOLVE_TIMEOUT_S=300`.
+- Frontend KV router mode fails with NATS connectivity errors:
+  - ensure NATS is running with JetStream:
+    `scripts/bench_start_nats.sh && scripts/bench_wait_nats_ready.sh`.
+  - ensure worker/frontend use the same endpoint:
+    `BENCH_NATS_SERVER=nats://127.0.0.1:4222 ...`.
+  - keep worker publish-events disabled in this build (`BENCH_PUBLISH_EVENTS_AND_METRICS=0`) to avoid a local ZMQ port collision during startup.
+  - capture logs for postmortem:
+    `bench/scripts/collect_nats_logs.sh bench/results/<run_id>`.
