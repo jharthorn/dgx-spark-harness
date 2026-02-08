@@ -53,7 +53,14 @@ source ~/dynamo-venv/bin/activate
 scripts/bench_run_matrix.sh
 ```
 
-7. Summarize outputs:
+7. Optional baseline vs offload mode compare:
+
+```bash
+source ~/dynamo-venv/bin/activate
+BENCH_COMPARE_SKIP_READY=1 BENCH_KV_MODE_LIST="cpu_only cpu_disk" scripts/bench_run_mode_compare.sh
+```
+
+8. Summarize outputs:
 
 ```bash
 scripts/bench_results_summary.sh
@@ -61,14 +68,29 @@ scripts/bench_results_summary.sh
 
 Artifacts are written under `bench/results/<run_id>/`.
 
+## Validated Bring-Up Notes (2026-02-08)
+
+- Worker/frontend startup can race model discovery. `bench.run_bench` now waits for `/v1/models` to return at least one model before failing.
+- `scripts/bench_wait_ready.sh` supports model-based readiness by default (more reliable on this build) and optional strict endpoint gating.
+- `scripts/bench_run_mode_compare.sh` supports:
+  - `BENCH_COMPARE_SKIP_READY=1` to bypass readiness gating when the control plane is flaky.
+  - `BENCH_COMPARE_MODEL_RESOLVE_TIMEOUT_S` to tolerate slow model registration.
+- `off` mode can trigger discovery-store behavior that is unstable on this stack; for current Spark validation, use `cpu_only` vs `cpu_disk` for baseline/offload contrast.
+
 ## New Harness Components
 
-- `bench/run_bench.py`: OpenAI-compatible `/v1/completions` benchmark runner.
+- `bench/run_bench.py`: OpenAI-compatible `/v1/completions` benchmark runner with:
+  - KVBM metrics snapshots/deltas
+  - `--kv-mode {off,cpu_only,cpu_disk}`
+  - prompt preflight guardrails
+  - invalid-run labeling
+  - auto `report.md` generation
 - `bench/prompts.py`: deterministic short/long/mixed prompt generation with replay sets.
 - `bench/openai_compat.py`: model discovery + completion client.
 - `bench/telemetry.py`: orchestration for telemetry script collectors.
 - `bench/scripts/`: `iostat`, `pidstat`, `nvidia-smi`, cache snapshots, docker/cufile logs.
 - `scripts/bench_*.sh`: operator wrappers for container lifecycle, health checks, smoke runs, and matrix execution.
+- `scripts/bench_run_mode_compare.sh`: mode-controlled baseline vs offload runs.
 - `images/dyn/`: benchmark container Docker build context.
 - `kvbm/kvbm_llm_api_config.yaml`: tracked KVBM template used by `scripts/bench_prepare_host.sh`.
 

@@ -5,8 +5,11 @@ CONTAINER_NAME="${BENCH_CONTAINER_NAME:-dyn}"
 IMAGE="${BENCH_IMAGE:-trtllm-rc6-dynamo-nixl:latest}"
 MODEL_HANDLE="${MODEL_HANDLE:-nvidia/Llama-3.1-8B-Instruct-FP8}"
 DYN_KVBM_DISK_CACHE_GB="${DYN_KVBM_DISK_CACHE_GB:-32}"
+DYN_KVBM_CPU_CACHE_GB="${DYN_KVBM_CPU_CACHE_GB:-8}"
 DYN_KVBM_DISK_CACHE_DIR="${DYN_KVBM_DISK_CACHE_DIR:-/mnt/nvme/kvbm}"
 KVBM_CONFIG_HOST="${KVBM_CONFIG_HOST:-/mnt/nvme/kvbm/kvbm_llm_api_config.yaml}"
+DYN_KVBM_METRICS="${DYN_KVBM_METRICS:-true}"
+DYN_KVBM_METRICS_PORT="${DYN_KVBM_METRICS_PORT:-6880}"
 
 if [[ ! -f "${KVBM_CONFIG_HOST}" ]]; then
   echo "Missing KVBM config: ${KVBM_CONFIG_HOST}" >&2
@@ -35,8 +38,11 @@ docker run -d --name "${CONTAINER_NAME}" \
   --security-opt seccomp=unconfined \
   --security-opt apparmor=unconfined \
   -e MODEL_HANDLE="${MODEL_HANDLE}" \
+  -e DYN_KVBM_CPU_CACHE_GB="${DYN_KVBM_CPU_CACHE_GB}" \
   -e DYN_KVBM_DISK_CACHE_GB="${DYN_KVBM_DISK_CACHE_GB}" \
   -e DYN_KVBM_DISK_CACHE_DIR="${DYN_KVBM_DISK_CACHE_DIR}" \
+  -e DYN_KVBM_METRICS="${DYN_KVBM_METRICS}" \
+  -e DYN_KVBM_METRICS_PORT="${DYN_KVBM_METRICS_PORT}" \
   -e CUFILE_ENV_PATH_JSON="${CUFILE_ENV_PATH_JSON:-/etc/cufile/cufile.json}" \
   -v /mnt/nvme:/mnt/nvme:rshared \
   -v "${KVBM_CONFIG_HOST}:/tmp/kvbm_llm_api_config.yaml:ro" \
@@ -49,4 +55,3 @@ docker run -d --name "${CONTAINER_NAME}" \
 echo "Container started: ${CONTAINER_NAME}"
 docker ps --filter "name=${CONTAINER_NAME}"
 docker exec "${CONTAINER_NAME}" bash -lc "findmnt -T ${DYN_KVBM_DISK_CACHE_DIR} -o TARGET,SOURCE,FSTYPE,OPTIONS"
-

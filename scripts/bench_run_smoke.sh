@@ -3,9 +3,16 @@ set -euo pipefail
 
 BASE_URL="${BENCH_BASE_URL:-http://127.0.0.1:8000}"
 RUN_ID="${1:-smoke_short_c1_$(date -u +%Y%m%dT%H%M%SZ)}"
+KV_MODE="${BENCH_KV_MODE:-cpu_disk}"
+KV_CPU_CACHE_GB="${DYN_KVBM_CPU_CACHE_GB:-8}"
+KV_DISK_CACHE_GB="${DYN_KVBM_DISK_CACHE_GB:-32}"
 
 python3 -m bench.run_bench \
   --base-url "${BASE_URL}" \
+  --kv-mode "${KV_MODE}" \
+  --kv-cpu-cache-gb "${KV_CPU_CACHE_GB}" \
+  --kv-disk-cache-gb "${KV_DISK_CACHE_GB}" \
+  --variant-tag "kv_mode:${KV_MODE}" \
   --scenario standard \
   --prompt-set short \
   --requests 4 \
@@ -21,4 +28,3 @@ python3 -m bench.run_bench \
 
 RUN_DIR="bench/results/${RUN_ID}"
 jq '.overall_summary' "${RUN_DIR}/summary.json"
-

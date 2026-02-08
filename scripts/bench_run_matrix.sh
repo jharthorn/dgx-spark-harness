@@ -3,11 +3,34 @@ set -euo pipefail
 
 BASE_URL="${BENCH_BASE_URL:-http://127.0.0.1:8000}"
 CONCURRENCIES="${BENCH_CONCURRENCIES:-1 4 8}"
+KV_MODE="${BENCH_KV_MODE:-cpu_disk}"
+KV_CPU_CACHE_GB="${DYN_KVBM_CPU_CACHE_GB:-8}"
+KV_DISK_CACHE_GB="${DYN_KVBM_DISK_CACHE_GB:-32}"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
+
+COMMON_ARGS=(
+  --base-url "${BASE_URL}"
+  --kv-mode "${KV_MODE}"
+  --kv-cpu-cache-gb "${KV_CPU_CACHE_GB}"
+  --kv-disk-cache-gb "${KV_DISK_CACHE_GB}"
+  --variant-tag "kv_mode:${KV_MODE}"
+  --variant-tag "cpu_cache_gb:${KV_CPU_CACHE_GB}"
+  --variant-tag "disk_cache_gb:${KV_DISK_CACHE_GB}"
+)
+
+if [[ "${BENCH_DISABLE_PARTIAL_REUSE:-0}" == "1" ]]; then
+  COMMON_ARGS+=(--diagnostic-disable-partial-reuse --variant-tag "diag:disable_partial_reuse")
+fi
+if [[ "${BENCH_DISABLE_BLOCK_REUSE:-0}" == "1" ]]; then
+  COMMON_ARGS+=(--diagnostic-disable-block-reuse --variant-tag "diag:disable_block_reuse")
+fi
+if [[ "${BENCH_DISABLE_DISK_OFFLOAD_FILTER:-0}" == "1" ]]; then
+  COMMON_ARGS+=(--diagnostic-disable-disk-offload-filter --variant-tag "diag:disable_disk_offload_filter")
+fi
 
 for c in ${CONCURRENCIES}; do
   python3 -m bench.run_bench \
-    --base-url "${BASE_URL}" \
+    "${COMMON_ARGS[@]}" \
     --scenario standard \
     --prompt-set short \
     --requests "${BENCH_SHORT_REQUESTS:-64}" \
@@ -24,7 +47,7 @@ done
 
 for c in ${CONCURRENCIES}; do
   python3 -m bench.run_bench \
-    --base-url "${BASE_URL}" \
+    "${COMMON_ARGS[@]}" \
     --scenario standard \
     --prompt-set long \
     --long-range "${BENCH_LONG_RANGE:-6000:7600}" \
@@ -41,7 +64,7 @@ for c in ${CONCURRENCIES}; do
 done
 
 python3 -m bench.run_bench \
-  --base-url "${BASE_URL}" \
+  "${COMMON_ARGS[@]}" \
   --scenario eviction_replay \
   --warmup "${BENCH_EVICT_WARMUP:-2}" \
   --eviction-a-requests "${BENCH_EVICT_A_REQUESTS:-8}" \
@@ -58,4 +81,3 @@ python3 -m bench.run_bench \
   --run-id "eviction_replay_${TS}"
 
 echo "Completed matrix at timestamp ${TS}"
-

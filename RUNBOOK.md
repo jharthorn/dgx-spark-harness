@@ -21,6 +21,7 @@ scripts/bench_smoke_completion.sh
 source ~/dynamo-venv/bin/activate
 scripts/bench_run_smoke.sh
 scripts/bench_run_matrix.sh
+BENCH_COMPARE_SKIP_READY=1 BENCH_KV_MODE_LIST="cpu_only cpu_disk" scripts/bench_run_mode_compare.sh
 scripts/bench_results_summary.sh
 ```
 
@@ -184,6 +185,7 @@ cd ~/dgx-spark-harness
 for c in 1 4 8; do
   python3 -m bench.run_bench \
     --base-url http://127.0.0.1:8000 \
+    --kv-mode cpu_disk \
     --scenario standard \
     --prompt-set short \
     --requests 64 \
@@ -209,6 +211,7 @@ cd ~/dgx-spark-harness
 for c in 1 4 8; do
   python3 -m bench.run_bench \
     --base-url http://127.0.0.1:8000 \
+    --kv-mode cpu_disk \
     --scenario standard \
     --prompt-set long \
     --long-range 6000:7600 \
@@ -234,6 +237,7 @@ cd ~/dgx-spark-harness
 
 python3 -m bench.run_bench \
   --base-url http://127.0.0.1:8000 \
+  --kv-mode cpu_disk \
   --scenario eviction_replay \
   --warmup 4 \
   --eviction-a-requests 24 \
@@ -253,14 +257,30 @@ python3 -m bench.run_bench \
 Check replay signal:
 
 ```bash
-jq '.overall_summary.eviction_replay_signal' bench/results/eviction_replay_*/summary.json
+jq '.run_valid, .overall_summary.eviction_replay_signal_kvbm, .overall_summary.eviction_replay_signal_io' bench/results/eviction_replay_*/summary.json
 ```
+
+## 9b) Baseline vs Offload Mode Compare
+
+Same workload, only KV mode changes:
+
+```bash
+source ~/dynamo-venv/bin/activate
+BENCH_COMPARE_SKIP_READY=1 BENCH_KV_MODE_LIST="cpu_only cpu_disk" scripts/bench_run_mode_compare.sh
+```
+
+Recommended on this stack:
+
+- Compare `cpu_only` vs `cpu_disk` for stable baseline/offload contrast.
+- `off` mode may fail due to runtime discovery-store behavior in this build; treat as optional diagnostic only.
+- If startup is stable and you want strict gating, set `BENCH_COMPARE_READY_REQUIRE_ENDPOINTS=1`.
 
 ## 10) Collect and Summarize Artifacts
 
 Per run, inspect:
 
 - `bench/results/<run_id>/summary.json`
+- `bench/results/<run_id>/report.md`
 - `bench/results/<run_id>/requests.jsonl`
 - `bench/results/<run_id>/telemetry/iostat_*.log`
 - `bench/results/<run_id>/telemetry/pidstat.log`
@@ -272,10 +292,7 @@ Per run, inspect:
 Quick summary helper:
 
 ```bash
-for s in bench/results/*/summary.json; do
-  echo "==== $s"
-  jq '{scenario, overall: .overall_summary, phases: [.phase_summaries[] | {phase, req_per_s, error_rate, io_delta}]}' "$s"
-done
+scripts/bench_results_summary.sh "bench/results/*/summary.json"
 ```
 
 ## Expected Evidence for KV Offload
@@ -287,3 +304,14 @@ done
   - replay served from in-memory tiers,
   - insufficient eviction pressure,
   - disk rehydrate not active in this runtime mode.
+
+## Troubleshooting (Validated)
+
+- `worker.log` / `frontend.log` missing:
+  - confirm startup wrappers create `/tmp/bench-logs` and that prior `pkill` patterns are not matching the shell itself.
+- Ready loop appears stuck but `/v1/models` is non-empty in another shell:
+  - use model-based readiness (default),
+  - or bypass compare-loop readiness with `BENCH_COMPARE_SKIP_READY=1`.
+- Compare run exits early with "No models returned by /v1/models":
+  - rerun with a larger model resolve timeout:
+    `BENCH_COMPARE_MODEL_RESOLVE_TIMEOUT_S=300`.

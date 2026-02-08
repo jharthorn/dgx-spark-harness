@@ -1,11 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PATTERN="${1:-bench/results/*/summary.json}"
+INPUT="${1:-bench/results/*/summary.json}"
 
-for s in ${PATTERN}; do
+expand_to_summaries() {
+  local value="$1"
+  if [[ -d "${value}" ]]; then
+    printf '%s/summary.json\n' "${value}"
+    return 0
+  fi
+  if [[ "${value}" == *"/summary.json" ]]; then
+    printf '%s\n' "${value}"
+    return 0
+  fi
+  printf '%s\n' "${value}"
+}
+
+for p in $(expand_to_summaries "${INPUT}"); do
+  for s in ${p}; do
   [[ -f "${s}" ]] || continue
   echo "==== ${s}"
-  jq '{scenario, overall: .overall_summary, phases: [.phase_summaries[] | {phase, req_per_s, error_rate, io_delta}]}' "${s}"
+  jq '{
+    run_valid,
+    invalid_reason,
+    scenario,
+    kv_mode: .kv_mode.mode,
+    overall: .overall_summary,
+    kvbm_signal: .overall_summary.eviction_replay_signal_kvbm,
+    phases: [.phase_summaries[] | {phase, req_per_s, error_rate, io_delta, kvbm_metrics_delta}]
+  }' "${s}"
+  done
 done
-

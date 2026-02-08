@@ -5,6 +5,10 @@ This package adds a focused benchmark harness for DGX Spark Dynamo + TRT-LLM + K
 ## Files
 
 - `bench/run_bench.py`: benchmark CLI driver (standard + `eviction_replay` scenario).
+  - Includes KVBM metrics snapshots/deltas by phase.
+  - Includes `--kv-mode {off,cpu_only,cpu_disk}` metadata.
+  - Enforces prompt preflight guardrails against engine token limits.
+  - Marks invalid runs explicitly and emits `report.md`.
 - `bench/prompts.py`: deterministic short/long/mixed and replay prompt generation.
 - `bench/openai_compat.py`: async OpenAI-compatible client (`/v1/models`, `/v1/completions`).
 - `bench/telemetry.py`: Python wrappers around shell collectors.
@@ -20,6 +24,7 @@ This package adds a focused benchmark harness for DGX Spark Dynamo + TRT-LLM + K
 ```bash
 python3 -m bench.run_bench \
   --base-url http://127.0.0.1:8000 \
+  --kv-mode cpu_disk \
   --scenario standard \
   --prompt-set short \
   --requests 64 \
@@ -36,6 +41,7 @@ python3 -m bench.run_bench \
 ```bash
 python3 -m bench.run_bench \
   --base-url http://127.0.0.1:8000 \
+  --kv-mode cpu_disk \
   --scenario standard \
   --prompt-set long \
   --long-range 6000:7600 \
@@ -53,6 +59,7 @@ python3 -m bench.run_bench \
 ```bash
 python3 -m bench.run_bench \
   --base-url http://127.0.0.1:8000 \
+  --kv-mode cpu_disk \
   --scenario eviction_replay \
   --warmup 4 \
   --eviction-a-requests 24 \
@@ -93,6 +100,8 @@ For the scripted workflow around this harness, use:
 - `scripts/bench_run_smoke.sh`
 - `scripts/bench_run_matrix.sh`
 - `scripts/bench_results_summary.sh`
+- `scripts/bench_run_mode_compare.sh`
+  - For current Spark stability: `BENCH_COMPARE_SKIP_READY=1 BENCH_KV_MODE_LIST="cpu_only cpu_disk" scripts/bench_run_mode_compare.sh`
 
 ## Concurrency Sweep Example
 
@@ -121,7 +130,9 @@ Each run writes to `bench/results/<run_id>/`:
 - `prompts_manifest.jsonl`: prompt IDs + token targets/estimates + hashes.
 - `requests.jsonl`: per-request raw records:
   `start_ts`, `end_ts`, `latency_ms`, `status_code`, `prompt_id`, `prompt_tokens_est`, `output_len_chars`, `error`, `request_id`, `ttft_ms` (if stream).
-- `summary.json`: per-phase + overall aggregate metrics and eviction replay signal notes.
+- `kvbm_metrics_snapshots.jsonl`: raw `/metrics` snapshots at phase boundaries.
+- `summary.json`: includes run validity, per-phase + overall metrics, KVBM deltas, eviction replay signals.
+- `report.md`: human-readable run report (brief-ready).
 - `telemetry/`: iostat, pidstat, nvidia-smi, KVBM cache snapshots, docker logs, cuFile logs.
 - `responses/` (optional with `--store-responses`): raw text outputs.
 
@@ -162,3 +173,11 @@ Known limitations:
 
 - TTFT is only a proxy unless streaming chunks are actually emitted.
 - If replay reads do not appear, reuse may be served from in-memory tiers, eviction may be insufficient, or disk rehydrate may not be active in this mode.
+
+## Interactive Validation Notes (2026-02-08)
+
+- Mode-compare runs are stable with `cpu_only` and `cpu_disk`.
+- `off` mode can be runtime-fragile in this build and is not required for Phase 1 evidence.
+- If startup/model registration races occur, use:
+  - `--model-resolve-timeout-s` / `--model-resolve-poll-s` in `bench.run_bench`,
+  - `BENCH_COMPARE_MODEL_RESOLVE_TIMEOUT_S` in `scripts/bench_run_mode_compare.sh`.

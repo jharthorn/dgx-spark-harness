@@ -41,9 +41,7 @@ class OpenAICompatClient:
         await self._client.aclose()
 
     async def fetch_first_model_id(self) -> str:
-        resp = await self._client.get("/v1/models")
-        resp.raise_for_status()
-        payload = resp.json()
+        payload = await self.fetch_models_payload()
         data = payload.get("data", [])
         if not data:
             raise RuntimeError("No models returned by /v1/models.")
@@ -51,6 +49,21 @@ class OpenAICompatClient:
         if not model_id:
             raise RuntimeError("Model entry missing `id`.")
         return str(model_id)
+
+    async def fetch_models_payload(self) -> dict[str, Any]:
+        resp = await self._client.get("/v1/models")
+        resp.raise_for_status()
+        body = resp.json()
+        if not isinstance(body, dict):
+            raise RuntimeError("Unexpected /v1/models payload.")
+        return body
+
+    async def count_models(self) -> int:
+        payload = await self.fetch_models_payload()
+        data = payload.get("data")
+        if isinstance(data, list):
+            return len(data)
+        return 0
 
     async def create_completion(
         self,
@@ -245,4 +258,3 @@ def _extract_stream_response_id(raw: str) -> Optional[str]:
             if isinstance(response_id, str):
                 return response_id
     return None
-
