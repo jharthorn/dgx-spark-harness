@@ -84,6 +84,7 @@ If the server does not stream chunks, `ttft_ms` stays empty and you should rely 
 
 For the scripted workflow around this harness, use:
 
+- `scripts/bench_prepare_host.sh`
 - `scripts/bench_container_up.sh`
 - `scripts/bench_start_worker.sh`
 - `scripts/bench_start_frontend.sh`

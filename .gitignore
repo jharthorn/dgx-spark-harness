@@ -54,3 +54,4 @@ trt_*/
 .hf_cache_fresh/
 scripts/cufile.log
 hf_ckpt*/
+legacy/local/

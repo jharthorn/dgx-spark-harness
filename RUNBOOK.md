@@ -11,6 +11,7 @@ This runbook is the canonical path to reproduce SSD KV offload benchmarking on D
 If you prefer an operator script flow instead of manual command blocks:
 
 ```bash
+scripts/bench_prepare_host.sh
 scripts/bench_container_up.sh
 scripts/bench_start_worker.sh
 scripts/bench_start_frontend.sh
@@ -28,21 +29,7 @@ scripts/bench_results_summary.sh
 ```bash
 set -euxo pipefail
 
-mkdir -p /mnt/nvme/kvbm
-
-cat >/mnt/nvme/kvbm/kvbm_llm_api_config.yaml <<'YAML'
-kv_cache_config:
-  enable_block_reuse: true
-  enable_partial_reuse: true
-  copy_on_partial_reuse: true
-  free_gpu_memory_fraction: 0.40
-  tokens_per_block: 32
-
-kv_connector_config:
-  connector_module: kvbm.trtllm_integration.connector
-  connector_scheduler_class: DynamoKVBMConnectorLeader
-  connector_worker_class: DynamoKVBMConnectorWorker
-YAML
+scripts/bench_prepare_host.sh
 ```
 
 Expected: `/mnt/nvme/kvbm/kvbm_llm_api_config.yaml` exists and is readable.
