@@ -12,6 +12,7 @@ dyn-venv/
 # Generated data, logs, and summaries
 
 results/
+bench/results/
 
 # Generated plot images & tables
 
