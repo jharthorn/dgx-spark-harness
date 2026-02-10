@@ -5,6 +5,7 @@ This repository now centers on a reproducible benchmarking workflow for **DGX Sp
 Primary docs:
 
 - `RUNBOOK.md`: canonical end-to-end setup and benchmark procedure.
+- `CANONICAL_TEST_PLAN.md`: canonical project goals and whitepaper-grade test/evidence plan.
 - `bench/README.md`: benchmark driver CLI, telemetry outputs, and interpretation notes.
 
 ## Quick Start (Current Workflow)

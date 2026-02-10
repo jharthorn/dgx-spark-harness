@@ -2,6 +2,8 @@
 
 This runbook is the canonical path to reproduce SSD KV offload benchmarking on DGX Spark using Dynamo + TensorRT-LLM + KVBM.
 
+Start here for project goals, Definition of Done, and the canonical experiment matrix: `CANONICAL_TEST_PLAN.md`.
+
 - Platform assumptions: DGX Spark (aarch64, unified memory), no GPUDirect RDMA fast path.
 - Endpoint used for load: `/v1/completions` only.
 - Model prompt format: Llama 3 chat template wrapped into completion prompt.
