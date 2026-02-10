@@ -46,6 +46,7 @@ METRICS_KVBM_PORT="${BENCH_PHASE56_METRICS_KVBM_PORT:-${DYN_KVBM_METRICS_PORT:-6
 METRICS_SYSTEM_URL="${BENCH_PHASE56_METRICS_SYSTEM_URL:-http://127.0.0.1:${METRICS_SYSTEM_PORT}/metrics}"
 METRICS_KVBM_URL="${BENCH_PHASE56_METRICS_KVBM_URL:-http://127.0.0.1:${METRICS_KVBM_PORT}/metrics}"
 PYTHON_BIN="${BENCH_PHASE56_PYTHON_BIN:-python3}"
+KVBM_INVENTORY_FROM_6880="${ANALYSIS_DIR}/kvbm_metric_inventory_from_6880.txt"
 
 if ! "${PYTHON_BIN}" -c "import httpx" >/dev/null 2>&1; then
   if [[ -x "${REPO_ROOT}/.venv-bench/bin/python3" ]] && "${REPO_ROOT}/.venv-bench/bin/python3" -c "import httpx" >/dev/null 2>&1; then
@@ -162,6 +163,102 @@ if [[ -z "${from_6880_metric_count}" ]]; then
   from_6880_metric_count=0
 fi
 
+metrics_scan_json="$(
+  "${PYTHON_BIN}" - \
+    "${ANALYSIS_DIR}/metrics_system_pressure.prom" \
+    "${ANALYSIS_DIR}/metrics_kvbm_pressure.prom" \
+    "${ANALYSIS_DIR}/metrics_kvbm_replay.prom" \
+    "${KVBM_INVENTORY_FROM_6880}" <<'PY'
+import collections
+import json
+import re
+import sys
+from pathlib import Path
+
+system_pressure_path = Path(sys.argv[1])
+kvbm_pressure_path = Path(sys.argv[2])
+kvbm_replay_path = Path(sys.argv[3])
+inventory_out_path = Path(sys.argv[4])
+
+metric_line_re = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+")
+keywords = ("offload", "onboard", "matched", "tier", "disk", "host")
+
+
+def iter_metric_lines(path: Path):
+    if not path.exists():
+        return
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = metric_line_re.match(line)
+        if not m:
+            continue
+        yield m.group(1), line
+
+
+system_names = {name for name, _ in iter_metric_lines(system_pressure_path) or []}
+system_trtllm_prefix_count = len(
+    {name for name in system_names if name.startswith("trtllm_") or name.startswith("tensorrt_llm_")}
+)
+system_dynamo_component_prefix_count = len({name for name in system_names if name.startswith("dynamo_component_")})
+
+keyword_counter: collections.Counter[str] = collections.Counter()
+keyword_samples: dict[str, str] = {}
+for path in (kvbm_pressure_path, kvbm_replay_path):
+    for name, line in iter_metric_lines(path) or []:
+        lower = name.lower()
+        if any(token in lower for token in keywords):
+            keyword_counter[name] += 1
+            keyword_samples.setdefault(name, line)
+
+top_names = [name for name, _ in keyword_counter.most_common(20)]
+keyword_match_count = len(keyword_counter)
+
+inventory_lines = [
+    "# KVBM metrics keyword inventory from 6880 snapshots",
+    f"# keywords={','.join(keywords)}",
+    f"# keyword_match_count={keyword_match_count}",
+    "",
+]
+for name in top_names:
+    inventory_lines.append(name)
+    inventory_lines.append(f"sample: {keyword_samples.get(name, '')}")
+    inventory_lines.append("")
+inventory_out_path.write_text("\n".join(inventory_lines).rstrip() + "\n", encoding="utf-8")
+
+print(
+    json.dumps(
+        {
+            "system_metrics_trtllm_prefix_count": int(system_trtllm_prefix_count),
+            "system_metrics_dynamo_component_prefix_count": int(system_dynamo_component_prefix_count),
+            "kvbm_metrics_keyword_match_count": int(keyword_match_count),
+            "kvbm_metrics_top_names": top_names,
+        }
+    )
+)
+PY
+)"
+
+system_metrics_trtllm_prefix_count="$(jq '.system_metrics_trtllm_prefix_count' <<< "${metrics_scan_json}")"
+system_metrics_dynamo_component_prefix_count="$(jq '.system_metrics_dynamo_component_prefix_count' <<< "${metrics_scan_json}")"
+kvbm_metrics_keyword_match_count="$(jq '.kvbm_metrics_keyword_match_count' <<< "${metrics_scan_json}")"
+kvbm_metrics_top_names_json="$(jq '.kvbm_metrics_top_names' <<< "${metrics_scan_json}")"
+from_6880_metric_count="${kvbm_metrics_keyword_match_count}"
+
+kvbm_metrics_classification="kvbm_metrics_endpoint_missing"
+if [[ "${kvbm_pressure_ok}" == "1" || "${kvbm_replay_ok}" == "1" ]]; then
+  if [[ "${kvbm_metrics_keyword_match_count}" -gt 0 ]]; then
+    kvbm_metrics_classification="kvbm_metrics_keywords_found"
+  else
+    kvbm_metrics_classification="kvbm_metrics_endpoint_reachable_but_no_matching_counters"
+  fi
+fi
+
 jq -n \
   --arg backend "trtllm" \
   --arg bundle_id "${BUNDLE_ID}" \
@@ -185,6 +282,11 @@ jq -n \
   --argjson system_replay_ok "${system_replay_ok}" \
   --argjson kvbm_pressure_ok "${kvbm_pressure_ok}" \
   --argjson kvbm_replay_ok "${kvbm_replay_ok}" \
+  --arg kvbm_metrics_classification "${kvbm_metrics_classification}" \
+  --argjson system_metrics_trtllm_prefix_count "${system_metrics_trtllm_prefix_count}" \
+  --argjson system_metrics_dynamo_component_prefix_count "${system_metrics_dynamo_component_prefix_count}" \
+  --argjson kvbm_metrics_keyword_match_count "${kvbm_metrics_keyword_match_count}" \
+  --argjson kvbm_metrics_top_names "${kvbm_metrics_top_names_json}" \
   --argjson expanded_metric_count "${expanded_metric_count:-0}" \
   --argjson from_6880_metric_count "${from_6880_metric_count:-0}" \
   --argjson bench_rc "${BENCH_RC}" \
@@ -195,6 +297,10 @@ jq -n \
     run_valid: $run_valid,
     invalid_reason: (if $invalid_reason == "" then null else $invalid_reason end),
     bench_return_code: $bench_rc,
+    system_metrics_trtllm_prefix_count: $system_metrics_trtllm_prefix_count,
+    system_metrics_dynamo_component_prefix_count: $system_metrics_dynamo_component_prefix_count,
+    kvbm_metrics_keyword_match_count: $kvbm_metrics_keyword_match_count,
+    kvbm_metrics_top_names: $kvbm_metrics_top_names,
     latency_ms: {
       overall: {p50: $overall_p50, p99: $overall_p99},
       warm_A: {p50: $warm_p50},
@@ -210,6 +316,7 @@ jq -n \
         pressure_snapshot_present: ($kvbm_pressure_ok == 1),
         replay_snapshot_present: ($kvbm_replay_ok == 1)
       },
+      kvbm_classification: $kvbm_metrics_classification,
       inventory_counts: {
         expanded: $expanded_metric_count,
         from_6880: $from_6880_metric_count

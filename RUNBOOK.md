@@ -322,6 +322,7 @@ python3 -m bench.run_bench \
 Notes:
 
 - Dynamo system metrics are exposed from `DYN_SYSTEM_PORT`.
+- TRT-LLM engine metrics are expected on system `/metrics` with a `trtllm_` prefix; if `system_metrics_trtllm_prefix_count=0`, treat it as an observability gap and verify runtime metric export configuration.
 - KVBM metrics endpoint is captured as best effort (`DYN_KVBM_METRICS_PORT`, default `6880`).
 - TRT-LLM KVBM metrics exposure may be partial depending on runtime build; missing KVBM metrics alone is not a hard failure for probe runs.
 - Current TRT-LLM runtime on this stack rejects `kv_connector_config.enable_partial_reuse`; keep `kv_cache_config.enable_partial_reuse: false` as the compatible control.

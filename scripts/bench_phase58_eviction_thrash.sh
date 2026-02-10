@@ -68,6 +68,7 @@ DRY_RUN="$(normalize_bool "${BENCH_PHASE58_DRY_RUN:-0}")"
 STOP_ON_SUCCESS="$(normalize_bool "${BENCH_PHASE58_STOP_ON_SUCCESS:-1}")"
 MAX_ATTEMPTS="${BENCH_PHASE58_MAX_ATTEMPTS:-0}"
 COLLECT_TELEMETRY="$(normalize_bool "${BENCH_PHASE58_COLLECT_TELEMETRY:-0}")"
+IDENTICAL_SEEDS="$(normalize_bool "${BENCH_PHASE58_IDENTICAL_SEEDS:-0}")"
 METRICS_SYSTEM_PORT="${BENCH_PHASE58_METRICS_SYSTEM_PORT:-${DYN_SYSTEM_PORT:-8081}}"
 METRICS_KVBM_PORT="${BENCH_PHASE58_METRICS_KVBM_PORT:-${DYN_KVBM_METRICS_PORT:-6880}}"
 
@@ -134,6 +135,7 @@ fi
   echo "metrics_system_port=${METRICS_SYSTEM_PORT}"
   echo "metrics_kvbm_port=${METRICS_KVBM_PORT}"
   echo "collect_telemetry=${COLLECT_TELEMETRY}"
+  echo "identical_seeds=${IDENTICAL_SEEDS}"
 } > "${LOG_DIR}/phase58_start.log"
 
 TRIALS_JSONL="${ANALYSIS_DIR}/trials.jsonl"
@@ -178,8 +180,13 @@ for ((i = 0; i < max_len; i++)); do
     continue
   fi
 
-  trial_seed="$((SEED_BASE + i))"
-  trial_request_seed="$((REQUEST_SEED_BASE + i))"
+  if [[ "${IDENTICAL_SEEDS}" == "1" ]]; then
+    trial_seed="${SEED_BASE}"
+    trial_request_seed="${REQUEST_SEED_BASE}"
+  else
+    trial_seed="$((SEED_BASE + i))"
+    trial_request_seed="$((REQUEST_SEED_BASE + i))"
+  fi
 
   if [[ "${DRY_RUN}" == "1" ]]; then
     jq -c -n \
@@ -248,7 +255,7 @@ for ((i = 0; i < max_len; i++)); do
     BENCH_PHASE56_REQUEST_SEED="${trial_request_seed}" \
     BENCH_PHASE56_COLLECT_TELEMETRY="${COLLECT_TELEMETRY}" \
     BENCH_PHASE56_METRICS_SYSTEM_PORT="${METRICS_SYSTEM_PORT}" \
-    BENCH_PHASE56_KVBM_METRICS_PORT="${METRICS_KVBM_PORT}" \
+    BENCH_PHASE56_METRICS_KVBM_PORT="${METRICS_KVBM_PORT}" \
     DYN_SYSTEM_PORT="${METRICS_SYSTEM_PORT}" \
     DYN_KVBM_METRICS_PORT="${METRICS_KVBM_PORT}" \
     scripts/bench_phase56_like_probe_trtllm.sh >> "${trial_log}" 2>&1
@@ -367,6 +374,149 @@ for ((i = 0; i < max_len; i++)); do
     break
   fi
 done
+
+METRICS_DIFF_SUMMARY_PATH="${ANALYSIS_DIR}/metrics_diff_summary.json"
+python3 - "${TRIALS_JSONL}" "${METRICS_DIFF_SUMMARY_PATH}" <<'PY'
+import json
+import math
+import re
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+trials_path = Path(sys.argv[1])
+out_path = Path(sys.argv[2])
+metric_line_re = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{[^}]*\})?\s+([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?|[Nn]a[Nn]|[+-]?[Ii]nf(?:inity)?)")
+eps = 1e-9
+
+
+def load_trials(path: Path):
+    rows = []
+    if not path.exists():
+        return rows
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def parse_metric_file(path: Path):
+    names = set()
+    sums = defaultdict(float)
+    if not path.exists():
+        return names, sums
+    text = path.read_text(encoding="utf-8", errors="replace")
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = metric_line_re.match(line)
+        if not m:
+            continue
+        name = m.group(1)
+        try:
+            value = float(m.group(2))
+        except ValueError:
+            continue
+        if not math.isfinite(value):
+            continue
+        names.add(name)
+        sums[name] += value
+    return names, sums
+
+
+def trial_metric_state(trial):
+    quick_summary = Path(trial.get("artifacts", {}).get("quick_summary_path", ""))
+    analysis_dir = quick_summary.parent if quick_summary.name else Path()
+    pressure_files = [
+        analysis_dir / "metrics_system_pressure.prom",
+        analysis_dir / "metrics_kvbm_pressure.prom",
+    ]
+    replay_files = [
+        analysis_dir / "metrics_system_replay.prom",
+        analysis_dir / "metrics_kvbm_replay.prom",
+    ]
+
+    all_names = set()
+    pressure_sums = defaultdict(float)
+    replay_sums = defaultdict(float)
+
+    for p in pressure_files:
+        names, sums = parse_metric_file(p)
+        all_names.update(names)
+        for name, value in sums.items():
+            pressure_sums[name] += value
+    for p in replay_files:
+        names, sums = parse_metric_file(p)
+        all_names.update(names)
+        for name, value in sums.items():
+            replay_sums[name] += value
+
+    deltas = {}
+    for name in set(pressure_sums) | set(replay_sums):
+        deltas[name] = replay_sums.get(name, 0.0) - pressure_sums.get(name, 0.0)
+
+    return {
+        "names": all_names,
+        "deltas": deltas,
+    }
+
+
+trials = load_trials(trials_path)
+successes = [t for t in trials if t.get("status") == "ok"]
+
+summary = {
+    "successful_trials": len(successes),
+    "new_metric_names_added": [],
+    "metric_names_missing": [],
+    "counters_with_nonzero_delta_count": 0,
+}
+
+if len(successes) >= 2:
+    first = successes[0]
+    second = successes[1]
+    state_a = trial_metric_state(first)
+    state_b = trial_metric_state(second)
+    names_a = state_a["names"]
+    names_b = state_b["names"]
+
+    summary["compared_trials"] = [
+        {
+            "trial_id": first.get("trial_id"),
+            "attempt_num": first.get("attempt_num"),
+        },
+        {
+            "trial_id": second.get("trial_id"),
+            "attempt_num": second.get("attempt_num"),
+        },
+    ]
+    summary["new_metric_names_added"] = sorted(names_b - names_a)
+    summary["metric_names_missing"] = sorted(names_a - names_b)
+
+    common_names = set(state_a["deltas"]) & set(state_b["deltas"])
+    nonzero_in_both = [
+        name
+        for name in common_names
+        if abs(state_a["deltas"][name]) > eps and abs(state_b["deltas"][name]) > eps
+    ]
+    summary["counters_with_nonzero_delta_count"] = len(nonzero_in_both)
+    summary["trial_1_nonzero_delta_count"] = sum(
+        1 for value in state_a["deltas"].values() if abs(value) > eps
+    )
+    summary["trial_2_nonzero_delta_count"] = sum(
+        1 for value in state_b["deltas"].values() if abs(value) > eps
+    )
+    summary["status"] = "ok"
+else:
+    summary["status"] = "insufficient_successful_trials"
+
+out_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
 
 jq -s \
   --arg bundle_id "${BUNDLE_ID}" \
