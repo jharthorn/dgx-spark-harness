@@ -286,6 +286,21 @@ Check replay signal:
 jq '.run_valid, .overall_summary.eviction_replay_signal_kvbm, .overall_summary.eviction_replay_signal_io' bench/results/eviction_replay_*/summary.json
 ```
 
+Phase58 wrapper (backend-switched, single-or-series trials):
+
+```bash
+BENCH_BACKEND=trtllm \
+BENCH_PHASE58_PATTERN=progressive_thrash \
+BENCH_PHASE58_MAX_ATTEMPTS=1 \
+scripts/bench_phase58_eviction_thrash.sh
+```
+
+Artifacts:
+
+- `bench/results/<bundle>/analysis/trials.jsonl`
+- `bench/results/<bundle>/analysis/quick_summary.json`
+- trial-level metrics snapshots/inventory under `bench/results/<bundle>/trials/<trial_id>/analysis/`
+
 Optional raw metrics capture for the same run:
 
 ```bash

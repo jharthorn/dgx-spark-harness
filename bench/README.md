@@ -151,6 +151,8 @@ For the scripted workflow around this harness, use:
 - `scripts/bench_run_matrix.sh`
 - `scripts/bench_results_summary.sh`
 - `scripts/bench_run_mode_compare.sh`
+- `scripts/bench_phase56_like_probe_trtllm.sh`
+- `scripts/bench_phase58_eviction_thrash.sh`
   - For current Spark stability: `BENCH_COMPARE_SKIP_READY=1 BENCH_KV_MODE_LIST="cpu_only cpu_disk" scripts/bench_run_mode_compare.sh`
 
 ## Concurrency Sweep Example
