@@ -324,6 +324,7 @@ Notes:
 - Dynamo system metrics are exposed from `DYN_SYSTEM_PORT`.
 - KVBM metrics endpoint is captured as best effort (`DYN_KVBM_METRICS_PORT`, default `6880`).
 - TRT-LLM KVBM metrics exposure may be partial depending on runtime build; missing KVBM metrics alone is not a hard failure for probe runs.
+- Current TRT-LLM runtime on this stack rejects `kv_connector_config.enable_partial_reuse`; keep `kv_cache_config.enable_partial_reuse: false` as the compatible control.
 
 ## 9a) Run Reuse Verification (Phase 1.5 Gate)
 

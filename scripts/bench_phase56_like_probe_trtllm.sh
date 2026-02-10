@@ -45,6 +45,18 @@ METRICS_SYSTEM_PORT="${BENCH_PHASE56_METRICS_SYSTEM_PORT:-${DYN_SYSTEM_PORT:-808
 METRICS_KVBM_PORT="${BENCH_PHASE56_METRICS_KVBM_PORT:-${DYN_KVBM_METRICS_PORT:-6880}}"
 METRICS_SYSTEM_URL="${BENCH_PHASE56_METRICS_SYSTEM_URL:-http://127.0.0.1:${METRICS_SYSTEM_PORT}/metrics}"
 METRICS_KVBM_URL="${BENCH_PHASE56_METRICS_KVBM_URL:-http://127.0.0.1:${METRICS_KVBM_PORT}/metrics}"
+PYTHON_BIN="${BENCH_PHASE56_PYTHON_BIN:-python3}"
+
+if ! "${PYTHON_BIN}" -c "import httpx" >/dev/null 2>&1; then
+  if [[ -x "${REPO_ROOT}/.venv-bench/bin/python3" ]] && "${REPO_ROOT}/.venv-bench/bin/python3" -c "import httpx" >/dev/null 2>&1; then
+    PYTHON_BIN="${REPO_ROOT}/.venv-bench/bin/python3"
+  elif [[ -x "/home/jharthorn/dgx-spark-harness/.venv-bench/bin/python3" ]] && /home/jharthorn/dgx-spark-harness/.venv-bench/bin/python3 -c "import httpx" >/dev/null 2>&1; then
+    PYTHON_BIN="/home/jharthorn/dgx-spark-harness/.venv-bench/bin/python3"
+  else
+    echo "Missing dependency: httpx (python binary: ${PYTHON_BIN})." >&2
+    exit 1
+  fi
+fi
 
 STARTUP_EXTRACT="${ANALYSIS_DIR}/worker_kvbm_startup_extract.log"
 QUICK_SUMMARY_PATH="${ANALYSIS_DIR}/quick_summary.json"
@@ -87,7 +99,7 @@ if [[ "${COLLECT_TELEMETRY}" == "1" ]]; then
 fi
 
 set +e
-python3 -m bench.run_bench "${BENCH_ARGS[@]}"
+"${PYTHON_BIN}" -m bench.run_bench "${BENCH_ARGS[@]}"
 BENCH_RC=$?
 set -e
 
@@ -141,8 +153,14 @@ if [[ -s "${ANALYSIS_DIR}/metrics_kvbm_replay.prom" ]] && ! grep -q "snapshot_un
   kvbm_replay_ok=1
 fi
 
-expanded_metric_count="$(grep -c '^sample:' "${ANALYSIS_DIR}/kvbm_metric_inventory_expanded.txt" 2>/dev/null || true)"
-from_6880_metric_count="$(grep -c '^sample:' "${ANALYSIS_DIR}/kvbm_metric_inventory_from_6880.txt" 2>/dev/null || true)"
+expanded_metric_count="$(grep -c '^sample:' "${ANALYSIS_DIR}/kvbm_metric_inventory_expanded.txt" 2>/dev/null || echo 0)"
+from_6880_metric_count="$(grep -c '^sample:' "${ANALYSIS_DIR}/kvbm_metric_inventory_from_6880.txt" 2>/dev/null || echo 0)"
+if [[ -z "${expanded_metric_count}" ]]; then
+  expanded_metric_count=0
+fi
+if [[ -z "${from_6880_metric_count}" ]]; then
+  from_6880_metric_count=0
+fi
 
 jq -n \
   --arg backend "trtllm" \
