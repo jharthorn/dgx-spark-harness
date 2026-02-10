@@ -132,9 +132,9 @@ run_valid="$(jq '.run_valid' "${SUMMARY_PATH}")"
 invalid_reason="$(jq -r '.invalid_reason // ""' "${SUMMARY_PATH}")"
 overall_p50="$(jq '.overall_summary.latency_ms.p50 // null' "${SUMMARY_PATH}")"
 overall_p99="$(jq '.overall_summary.latency_ms.p99 // null' "${SUMMARY_PATH}")"
-warm_p50="$(jq '[.phase_summaries[] | select(.phase==\"warm_A\") | .latency_ms.p50][0] // null' "${SUMMARY_PATH}")"
-pressure_p50="$(jq '[.phase_summaries[] | select(.phase==\"pressure_B\") | .latency_ms.p50][0] // null' "${SUMMARY_PATH}")"
-replay_p50="$(jq '[.phase_summaries[] | select(.phase==\"replay_A\") | .latency_ms.p50][0] // null' "${SUMMARY_PATH}")"
+warm_p50="$(jq '[.phase_summaries[] | select(.phase=="warm_A") | .latency_ms.p50][0] // null' "${SUMMARY_PATH}")"
+pressure_p50="$(jq '[.phase_summaries[] | select(.phase=="pressure_B") | .latency_ms.p50][0] // null' "${SUMMARY_PATH}")"
+replay_p50="$(jq '[.phase_summaries[] | select(.phase=="replay_A") | .latency_ms.p50][0] // null' "${SUMMARY_PATH}")"
 
 system_pressure_ok=0
 system_replay_ok=0
