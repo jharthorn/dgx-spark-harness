@@ -10,6 +10,7 @@ import itertools
 import json
 import logging
 import math
+import os
 import platform
 import re
 import subprocess
@@ -27,6 +28,23 @@ from .telemetry import TelemetryManager
 LOG = logging.getLogger("bench.run_bench")
 
 PROM_LINE_RE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{.*\})?\s+([0-9.eE+-]+)$")
+
+METRICS_SNAPSHOT_PHASE_SUFFIX: dict[str, str] = {
+    "pressure_B": "pressure",
+    "replay_A": "replay",
+}
+
+METRIC_INVENTORY_DEFAULT_KEYWORDS: tuple[str, ...] = (
+    "kvbm",
+    "block_manager",
+    "offload",
+    "onboard",
+    "matched",
+    "rehydrate",
+    "tier",
+    "disk",
+    "host",
+)
 
 KVBM_COUNTER_METRICS: tuple[str, ...] = (
     "kvbm_offload_blocks_d2h",
@@ -143,6 +161,10 @@ class KVBMMetricsProbe:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DGX Spark Dynamo/TRT-LLM/KVBM benchmark driver.")
+    system_port = os.environ.get("DYN_SYSTEM_PORT", "8081")
+    kvbm_metrics_port = os.environ.get("DYN_KVBM_METRICS_PORT", "6880")
+    default_system_metrics_url = f"http://127.0.0.1:{system_port}/metrics"
+    default_kvbm_metrics_url = f"http://127.0.0.1:{kvbm_metrics_port}/metrics"
     parser.add_argument("--base-url", default="http://127.0.0.1:8000", help="Frontend base URL.")
     parser.add_argument("--model-id", default="auto", help="Model ID; `auto` resolves from /v1/models.")
     parser.add_argument(
@@ -227,8 +249,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kvbm-cache-dir", default="/mnt/nvme/kvbm")
     parser.add_argument("--container-name", default="dyn")
 
-    parser.add_argument("--kvbm-metrics-url", default="http://127.0.0.1:6880/metrics")
+    parser.add_argument("--kvbm-metrics-url", default=default_kvbm_metrics_url)
     parser.add_argument("--kvbm-metrics-timeout-s", type=float, default=3.0)
+    parser.add_argument(
+        "--capture-metrics-snapshot",
+        action="store_true",
+        help="Capture raw Prometheus snapshots for pressure/replay from both system and KVBM endpoints.",
+    )
+    parser.add_argument(
+        "--metrics-system-url",
+        default=default_system_metrics_url,
+        help="System metrics URL (typically DYN_SYSTEM_PORT).",
+    )
+    parser.add_argument(
+        "--metrics-kvbm-url",
+        default=default_kvbm_metrics_url,
+        help="KVBM metrics URL (typically DYN_KVBM_METRICS_PORT).",
+    )
+    parser.add_argument(
+        "--metrics-snapshot-dir",
+        default="",
+        help="Output directory for metrics snapshots and inventory files (defaults to run dir).",
+    )
+    parser.add_argument(
+        "--metrics-inventory-keywords",
+        default=",".join(METRIC_INVENTORY_DEFAULT_KEYWORDS),
+        help="Comma-separated keyword list used for expanded metrics inventory matching.",
+    )
     parser.add_argument(
         "--allow-missing-kvbm-metrics",
         action="store_true",
@@ -245,6 +292,83 @@ def configure_logging(level: str) -> None:
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+
+def split_inventory_keywords(raw: str) -> list[str]:
+    out: list[str] = []
+    for token in re.split(r"[\s,]+", str(raw or "").strip().lower()):
+        item = token.strip()
+        if item:
+            out.append(item)
+    return out or list(METRIC_INVENTORY_DEFAULT_KEYWORDS)
+
+
+def fetch_metrics_text(url: str, timeout_s: float) -> dict[str, Any]:
+    if not url:
+        return {"success": False, "error": "metrics_url_not_configured", "raw_text": ""}
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_s) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+        return {"success": True, "error": None, "raw_text": text}
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return {"success": False, "error": str(exc), "raw_text": ""}
+
+
+def write_metrics_snapshot(path: Path, phase_name: str, snap: dict[str, Any]) -> None:
+    raw_text = str(snap.get("raw_text") or "")
+    if snap.get("success") and raw_text:
+        path.write_text(raw_text, encoding="utf-8")
+        return
+    path.write_text(
+        (
+            f"# snapshot_unavailable phase={phase_name}\n"
+            f"# error={snap.get('error')}\n"
+        ),
+        encoding="utf-8",
+    )
+
+
+def collect_metric_samples(
+    texts: dict[str, str],
+    keywords: list[str],
+    include_regex: Optional[re.Pattern[str]] = None,
+) -> dict[str, str]:
+    samples: dict[str, str] = {}
+    kw = [k.lower() for k in keywords if k]
+    for text in texts.values():
+        for line in text.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            match = PROM_LINE_RE.match(s)
+            if not match:
+                continue
+            metric_name = match.group(1)
+            lower_name = metric_name.lower()
+            keyword_hit = any(token in lower_name for token in kw)
+            regex_hit = bool(include_regex and include_regex.search(metric_name))
+            if keyword_hit or regex_hit:
+                samples.setdefault(metric_name, s)
+    return samples
+
+
+def write_metric_inventory(
+    path: Path,
+    title: str,
+    keywords: list[str],
+    samples: dict[str, str],
+) -> None:
+    lines: list[str] = [
+        f"# {title}",
+        f"# keywords={','.join(keywords)}",
+        f"# metric_count={len(samples)}",
+        "",
+    ]
+    for metric_name in sorted(samples):
+        lines.append(metric_name)
+        lines.append(f"sample: {samples[metric_name]}")
+        lines.append("")
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
 async def resolve_model_id_with_retry(client: Any, args: argparse.Namespace) -> str:
@@ -310,6 +434,12 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
     telemetry_start_report = None
     telemetry_stop_report = None
     kvbm_probe = KVBMMetricsProbe(args.kvbm_metrics_url, args.kvbm_metrics_timeout_s)
+    metrics_snapshot_dir = Path(args.metrics_snapshot_dir) if args.metrics_snapshot_dir else run_dir
+    metrics_capture_records: list[dict[str, Any]] = []
+    metrics_capture_texts: dict[str, str] = {}
+    metrics_inventory_keywords = split_inventory_keywords(args.metrics_inventory_keywords)
+    if args.capture_metrics_snapshot:
+        metrics_snapshot_dir.mkdir(parents=True, exist_ok=True)
     kvbm_snapshots: list[dict[str, Any]] = []
     kvbm_phase_deltas: dict[str, dict[str, Any]] = {}
     kvbm_snapshots_path = run_dir / "kvbm_metrics_snapshots.jsonl"
@@ -424,6 +554,47 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
                         if telemetry_manager is not None:
                             telemetry_manager.snapshot_kvbm_dir(f"after_{phase.name}")
 
+                        suffix = METRICS_SNAPSHOT_PHASE_SUFFIX.get(phase.name)
+                        if args.capture_metrics_snapshot and suffix:
+                            system_snap = fetch_metrics_text(args.metrics_system_url, args.kvbm_metrics_timeout_s)
+                            kvbm_snap = fetch_metrics_text(args.metrics_kvbm_url, args.kvbm_metrics_timeout_s)
+                            metrics_capture_records.append(
+                                {
+                                    "phase": phase.name,
+                                    "suffix": suffix,
+                                    "system": {
+                                        "url": args.metrics_system_url,
+                                        "success": bool(system_snap.get("success")),
+                                        "error": system_snap.get("error"),
+                                    },
+                                    "kvbm": {
+                                        "url": args.metrics_kvbm_url,
+                                        "success": bool(kvbm_snap.get("success")),
+                                        "error": kvbm_snap.get("error"),
+                                    },
+                                }
+                            )
+                            if system_snap.get("success"):
+                                metrics_capture_texts[f"system_{suffix}"] = str(system_snap.get("raw_text") or "")
+                            if kvbm_snap.get("success"):
+                                metrics_capture_texts[f"kvbm_{suffix}"] = str(kvbm_snap.get("raw_text") or "")
+                            write_metrics_snapshot(
+                                metrics_snapshot_dir / f"metrics_system_{suffix}.prom",
+                                phase.name,
+                                system_snap,
+                            )
+                            write_metrics_snapshot(
+                                metrics_snapshot_dir / f"metrics_kvbm_{suffix}.prom",
+                                phase.name,
+                                kvbm_snap,
+                            )
+                            # Keep legacy names for downstream consumers that still expect these.
+                            write_metrics_snapshot(
+                                metrics_snapshot_dir / f"metrics_{suffix}.prom",
+                                phase.name,
+                                system_snap,
+                            )
+
                         io_delta = diff_block_device_stats(before_io, after_io)
                         kvbm_delta = kvbm_probe.delta(before_kvbm, after_kvbm)
                         kvbm_phase_deltas[phase.name] = kvbm_delta
@@ -484,6 +655,37 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
         encoding="utf-8",
     )
 
+    if args.capture_metrics_snapshot:
+        broad_samples = collect_metric_samples(
+            metrics_capture_texts,
+            metrics_inventory_keywords,
+            include_regex=re.compile(r"dynamo_component_.*kvbm", re.IGNORECASE),
+        )
+        kvbm_name_samples = collect_metric_samples(metrics_capture_texts, ["kvbm"])
+        kvbm_from_6880_texts = {k: v for k, v in metrics_capture_texts.items() if k.startswith("kvbm_")}
+        kvbm_onboard_offload_samples = collect_metric_samples(
+            kvbm_from_6880_texts,
+            ["onboard", "offload", "matched"],
+        )
+        write_metric_inventory(
+            metrics_snapshot_dir / "kvbm_metric_inventory_expanded.txt",
+            "Expanded metric inventory",
+            metrics_inventory_keywords,
+            broad_samples,
+        )
+        write_metric_inventory(
+            metrics_snapshot_dir / "kvbm_metric_inventory.txt",
+            "KVBM-prefixed metric inventory",
+            ["kvbm"],
+            kvbm_name_samples,
+        )
+        write_metric_inventory(
+            metrics_snapshot_dir / "kvbm_metric_inventory_from_6880.txt",
+            "KVBM 6880 onboard/offload/matched inventory",
+            ["onboard", "offload", "matched"],
+            kvbm_onboard_offload_samples,
+        )
+
     kvbm_summary = build_kvbm_metrics_summary(kvbm_snapshots, kvbm_phase_deltas, args.scenario, args.kv_mode)
     request_identity_summary = analyze_request_identity(all_rows, args.scenario)
     if executed_workload and args.kv_mode != "off" and not args.allow_missing_kvbm_metrics and not kvbm_summary.get("available", False):
@@ -533,6 +735,12 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
         "phase_summaries": phase_summaries,
         "overall_summary": overall_summary,
         "kvbm_metrics": kvbm_summary,
+        "metrics_snapshot": {
+            "enabled": bool(args.capture_metrics_snapshot),
+            "snapshot_dir": str(metrics_snapshot_dir) if args.capture_metrics_snapshot else None,
+            "records": metrics_capture_records if args.capture_metrics_snapshot else [],
+            "inventory_keywords": metrics_inventory_keywords if args.capture_metrics_snapshot else [],
+        },
         "request_identity": request_identity_summary,
         "fingerprint": fingerprint,
         "notes": [

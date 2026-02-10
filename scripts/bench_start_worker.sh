@@ -6,6 +6,7 @@ MODEL_SNAPSHOT="${MODEL_SNAPSHOT:-/root/.cache/huggingface/hub/models--nvidia--L
 KVBM_CONFIG_IN_CONTAINER="${KVBM_CONFIG_IN_CONTAINER:-/tmp/kvbm_llm_api_config.yaml}"
 WORKER_LOG="${WORKER_LOG:-/tmp/bench-logs/worker.log}"
 KV_MODE="${BENCH_KV_MODE:-cpu_disk}"
+SYSTEM_PORT="${DYN_SYSTEM_PORT:-8081}"
 KVBM_METRICS_PORT="${DYN_KVBM_METRICS_PORT:-6880}"
 ENABLE_LOCAL_INDEXER="${BENCH_ENABLE_LOCAL_INDEXER:-false}"
 PUBLISH_EVENTS_AND_METRICS="${BENCH_PUBLISH_EVENTS_AND_METRICS:-0}"
@@ -74,9 +75,17 @@ export DYN_KVBM_DISK_CACHE_GB='${RESOLVED_DISK_CACHE_GB}'
 export DYN_KVBM_DISK_CACHE_DIR=\${DYN_KVBM_DISK_CACHE_DIR:-/mnt/nvme/kvbm}
 export DYN_KVBM_METRICS='${RESOLVED_KVBM_METRICS}'
 export DYN_KVBM_METRICS_PORT='${KVBM_METRICS_PORT}'
+export DYN_SYSTEM_PORT='${SYSTEM_PORT}'
 export DYN_KVBM_DISABLE_DISK_OFFLOAD_FILTER=\${DYN_KVBM_DISABLE_DISK_OFFLOAD_FILTER:-${BENCH_DISABLE_DISK_OFFLOAD_FILTER:-0}}
 export DYN_REQUEST_PLANE='${REQUEST_PLANE}'
 export NATS_SERVER='${NATS_SERVER_URL}'
+{
+  echo \"DYN_SYSTEM_PORT=\${DYN_SYSTEM_PORT}\"
+  echo \"DYN_KVBM_METRICS_PORT=\${DYN_KVBM_METRICS_PORT}\"
+  echo \"DYN_REQUEST_PLANE=\${DYN_REQUEST_PLANE}\"
+  echo \"TRTLLM_EXTRA_ENGINE_ARGS=${EXTRA_ENGINE_ARGS}\"
+  echo \"TRTLLM_STORE_KV_ARG=${STORE_KV_ARG}\"
+} >> '${WORKER_LOG}'
 nohup python3 -m dynamo.trtllm \
   --model-path '${MODEL_SNAPSHOT}' \
   --endpoint dyn://dynamo.tensorrt_llm.generate \
@@ -89,7 +98,8 @@ nohup python3 -m dynamo.trtllm \
 "
 
 echo "Worker started in ${CONTAINER_NAME}. Log: ${WORKER_LOG}"
-echo "Resolved KV mode: ${KV_MODE} (cpu_cache_gb=${RESOLVED_CPU_CACHE_GB}, disk_cache_gb=${RESOLVED_DISK_CACHE_GB}, kvbm_metrics=${RESOLVED_KVBM_METRICS}, metrics_port=${KVBM_METRICS_PORT}, local_indexer=${ENABLE_LOCAL_INDEXER}, publish_events=${RESOLVED_PUBLISH_EVENTS_AND_METRICS}, request_plane=${REQUEST_PLANE}, nats_server=${NATS_SERVER_URL})"
+echo "Resolved KV mode: ${KV_MODE} (cpu_cache_gb=${RESOLVED_CPU_CACHE_GB}, disk_cache_gb=${RESOLVED_DISK_CACHE_GB}, kvbm_metrics=${RESOLVED_KVBM_METRICS}, kvbm_metrics_port=${KVBM_METRICS_PORT}, system_port=${SYSTEM_PORT}, local_indexer=${ENABLE_LOCAL_INDEXER}, publish_events=${RESOLVED_PUBLISH_EVENTS_AND_METRICS}, request_plane=${REQUEST_PLANE}, nats_server=${NATS_SERVER_URL})"
+echo "Final TRT-LLM args: --model-path '${MODEL_SNAPSHOT}' --endpoint dyn://dynamo.tensorrt_llm.generate --request-plane '${REQUEST_PLANE}' ${EXTRA_ENGINE_ARGS} ${STORE_KV_ARG} ${WORKER_EXTRA_ARGS} --enable-local-indexer '${ENABLE_LOCAL_INDEXER}'"
 docker exec "${CONTAINER_NAME}" bash -lc "
 sleep 2
 if ! pgrep -f '^python3 -m dynamo\\.trtllm( |$)' >/dev/null 2>&1; then

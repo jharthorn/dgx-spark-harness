@@ -6,6 +6,7 @@ This package adds a focused benchmark harness for DGX Spark Dynamo + TRT-LLM + K
 
 - `bench/run_bench.py`: benchmark CLI driver (`standard`, `eviction_replay`, `reuse_verify`).
   - Includes KVBM metrics snapshots/deltas by phase.
+  - Can capture raw Prometheus snapshots from both Dynamo system metrics and KVBM metrics endpoints.
   - Includes per-request identity hashes (prompt bytes + generation params).
   - Includes `--kv-mode {off,cpu_only,cpu_disk}` metadata.
   - Enforces prompt preflight guardrails against engine token limits.
@@ -73,6 +74,30 @@ python3 -m bench.run_bench \
   --kvbm-cache-dir /mnt/nvme/kvbm \
   --container-name dyn
 ```
+
+### 3a) Dual metrics snapshots (system + kvbm)
+
+```bash
+python3 -m bench.run_bench \
+  --base-url http://127.0.0.1:8000 \
+  --kv-mode cpu_disk \
+  --scenario eviction_replay \
+  --eviction-a-requests 8 \
+  --eviction-b-requests 16 \
+  --eviction-a-concurrency 2 \
+  --eviction-b-concurrency 4 \
+  --long-range 6000:7600 \
+  --allow-missing-kvbm-metrics \
+  --capture-metrics-snapshot \
+  --metrics-system-url "http://127.0.0.1:${DYN_SYSTEM_PORT:-8081}/metrics" \
+  --metrics-kvbm-url "http://127.0.0.1:${DYN_KVBM_METRICS_PORT:-6880}/metrics"
+```
+
+This writes:
+
+- `metrics_system_pressure.prom`, `metrics_system_replay.prom`
+- `metrics_kvbm_pressure.prom`, `metrics_kvbm_replay.prom`
+- `kvbm_metric_inventory.txt`, `kvbm_metric_inventory_expanded.txt`, `kvbm_metric_inventory_from_6880.txt`
 
 ### 4) Reuse verification scenario (identical request replay)
 

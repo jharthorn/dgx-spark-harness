@@ -106,6 +106,7 @@ set -euxo pipefail
 mkdir -p /tmp/bench-logs
 export DYN_KVBM_DISK_CACHE_GB=${DYN_KVBM_DISK_CACHE_GB:-32}
 export DYN_KVBM_DISK_CACHE_DIR=${DYN_KVBM_DISK_CACHE_DIR:-/mnt/nvme/kvbm}
+export DYN_SYSTEM_PORT=${DYN_SYSTEM_PORT:-8081}
 
 python3 -m dynamo.trtllm \
   --model-path /root/.cache/huggingface/hub/models--nvidia--Llama-3.1-8B-Instruct-FP8/snapshots/42d9515ebd69eea3a87351d079c671c3c5ff0a31 \
@@ -284,6 +285,30 @@ Check replay signal:
 ```bash
 jq '.run_valid, .overall_summary.eviction_replay_signal_kvbm, .overall_summary.eviction_replay_signal_io' bench/results/eviction_replay_*/summary.json
 ```
+
+Optional raw metrics capture for the same run:
+
+```bash
+python3 -m bench.run_bench \
+  --base-url http://127.0.0.1:8000 \
+  --kv-mode cpu_disk \
+  --scenario eviction_replay \
+  --eviction-a-requests 8 \
+  --eviction-b-requests 16 \
+  --eviction-a-concurrency 2 \
+  --eviction-b-concurrency 4 \
+  --long-range 6000:7600 \
+  --allow-missing-kvbm-metrics \
+  --capture-metrics-snapshot \
+  --metrics-system-url "http://127.0.0.1:${DYN_SYSTEM_PORT:-8081}/metrics" \
+  --metrics-kvbm-url "http://127.0.0.1:${DYN_KVBM_METRICS_PORT:-6880}/metrics"
+```
+
+Notes:
+
+- Dynamo system metrics are exposed from `DYN_SYSTEM_PORT`.
+- KVBM metrics endpoint is captured as best effort (`DYN_KVBM_METRICS_PORT`, default `6880`).
+- TRT-LLM KVBM metrics exposure may be partial depending on runtime build; missing KVBM metrics alone is not a hard failure for probe runs.
 
 ## 9a) Run Reuse Verification (Phase 1.5 Gate)
 
