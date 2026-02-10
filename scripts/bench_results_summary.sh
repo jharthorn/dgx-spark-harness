@@ -27,6 +27,8 @@ for p in $(expand_to_summaries "${INPUT}"); do
     kv_mode: .kv_mode.mode,
     overall: .overall_summary,
     kvbm_signal: .overall_summary.eviction_replay_signal_kvbm,
+    reuse_verify_signal: .overall_summary.reuse_verify_signal_kvbm,
+    request_identity: .request_identity.reuse_verify_identity,
     phases: [.phase_summaries[] | {phase, req_per_s, error_rate, io_delta, kvbm_metrics_delta}]
   }' "${s}"
   done

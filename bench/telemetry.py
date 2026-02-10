@@ -59,6 +59,7 @@ class TelemetryManager:
             ("stop_pidstat.sh", [str(self.run_dir)]),
             ("stop_gpu_dmon.sh", [str(self.run_dir)]),
             ("collect_docker_logs.sh", [str(self.run_dir), self.container_name]),
+            ("collect_nats_logs.sh", [str(self.run_dir)]),
             ("collect_cufile_logs.sh", [str(self.run_dir), self.container_name]),
         ):
             completed = self._run_script(script_name, args)
@@ -96,4 +97,3 @@ class TelemetryManager:
             return subprocess.CompletedProcess(args=[str(script_path), *args], returncode=1, stdout="", stderr=msg)
         cmd = [str(script_path), *args]
         return subprocess.run(cmd, capture_output=True, text=True, check=False)
-

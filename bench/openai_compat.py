@@ -22,6 +22,7 @@ class CompletionResponse:
     error: Optional[str]
     ttft_ms: Optional[float]
     response_id: Optional[str]
+    response_headers: dict[str, str]
 
 
 class OpenAICompatClient:
@@ -72,18 +73,23 @@ class OpenAICompatClient:
         prompt: str,
         max_tokens: int,
         temperature: float,
+        top_p: float = 1.0,
         stop: Optional[Sequence[str]] = None,
         stream: bool = False,
+        seed: Optional[int] = None,
     ) -> CompletionResponse:
         payload: dict[str, Any] = {
             "model": model,
             "prompt": prompt,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "top_p": top_p,
             "stream": stream,
         }
         if stop:
             payload["stop"] = list(stop)
+        if seed is not None:
+            payload["seed"] = int(seed)
 
         if stream:
             return await self._create_completion_streaming(payload)
@@ -95,6 +101,7 @@ class OpenAICompatClient:
             resp = await self._client.post("/v1/completions", json=payload)
             latency_ms = (time.perf_counter() - start) * 1000.0
             request_id = resp.headers.get("x-request-id")
+            response_headers = _extract_response_header_hints(resp.headers)
             response_id = None
             text = ""
             error: Optional[str] = None
@@ -117,6 +124,7 @@ class OpenAICompatClient:
                 error=error,
                 ttft_ms=None,
                 response_id=response_id,
+                response_headers=response_headers,
             )
         except Exception as exc:
             latency_ms = (time.perf_counter() - start) * 1000.0
@@ -128,6 +136,7 @@ class OpenAICompatClient:
                 error=str(exc),
                 ttft_ms=None,
                 response_id=None,
+                response_headers={},
             )
 
     async def _create_completion_streaming(self, payload: dict[str, Any]) -> CompletionResponse:
@@ -137,10 +146,12 @@ class OpenAICompatClient:
         request_id: Optional[str] = None
         response_id: Optional[str] = None
         status_code = 0
+        response_headers: dict[str, str] = {}
         try:
             async with self._client.stream("POST", "/v1/completions", json=payload) as resp:
                 status_code = resp.status_code
                 request_id = resp.headers.get("x-request-id")
+                response_headers = _extract_response_header_hints(resp.headers)
                 async for chunk in resp.aiter_text():
                     if chunk:
                         if first_chunk_ms is None:
@@ -163,6 +174,7 @@ class OpenAICompatClient:
                 error=error,
                 ttft_ms=first_chunk_ms,
                 response_id=response_id,
+                response_headers=response_headers,
             )
         except Exception as exc:
             latency_ms = (time.perf_counter() - start) * 1000.0
@@ -174,6 +186,7 @@ class OpenAICompatClient:
                 error=str(exc),
                 ttft_ms=first_chunk_ms,
                 response_id=response_id,
+                response_headers=response_headers,
             )
 
 
@@ -258,3 +271,15 @@ def _extract_stream_response_id(raw: str) -> Optional[str]:
             if isinstance(response_id, str):
                 return response_id
     return None
+
+
+def _extract_response_header_hints(headers: Any) -> dict[str, str]:
+    hints: dict[str, str] = {}
+    try:
+        for key, value in headers.items():
+            lk = str(key).lower()
+            if lk.startswith("x-") or "request" in lk or "trace" in lk:
+                hints[lk] = str(value)
+    except Exception:
+        return {}
+    return hints

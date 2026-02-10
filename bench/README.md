@@ -4,8 +4,10 @@ This package adds a focused benchmark harness for DGX Spark Dynamo + TRT-LLM + K
 
 ## Files
 
-- `bench/run_bench.py`: benchmark CLI driver (standard + `eviction_replay` scenario).
+- `bench/run_bench.py`: benchmark CLI driver (`standard`, `eviction_replay`, `reuse_verify`).
   - Includes KVBM metrics snapshots/deltas by phase.
+  - Can capture raw Prometheus snapshots from both Dynamo system metrics and KVBM metrics endpoints.
+  - Includes per-request identity hashes (prompt bytes + generation params).
   - Includes `--kv-mode {off,cpu_only,cpu_disk}` metadata.
   - Enforces prompt preflight guardrails against engine token limits.
   - Marks invalid runs explicitly and emits `report.md`.
@@ -73,7 +75,52 @@ python3 -m bench.run_bench \
   --container-name dyn
 ```
 
-### 4) Streaming TTFT proxy (best effort)
+### 3a) Dual metrics snapshots (system + kvbm)
+
+```bash
+python3 -m bench.run_bench \
+  --base-url http://127.0.0.1:8000 \
+  --kv-mode cpu_disk \
+  --scenario eviction_replay \
+  --eviction-a-requests 8 \
+  --eviction-b-requests 16 \
+  --eviction-a-concurrency 2 \
+  --eviction-b-concurrency 4 \
+  --long-range 6000:7600 \
+  --allow-missing-kvbm-metrics \
+  --capture-metrics-snapshot \
+  --metrics-system-url "http://127.0.0.1:${DYN_SYSTEM_PORT:-8081}/metrics" \
+  --metrics-kvbm-url "http://127.0.0.1:${DYN_KVBM_METRICS_PORT:-6880}/metrics"
+```
+
+This writes:
+
+- `metrics_system_pressure.prom`, `metrics_system_replay.prom`
+- `metrics_kvbm_pressure.prom`, `metrics_kvbm_replay.prom`
+- `kvbm_metric_inventory.txt`, `kvbm_metric_inventory_expanded.txt`, `kvbm_metric_inventory_from_6880.txt`
+
+### 4) Reuse verification scenario (identical request replay)
+
+```bash
+python3 -m bench.run_bench \
+  --base-url http://127.0.0.1:8000 \
+  --kv-mode cpu_disk \
+  --scenario reuse_verify \
+  --reuse-prompt-set short \
+  --reuse-repeat-count 3 \
+  --max-tokens 64 \
+  --temperature 0 \
+  --top-p 1 \
+  --request-seed 1337 \
+  --stop "<|eot_id|>"
+```
+
+Inspect:
+
+- `.overall_summary.reuse_verify_signal_kvbm`
+- `.request_identity.reuse_verify_identity`
+
+### 5) Streaming TTFT proxy (best effort)
 
 ```bash
 python3 -m bench.run_bench \
@@ -95,12 +142,17 @@ For the scripted workflow around this harness, use:
 - `scripts/bench_container_up.sh`
 - `scripts/bench_start_worker.sh`
 - `scripts/bench_start_frontend.sh`
+- `scripts/bench_start_nats.sh`
+- `scripts/bench_wait_nats_ready.sh`
+- `scripts/bench_stop_nats.sh`
 - `scripts/bench_health.sh`
 - `scripts/bench_smoke_completion.sh`
 - `scripts/bench_run_smoke.sh`
 - `scripts/bench_run_matrix.sh`
 - `scripts/bench_results_summary.sh`
 - `scripts/bench_run_mode_compare.sh`
+- `scripts/bench_phase56_like_probe_trtllm.sh`
+- `scripts/bench_phase58_eviction_thrash.sh`
   - For current Spark stability: `BENCH_COMPARE_SKIP_READY=1 BENCH_KV_MODE_LIST="cpu_only cpu_disk" scripts/bench_run_mode_compare.sh`
 
 ## Concurrency Sweep Example
@@ -151,6 +203,7 @@ bench/scripts/stop_iostat.sh "$RUN_DIR"
 bench/scripts/stop_pidstat.sh "$RUN_DIR"
 bench/scripts/stop_gpu_dmon.sh "$RUN_DIR"
 bench/scripts/collect_docker_logs.sh "$RUN_DIR" dyn
+bench/scripts/collect_nats_logs.sh "$RUN_DIR" bench-nats
 bench/scripts/collect_cufile_logs.sh "$RUN_DIR" dyn
 ```
 
@@ -172,7 +225,7 @@ Signals of pressure/eviction:
 Known limitations:
 
 - TTFT is only a proxy unless streaming chunks are actually emitted.
-- If replay reads do not appear, reuse may be served from in-memory tiers, eviction may be insufficient, or disk rehydrate may not be active in this mode.
+- If replay reads do not appear and `kvbm_matched_tokens_delta` is zero, disk rehydrate is gated because no cross-request reuse path activated.
 
 ## Interactive Validation Notes (2026-02-08)
 

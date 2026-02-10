@@ -25,6 +25,16 @@ BENCH_COMPARE_SKIP_READY=1 BENCH_KV_MODE_LIST="cpu_only cpu_disk" scripts/bench_
 scripts/bench_results_summary.sh
 ```
 
+KV-router prerequisite path:
+
+```bash
+scripts/bench_start_nats.sh
+scripts/bench_wait_nats_ready.sh
+BENCH_ENABLE_LOCAL_INDEXER=true BENCH_PUBLISH_EVENTS_AND_METRICS=0 scripts/bench_start_worker.sh
+BENCH_ROUTER_MODE=kv BENCH_KV_EVENTS=on scripts/bench_start_frontend.sh
+scripts/bench_wait_ready.sh
+```
+
 ## 1) Prepare Host Directories and Config
 
 ```bash
@@ -96,6 +106,7 @@ set -euxo pipefail
 mkdir -p /tmp/bench-logs
 export DYN_KVBM_DISK_CACHE_GB=${DYN_KVBM_DISK_CACHE_GB:-32}
 export DYN_KVBM_DISK_CACHE_DIR=${DYN_KVBM_DISK_CACHE_DIR:-/mnt/nvme/kvbm}
+export DYN_SYSTEM_PORT=${DYN_SYSTEM_PORT:-8081}
 
 python3 -m dynamo.trtllm \
   --model-path /root/.cache/huggingface/hub/models--nvidia--Llama-3.1-8B-Instruct-FP8/snapshots/42d9515ebd69eea3a87351d079c671c3c5ff0a31 \
@@ -150,6 +161,21 @@ Expected:
 
 - `/health` returns healthy JSON.
 - `/v1/models` returns non-empty `.data`.
+
+Router-mode stability check (no benchmarking):
+
+```bash
+for i in $(seq 1 6); do
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+  curl -s http://localhost:8000/health | jq -c '{status, endpoint_count: (.endpoints|length), instance_count: (.instances|length)}'
+  curl -s http://localhost:8000/v1/models | jq -c '{model_count: (.data|length)}'
+  sleep 5
+done
+```
+
+Expected:
+
+- endpoint/model counts remain non-zero (no flap).
 
 ## 6) Smoke Test `/v1/completions`
 
@@ -260,6 +286,72 @@ Check replay signal:
 jq '.run_valid, .overall_summary.eviction_replay_signal_kvbm, .overall_summary.eviction_replay_signal_io' bench/results/eviction_replay_*/summary.json
 ```
 
+Phase58 wrapper (backend-switched, single-or-series trials):
+
+```bash
+BENCH_BACKEND=trtllm \
+BENCH_PHASE58_PATTERN=progressive_thrash \
+BENCH_PHASE58_MAX_ATTEMPTS=1 \
+scripts/bench_phase58_eviction_thrash.sh
+```
+
+Artifacts:
+
+- `bench/results/<bundle>/analysis/trials.jsonl`
+- `bench/results/<bundle>/analysis/quick_summary.json`
+- trial-level metrics snapshots/inventory under `bench/results/<bundle>/trials/<trial_id>/analysis/`
+
+Optional raw metrics capture for the same run:
+
+```bash
+python3 -m bench.run_bench \
+  --base-url http://127.0.0.1:8000 \
+  --kv-mode cpu_disk \
+  --scenario eviction_replay \
+  --eviction-a-requests 8 \
+  --eviction-b-requests 16 \
+  --eviction-a-concurrency 2 \
+  --eviction-b-concurrency 4 \
+  --long-range 6000:7600 \
+  --allow-missing-kvbm-metrics \
+  --capture-metrics-snapshot \
+  --metrics-system-url "http://127.0.0.1:${DYN_SYSTEM_PORT:-8081}/metrics" \
+  --metrics-kvbm-url "http://127.0.0.1:${DYN_KVBM_METRICS_PORT:-6880}/metrics"
+```
+
+Notes:
+
+- Dynamo system metrics are exposed from `DYN_SYSTEM_PORT`.
+- TRT-LLM engine metrics are expected on system `/metrics` with a `trtllm_` prefix; if `system_metrics_trtllm_prefix_count=0`, treat it as an observability gap and verify runtime metric export configuration.
+- KVBM metrics endpoint is captured as best effort (`DYN_KVBM_METRICS_PORT`, default `6880`).
+- TRT-LLM KVBM metrics exposure may be partial depending on runtime build; missing KVBM metrics alone is not a hard failure for probe runs.
+- Current TRT-LLM runtime on this stack rejects `kv_connector_config.enable_partial_reuse`; keep `kv_cache_config.enable_partial_reuse: false` as the compatible control.
+
+## 9a) Run Reuse Verification (Phase 1.5 Gate)
+
+This runs 3 identical sequential requests (`reuse_1`, `reuse_2`, `reuse_3`) and reports matched/onboard deltas per request window.
+
+```bash
+python3 -m bench.run_bench \
+  --base-url http://127.0.0.1:8000 \
+  --kv-mode cpu_disk \
+  --scenario reuse_verify \
+  --reuse-prompt-set short \
+  --reuse-repeat-count 3 \
+  --max-tokens 64 \
+  --temperature 0 \
+  --top-p 1 \
+  --request-seed 1337 \
+  --stop "<|eot_id|>" \
+  --run-id "reuse_verify_$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+Check reuse gate:
+
+```bash
+jq '.overall_summary.reuse_verify_signal_kvbm, .request_identity.reuse_verify_identity' bench/results/reuse_verify_*/summary.json
+```
+
 ## 9b) Baseline vs Offload Mode Compare
 
 Same workload, only KV mode changes:
@@ -288,6 +380,8 @@ Per run, inspect:
 - `bench/results/<run_id>/telemetry/kvbm_*`
 - `bench/results/<run_id>/telemetry/cufile_*`
 - `bench/results/<run_id>/telemetry/docker_dyn_logs.txt`
+- `bench/results/<run_id>/telemetry/nats_server.log` (when NATS scripts are used)
+- `bench/results/<run_id>/telemetry/docker_bench-nats_logs.txt` (when NATS scripts are used)
 
 Quick summary helper:
 
@@ -300,6 +394,7 @@ scripts/bench_results_summary.sh "bench/results/*/summary.json"
 - NVMe writes increase under long-context and/or higher concurrency.
 - KVBM cache directory snapshots show active file churn and size movement.
 - Eviction replay run shows phase-level read deltas (`read_mib_delta`) if rehydrate happens.
+- If `kvbm_matched_tokens_delta` stays zero in replay/reuse verification, disk onboarding is gated and rehydrate cannot be observed.
 - If replay reads do not appear, document likely causes:
   - replay served from in-memory tiers,
   - insufficient eviction pressure,
@@ -315,3 +410,11 @@ scripts/bench_results_summary.sh "bench/results/*/summary.json"
 - Compare run exits early with "No models returned by /v1/models":
   - rerun with a larger model resolve timeout:
     `BENCH_COMPARE_MODEL_RESOLVE_TIMEOUT_S=300`.
+- Frontend KV router mode fails with NATS connectivity errors:
+  - ensure NATS is running with JetStream:
+    `scripts/bench_start_nats.sh && scripts/bench_wait_nats_ready.sh`.
+  - ensure worker/frontend use the same endpoint:
+    `BENCH_NATS_SERVER=nats://127.0.0.1:4222 ...`.
+  - keep worker publish-events disabled in this build (`BENCH_PUBLISH_EVENTS_AND_METRICS=0`) to avoid a local ZMQ port collision during startup.
+  - capture logs for postmortem:
+    `bench/scripts/collect_nats_logs.sh bench/results/<run_id>`.
