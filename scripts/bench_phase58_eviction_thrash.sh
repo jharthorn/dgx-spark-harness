@@ -47,10 +47,17 @@ pick_series_value() {
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
+# shellcheck source=scripts/bench_profile_lib.sh
+source "${SCRIPT_DIR}/bench_profile_lib.sh"
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 RESULTS_ROOT="${BENCH_RESULTS_ROOT:-bench/results}"
 BACKEND="${BENCH_BACKEND:-trtllm}"
+bench_resolve_tier_mode "${BENCH_TIER_MODE:-${BENCH_KV_MODE:-}}"
+bench_resolve_model_profile "${BENCH_MODEL_PROFILE:-}"
+TIER_MODE="${BENCH_TIER_MODE_RESOLVED}"
+KV_MODE="${BENCH_KV_MODE_RESOLVED}"
+MODEL_PROFILE="${BENCH_MODEL_PROFILE_RESOLVED}"
 PATTERN="${BENCH_PHASE58_PATTERN:-progressive_thrash}"
 BUNDLE_ID="${BENCH_PHASE58_BUNDLE_ID:-phase58_${BACKEND}_${PATTERN}_${TS}}"
 BUNDLE_DIR="${RESULTS_ROOT}/${BUNDLE_ID}"
@@ -122,6 +129,9 @@ fi
 
 {
   echo "backend=${BACKEND}"
+  echo "tier_mode=${TIER_MODE}"
+  echo "kv_mode=${KV_MODE}"
+  echo "model_profile=${MODEL_PROFILE}"
   echo "pattern=${PATTERN}"
   echo "bundle_id=${BUNDLE_ID}"
   echo "dry_run=${DRY_RUN}"
@@ -159,6 +169,9 @@ for ((i = 0; i < max_len; i++)); do
      ! is_uint "${b_req}" || ! is_uint "${b_conc}" || ! is_long_range "${long_range}"; then
     jq -c -n \
       --arg backend "${BACKEND}" \
+      --arg tier_mode "${TIER_MODE}" \
+      --arg kv_mode "${KV_MODE}" \
+      --arg model_profile "${MODEL_PROFILE}" \
       --arg pattern "${PATTERN}" \
       --arg trial_id "${trial_id}" \
       --arg trial_bundle_id "${trial_bundle_id}" \
@@ -170,6 +183,9 @@ for ((i = 0; i < max_len; i++)); do
       '{
         attempt_num: $attempt_num,
         backend: $backend,
+        tier_mode: $tier_mode,
+        kv_mode: $kv_mode,
+        model_profile: $model_profile,
         pattern: $pattern,
         trial_id: $trial_id,
         trial_bundle_id: $trial_bundle_id,
@@ -191,6 +207,9 @@ for ((i = 0; i < max_len; i++)); do
   if [[ "${DRY_RUN}" == "1" ]]; then
     jq -c -n \
       --arg backend "${BACKEND}" \
+      --arg tier_mode "${TIER_MODE}" \
+      --arg kv_mode "${KV_MODE}" \
+      --arg model_profile "${MODEL_PROFILE}" \
       --arg pattern "${PATTERN}" \
       --arg trial_id "${trial_id}" \
       --arg trial_bundle_id "${trial_bundle_id}" \
@@ -209,6 +228,9 @@ for ((i = 0; i < max_len; i++)); do
       '{
         attempt_num: $attempt_num,
         backend: $backend,
+        tier_mode: $tier_mode,
+        kv_mode: $kv_mode,
+        model_profile: $model_profile,
         pattern: $pattern,
         trial_id: $trial_id,
         trial_bundle_id: $trial_bundle_id,
@@ -235,6 +257,9 @@ for ((i = 0; i < max_len; i++)); do
   {
     echo "attempt=${attempt_num}"
     echo "backend=${BACKEND}"
+    echo "tier_mode=${TIER_MODE}"
+    echo "kv_mode=${KV_MODE}"
+    echo "model_profile=${MODEL_PROFILE}"
     echo "trial_bundle_id=${trial_bundle_id}"
     echo "trial_run_id=${trial_run_id}"
     echo "a_req=${A_REQ} b_req=${b_req} a_conc=${A_CONC} b_conc=${b_conc} long_range=${long_range}"
@@ -256,6 +281,9 @@ for ((i = 0; i < max_len; i++)); do
     BENCH_PHASE56_COLLECT_TELEMETRY="${COLLECT_TELEMETRY}" \
     BENCH_PHASE56_METRICS_SYSTEM_PORT="${METRICS_SYSTEM_PORT}" \
     BENCH_PHASE56_METRICS_KVBM_PORT="${METRICS_KVBM_PORT}" \
+    BENCH_TIER_MODE="${TIER_MODE}" \
+    BENCH_KV_MODE="${KV_MODE}" \
+    BENCH_MODEL_PROFILE="${MODEL_PROFILE}" \
     DYN_SYSTEM_PORT="${METRICS_SYSTEM_PORT}" \
     DYN_KVBM_METRICS_PORT="${METRICS_KVBM_PORT}" \
     scripts/bench_phase56_like_probe_trtllm.sh >> "${trial_log}" 2>&1
@@ -308,6 +336,9 @@ for ((i = 0; i < max_len; i++)); do
 
   jq -c -n \
     --arg backend "${BACKEND}" \
+    --arg tier_mode "${TIER_MODE}" \
+    --arg kv_mode "${KV_MODE}" \
+    --arg model_profile "${MODEL_PROFILE}" \
     --arg pattern "${PATTERN}" \
     --arg trial_id "${trial_id}" \
     --arg trial_bundle_id "${trial_bundle_id}" \
@@ -333,6 +364,9 @@ for ((i = 0; i < max_len; i++)); do
     '{
       attempt_num: $attempt_num,
       backend: $backend,
+      tier_mode: $tier_mode,
+      kv_mode: $kv_mode,
+      model_profile: $model_profile,
       pattern: $pattern,
       trial_id: $trial_id,
       trial_bundle_id: $trial_bundle_id,
@@ -521,10 +555,16 @@ PY
 jq -s \
   --arg bundle_id "${BUNDLE_ID}" \
   --arg backend "${BACKEND}" \
+  --arg tier_mode "${TIER_MODE}" \
+  --arg kv_mode "${KV_MODE}" \
+  --arg model_profile "${MODEL_PROFILE}" \
   --arg pattern "${PATTERN}" \
   '{
     bundle_id: $bundle_id,
     backend: $backend,
+    tier_mode: $tier_mode,
+    kv_mode: $kv_mode,
+    model_profile: $model_profile,
     pattern: $pattern,
     total_attempts: length,
     success_count: ([ .[] | select(.status == "ok") ] | length),

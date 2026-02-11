@@ -12,6 +12,11 @@ Start here for project goals, Definition of Done, and the canonical experiment m
 
 If you prefer an operator script flow instead of manual command blocks:
 
+Canonical switches:
+
+- `BENCH_TIER_MODE=B0|B1|B2` maps to `off|cpu_only|cpu_disk`.
+- `BENCH_MODEL_PROFILE=llama31_8b_fp8|llama33_70b_nvfp4` toggles baseline vs pressure-model defaults.
+
 ```bash
 scripts/bench_prepare_host.sh
 scripts/bench_container_up.sh

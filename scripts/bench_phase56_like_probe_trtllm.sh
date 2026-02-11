@@ -16,6 +16,8 @@ normalize_bool() {
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
+# shellcheck source=scripts/bench_profile_lib.sh
+source "${SCRIPT_DIR}/bench_profile_lib.sh"
 
 RESULTS_ROOT="${BENCH_RESULTS_ROOT:-bench/results}"
 BUNDLE_ID="${BENCH_PHASE56_LIKE_BUNDLE_ID:-phase56_like_trtllm_$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -27,9 +29,14 @@ mkdir -p "${ANALYSIS_DIR}"
 
 BASE_URL="${BENCH_BASE_URL:-http://127.0.0.1:8000}"
 CONTAINER_NAME="${BENCH_CONTAINER_NAME:-dyn}"
-KV_MODE="${BENCH_KV_MODE:-cpu_disk}"
-KV_CPU_CACHE_GB="${BENCH_PHASE56_CPU_CACHE_GB:-${DYN_KVBM_CPU_CACHE_GB:-8}}"
-KV_DISK_CACHE_GB="${BENCH_PHASE56_DISK_CACHE_GB:-${DYN_KVBM_DISK_CACHE_GB:-32}}"
+bench_resolve_tier_mode "${BENCH_TIER_MODE:-${BENCH_KV_MODE:-}}"
+bench_defaults_for_tier_mode "${BENCH_TIER_MODE_RESOLVED}"
+bench_resolve_model_env "${BENCH_MODEL_PROFILE:-}"
+KV_MODE="${BENCH_KV_MODE_RESOLVED}"
+TIER_MODE="${BENCH_TIER_MODE_RESOLVED}"
+MODEL_PROFILE="${BENCH_MODEL_PROFILE_RESOLVED}"
+KV_CPU_CACHE_GB="${BENCH_PHASE56_CPU_CACHE_GB:-${DYN_KVBM_CPU_CACHE_GB:-${BENCH_CPU_CACHE_GB_DEFAULT}}}"
+KV_DISK_CACHE_GB="${BENCH_PHASE56_DISK_CACHE_GB:-${DYN_KVBM_DISK_CACHE_GB:-${BENCH_DISK_CACHE_GB_DEFAULT}}}"
 A_REQ="${BENCH_PHASE56_A_REQ:-8}"
 B_REQ="${BENCH_PHASE56_B_REQ:-16}"
 A_CONC="${BENCH_PHASE56_A_CONC:-2}"
@@ -40,6 +47,18 @@ TEMPERATURE="${BENCH_PHASE56_TEMPERATURE:-0.2}"
 SEED="${BENCH_PHASE56_SEED:-1337}"
 REQUEST_SEED="${BENCH_PHASE56_REQUEST_SEED:-1337}"
 COLLECT_TELEMETRY="$(normalize_bool "${BENCH_PHASE56_COLLECT_TELEMETRY:-0}")"
+SCENARIO="${BENCH_PHASE56_SCENARIO:-eviction_replay}"
+DISK_OFFLOAD_FILTER_OVERRIDE="${BENCH_PHASE56_DISABLE_DISK_OFFLOAD_FILTER:-${DYN_KVBM_DISABLE_DISK_OFFLOAD_FILTER:-}}"
+
+REHYDRATE_POPULATE_SESSIONS="${BENCH_PHASE56_REHYDRATE_POPULATE_SESSIONS:-${A_REQ}}"
+REHYDRATE_THRASH_SESSIONS="${BENCH_PHASE56_REHYDRATE_THRASH_SESSIONS:-${B_REQ}}"
+REHYDRATE_TURNS="${BENCH_PHASE56_REHYDRATE_TURNS:-2}"
+REHYDRATE_PREFIX_TARGET_TOKENS="${BENCH_PHASE56_REHYDRATE_PREFIX_TARGET_TOKENS:-4096}"
+REHYDRATE_POPULATE_CONC="${BENCH_PHASE56_REHYDRATE_POPULATE_CONC:-${A_CONC}}"
+REHYDRATE_THRASH_CONC="${BENCH_PHASE56_REHYDRATE_THRASH_CONC:-${B_CONC}}"
+REHYDRATE_REPLAY_CONC="${BENCH_PHASE56_REHYDRATE_REPLAY_CONC:-${A_CONC}}"
+REHYDRATE_REPLAY_REPEATS="${BENCH_PHASE56_REHYDRATE_REPLAY_REPEATS:-1}"
+REHYDRATE_GEN_TOKENS="${BENCH_PHASE56_REHYDRATE_GEN_TOKENS:-${MAX_TOKENS}}"
 
 METRICS_SYSTEM_PORT="${BENCH_PHASE56_METRICS_SYSTEM_PORT:-${DYN_SYSTEM_PORT:-8081}}"
 METRICS_KVBM_PORT="${BENCH_PHASE56_METRICS_KVBM_PORT:-${DYN_KVBM_METRICS_PORT:-6880}}"
@@ -62,8 +81,22 @@ fi
 STARTUP_EXTRACT="${ANALYSIS_DIR}/worker_kvbm_startup_extract.log"
 QUICK_SUMMARY_PATH="${ANALYSIS_DIR}/quick_summary.json"
 SUMMARY_PATH="${RUN_DIR}/summary.json"
+RUNTIME_MANIFEST_PATH="${ANALYSIS_DIR}/worker_runtime_manifest.json"
+BUNDLE_MANIFEST_PATH="${ANALYSIS_DIR}/manifest.json"
 
+BENCH_TIER_MODE="${TIER_MODE}" \
+BENCH_KV_MODE="${KV_MODE}" \
+BENCH_MODEL_PROFILE="${MODEL_PROFILE}" \
+DYN_KVBM_CPU_CACHE_GB="${KV_CPU_CACHE_GB}" \
+DYN_KVBM_DISK_CACHE_GB="${KV_DISK_CACHE_GB}" \
+DYN_KVBM_DISABLE_DISK_OFFLOAD_FILTER="${DISK_OFFLOAD_FILTER_OVERRIDE}" \
 scripts/bench_start_worker.sh
+BENCH_TIER_MODE="${TIER_MODE}" \
+BENCH_KV_MODE="${KV_MODE}" \
+BENCH_MODEL_PROFILE="${MODEL_PROFILE}" \
+DYN_KVBM_CPU_CACHE_GB="${KV_CPU_CACHE_GB}" \
+DYN_KVBM_DISK_CACHE_GB="${KV_DISK_CACHE_GB}" \
+DYN_KVBM_DISABLE_DISK_OFFLOAD_FILTER="${DISK_OFFLOAD_FILTER_OVERRIDE}" \
 scripts/bench_start_frontend.sh
 scripts/bench_wait_ready.sh
 
@@ -71,20 +104,35 @@ BENCH_ARGS=(
   --base-url "${BASE_URL}"
   --results-root "${BUNDLE_DIR}"
   --run-id "${RUN_ID}"
+  --tier-mode "${TIER_MODE}"
   --kv-mode "${KV_MODE}"
   --kv-cpu-cache-gb "${KV_CPU_CACHE_GB}"
   --kv-disk-cache-gb "${KV_DISK_CACHE_GB}"
-  --scenario eviction_replay
+  --variant-tag "tier_mode:${TIER_MODE}"
+  --variant-tag "kv_mode:${KV_MODE}"
+  --variant-tag "model_profile:${MODEL_PROFILE}"
+  --scenario "${SCENARIO}"
   --warmup 0
   --eviction-a-requests "${A_REQ}"
   --eviction-b-requests "${B_REQ}"
   --eviction-a-concurrency "${A_CONC}"
   --eviction-b-concurrency "${B_CONC}"
+  --rehydrate-populate-sessions "${REHYDRATE_POPULATE_SESSIONS}"
+  --rehydrate-thrash-sessions "${REHYDRATE_THRASH_SESSIONS}"
+  --rehydrate-turns "${REHYDRATE_TURNS}"
+  --rehydrate-prefix-target-tokens "${REHYDRATE_PREFIX_TARGET_TOKENS}"
+  --rehydrate-populate-concurrency "${REHYDRATE_POPULATE_CONC}"
+  --rehydrate-thrash-concurrency "${REHYDRATE_THRASH_CONC}"
+  --rehydrate-replay-concurrency "${REHYDRATE_REPLAY_CONC}"
+  --rehydrate-replay-repeats "${REHYDRATE_REPLAY_REPEATS}"
+  --rehydrate-gen-tokens "${REHYDRATE_GEN_TOKENS}"
   --long-range "${LONG_RANGE}"
   --max-tokens "${MAX_TOKENS}"
   --temperature "${TEMPERATURE}"
   --seed "${SEED}"
   --request-seed "${REQUEST_SEED}"
+  --worker-proc-pattern "${BENCH_WORKER_PROC_PATTERN:-dynamo\\.trtllm}"
+  --nvme-device "${BENCH_NVME_DEVICE:-/dev/nvme0}"
   --stop "<|eot_id|>"
   --container-name "${CONTAINER_NAME}"
   --kvbm-cache-dir "${DYN_KVBM_DISK_CACHE_DIR:-/mnt/nvme/kvbm}"
@@ -124,6 +172,55 @@ set -euo pipefail
 } " > "${STARTUP_EXTRACT}" 2>/dev/null || true
 fi
 
+if docker exec "${CONTAINER_NAME}" bash -lc "test -f /tmp/bench-logs/worker_runtime_manifest.json"; then
+  docker exec "${CONTAINER_NAME}" bash -lc "cat /tmp/bench-logs/worker_runtime_manifest.json" > "${RUNTIME_MANIFEST_PATH}" 2>/dev/null || true
+else
+  jq -n \
+    --arg note "worker_runtime_manifest_missing" \
+    --arg container "${CONTAINER_NAME}" \
+    '{note: $note, container: $container}' > "${RUNTIME_MANIFEST_PATH}"
+fi
+
+jq -n \
+  --arg bundle_id "${BUNDLE_ID}" \
+  --arg run_id "${RUN_ID}" \
+  --arg scenario "${SCENARIO}" \
+  --arg tier_mode "${TIER_MODE}" \
+  --arg kv_mode "${KV_MODE}" \
+  --arg model_profile "${MODEL_PROFILE}" \
+  --arg model_handle "${MODEL_HANDLE}" \
+  --arg model_name "${MODEL_NAME}" \
+  --arg container_name "${CONTAINER_NAME}" \
+  --argjson kv_cpu_cache_gb "${KV_CPU_CACHE_GB}" \
+  --argjson kv_disk_cache_gb "${KV_DISK_CACHE_GB}" \
+  --arg metrics_system_port "${METRICS_SYSTEM_PORT}" \
+  --arg metrics_kvbm_port "${METRICS_KVBM_PORT}" \
+  --arg disk_offload_filter_override "${DISK_OFFLOAD_FILTER_OVERRIDE}" \
+  --arg runtime_manifest_path "${RUNTIME_MANIFEST_PATH}" \
+  --arg summary_path "${SUMMARY_PATH}" \
+  '{
+    bundle_id: $bundle_id,
+    run_id: $run_id,
+    scenario: $scenario,
+    tier_mode: $tier_mode,
+    kv_mode: $kv_mode,
+    model_profile: $model_profile,
+    model_handle: $model_handle,
+    model_name: $model_name,
+    container_name: $container_name,
+    kvbm: {
+      cpu_cache_gb: $kv_cpu_cache_gb,
+      disk_cache_gb: $kv_disk_cache_gb,
+      metrics_system_port: $metrics_system_port,
+      metrics_kvbm_port: $metrics_kvbm_port,
+      disk_offload_filter_override: (if $disk_offload_filter_override == "" then null else $disk_offload_filter_override end)
+    },
+    artifacts: {
+      worker_runtime_manifest: $runtime_manifest_path,
+      run_summary: $summary_path
+    }
+  }' > "${BUNDLE_MANIFEST_PATH}"
+
 if [[ ! -f "${SUMMARY_PATH}" ]]; then
   echo "missing run summary at ${SUMMARY_PATH}" >&2
   exit 1
@@ -131,11 +228,27 @@ fi
 
 run_valid="$(jq '.run_valid' "${SUMMARY_PATH}")"
 invalid_reason="$(jq -r '.invalid_reason // ""' "${SUMMARY_PATH}")"
+scenario_name="$(jq -r '.scenario // "unknown"' "${SUMMARY_PATH}")"
 overall_p50="$(jq '.overall_summary.latency_ms.p50 // null' "${SUMMARY_PATH}")"
+overall_p95="$(jq '.overall_summary.latency_ms.p95 // null' "${SUMMARY_PATH}")"
 overall_p99="$(jq '.overall_summary.latency_ms.p99 // null' "${SUMMARY_PATH}")"
-warm_p50="$(jq '[.phase_summaries[] | select(.phase=="warm_A") | .latency_ms.p50][0] // null' "${SUMMARY_PATH}")"
-pressure_p50="$(jq '[.phase_summaries[] | select(.phase=="pressure_B") | .latency_ms.p50][0] // null' "${SUMMARY_PATH}")"
-replay_p50="$(jq '[.phase_summaries[] | select(.phase=="replay_A") | .latency_ms.p50][0] // null' "${SUMMARY_PATH}")"
+overall_error_rate="$(jq '.overall_summary.error_rate // null' "${SUMMARY_PATH}")"
+overall_ttft_p50="$(jq '.overall_summary.ttft_ms.p50 // null' "${SUMMARY_PATH}")"
+overall_ttft_p95="$(jq '.overall_summary.ttft_ms.p95 // null' "${SUMMARY_PATH}")"
+overall_ttft_p99="$(jq '.overall_summary.ttft_ms.p99 // null' "${SUMMARY_PATH}")"
+warm_p50="$(jq '([.phase_summaries[] | select(.phase=="warm_A") | .latency_ms.p50][0] // [.phase_summaries[] | select(.phase=="populate") | .latency_ms.p50][0] // null)' "${SUMMARY_PATH}")"
+warm_p95="$(jq '([.phase_summaries[] | select(.phase=="warm_A") | .latency_ms.p95][0] // [.phase_summaries[] | select(.phase=="populate") | .latency_ms.p95][0] // null)' "${SUMMARY_PATH}")"
+pressure_p50="$(jq '([.phase_summaries[] | select(.phase=="pressure_B") | .latency_ms.p50][0] // [.phase_summaries[] | select(.phase=="thrash") | .latency_ms.p50][0] // null)' "${SUMMARY_PATH}")"
+pressure_p95="$(jq '([.phase_summaries[] | select(.phase=="pressure_B") | .latency_ms.p95][0] // [.phase_summaries[] | select(.phase=="thrash") | .latency_ms.p95][0] // null)' "${SUMMARY_PATH}")"
+replay_p50="$(jq '([.phase_summaries[] | select(.phase=="replay_A") | .latency_ms.p50][0] // [.phase_summaries[] | select(.phase=="replay") | .latency_ms.p50][0] // null)' "${SUMMARY_PATH}")"
+replay_p95="$(jq '([.phase_summaries[] | select(.phase=="replay_A") | .latency_ms.p95][0] // [.phase_summaries[] | select(.phase=="replay") | .latency_ms.p95][0] // null)' "${SUMMARY_PATH}")"
+replay_ttft_p50="$(jq '([.phase_summaries[] | select(.phase=="replay_A") | .ttft_ms.p50][0] // [.phase_summaries[] | select(.phase=="replay") | .ttft_ms.p50][0] // null)' "${SUMMARY_PATH}")"
+replay_ttft_p95="$(jq '([.phase_summaries[] | select(.phase=="replay_A") | .ttft_ms.p95][0] // [.phase_summaries[] | select(.phase=="replay") | .ttft_ms.p95][0] // null)' "${SUMMARY_PATH}")"
+replay_ttft_p99="$(jq '([.phase_summaries[] | select(.phase=="replay_A") | .ttft_ms.p99][0] // [.phase_summaries[] | select(.phase=="replay") | .ttft_ms.p99][0] // null)' "${SUMMARY_PATH}")"
+populate_p50="$(jq '[.phase_summaries[] | select(.phase=="populate") | .latency_ms.p50][0] // null' "${SUMMARY_PATH}")"
+populate_p95="$(jq '[.phase_summaries[] | select(.phase=="populate") | .latency_ms.p95][0] // null' "${SUMMARY_PATH}")"
+thrash_p50="$(jq '[.phase_summaries[] | select(.phase=="thrash") | .latency_ms.p50][0] // null' "${SUMMARY_PATH}")"
+thrash_p95="$(jq '[.phase_summaries[] | select(.phase=="thrash") | .latency_ms.p95][0] // null' "${SUMMARY_PATH}")"
 
 system_pressure_ok=0
 system_replay_ok=0
@@ -263,8 +376,17 @@ jq -n \
   --arg backend "trtllm" \
   --arg bundle_id "${BUNDLE_ID}" \
   --arg run_id "${RUN_ID}" \
+  --arg tier_mode "${TIER_MODE}" \
+  --arg kv_mode "${KV_MODE}" \
+  --arg scenario "${scenario_name}" \
+  --arg model_profile "${MODEL_PROFILE}" \
   --arg summary_path "${SUMMARY_PATH}" \
   --arg startup_extract_path "${STARTUP_EXTRACT}" \
+  --arg runtime_manifest_path "${RUNTIME_MANIFEST_PATH}" \
+  --arg bundle_manifest_path "${BUNDLE_MANIFEST_PATH}" \
+  --arg nvme_identity_path "${RUN_DIR}/nvme_identity.json" \
+  --arg nvme_smart_pre_path "${RUN_DIR}/nvme_smart_pre.json" \
+  --arg nvme_smart_post_path "${RUN_DIR}/nvme_smart_post.json" \
   --arg metrics_system_pressure "${ANALYSIS_DIR}/metrics_system_pressure.prom" \
   --arg metrics_system_replay "${ANALYSIS_DIR}/metrics_system_replay.prom" \
   --arg metrics_kvbm_pressure "${ANALYSIS_DIR}/metrics_kvbm_pressure.prom" \
@@ -274,10 +396,25 @@ jq -n \
   --arg invalid_reason "${invalid_reason}" \
   --argjson run_valid "${run_valid}" \
   --argjson overall_p50 "${overall_p50}" \
+  --argjson overall_p95 "${overall_p95}" \
   --argjson overall_p99 "${overall_p99}" \
+  --argjson overall_error_rate "${overall_error_rate}" \
+  --argjson overall_ttft_p50 "${overall_ttft_p50}" \
+  --argjson overall_ttft_p95 "${overall_ttft_p95}" \
+  --argjson overall_ttft_p99 "${overall_ttft_p99}" \
   --argjson warm_p50 "${warm_p50}" \
+  --argjson warm_p95 "${warm_p95}" \
   --argjson pressure_p50 "${pressure_p50}" \
+  --argjson pressure_p95 "${pressure_p95}" \
   --argjson replay_p50 "${replay_p50}" \
+  --argjson replay_p95 "${replay_p95}" \
+  --argjson replay_ttft_p50 "${replay_ttft_p50}" \
+  --argjson replay_ttft_p95 "${replay_ttft_p95}" \
+  --argjson replay_ttft_p99 "${replay_ttft_p99}" \
+  --argjson populate_p50 "${populate_p50}" \
+  --argjson populate_p95 "${populate_p95}" \
+  --argjson thrash_p50 "${thrash_p50}" \
+  --argjson thrash_p95 "${thrash_p95}" \
   --argjson system_pressure_ok "${system_pressure_ok}" \
   --argjson system_replay_ok "${system_replay_ok}" \
   --argjson kvbm_pressure_ok "${kvbm_pressure_ok}" \
@@ -294,18 +431,31 @@ jq -n \
     backend: $backend,
     bundle_id: $bundle_id,
     run_id: $run_id,
+    tier_mode: $tier_mode,
+    kv_mode: $kv_mode,
+    scenario: $scenario,
+    model_profile: $model_profile,
     run_valid: $run_valid,
     invalid_reason: (if $invalid_reason == "" then null else $invalid_reason end),
     bench_return_code: $bench_rc,
+    error_rate: $overall_error_rate,
     system_metrics_trtllm_prefix_count: $system_metrics_trtllm_prefix_count,
     system_metrics_dynamo_component_prefix_count: $system_metrics_dynamo_component_prefix_count,
     kvbm_metrics_keyword_match_count: $kvbm_metrics_keyword_match_count,
     kvbm_metrics_top_names: $kvbm_metrics_top_names,
     latency_ms: {
-      overall: {p50: $overall_p50, p99: $overall_p99},
-      warm_A: {p50: $warm_p50},
-      pressure_B: {p50: $pressure_p50},
-      replay_A: {p50: $replay_p50}
+      overall: {p50: $overall_p50, p95: $overall_p95, p99: $overall_p99},
+      warm_A: {p50: $warm_p50, p95: $warm_p95},
+      pressure_B: {p50: $pressure_p50, p95: $pressure_p95},
+      replay_A: {p50: $replay_p50, p95: $replay_p95},
+      populate: {p50: $populate_p50, p95: $populate_p95},
+      thrash: {p50: $thrash_p50, p95: $thrash_p95},
+      replay: {p50: $replay_p50, p95: $replay_p95}
+    },
+    ttft_ms: {
+      overall: {p50: $overall_ttft_p50, p95: $overall_ttft_p95, p99: $overall_ttft_p99},
+      replay_A: {p50: $replay_ttft_p50, p95: $replay_ttft_p95, p99: $replay_ttft_p99},
+      replay: {p50: $replay_ttft_p50, p95: $replay_ttft_p95, p99: $replay_ttft_p99}
     },
     metrics: {
       system_endpoint: {
@@ -325,6 +475,11 @@ jq -n \
     artifacts: {
       summary_path: $summary_path,
       worker_kvbm_startup_extract: $startup_extract_path,
+      worker_runtime_manifest: $runtime_manifest_path,
+      bundle_manifest: $bundle_manifest_path,
+      nvme_identity: $nvme_identity_path,
+      nvme_smart_pre: $nvme_smart_pre_path,
+      nvme_smart_post: $nvme_smart_post_path,
       metrics_system_pressure: $metrics_system_pressure,
       metrics_system_replay: $metrics_system_replay,
       metrics_kvbm_pressure: $metrics_kvbm_pressure,

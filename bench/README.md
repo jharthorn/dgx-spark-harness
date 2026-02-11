@@ -4,11 +4,13 @@ This package adds a focused benchmark harness for DGX Spark Dynamo + TRT-LLM + K
 
 ## Files
 
-- `bench/run_bench.py`: benchmark CLI driver (`standard`, `eviction_replay`, `reuse_verify`).
+- `bench/run_bench.py`: benchmark CLI driver (`standard`, `eviction_replay`, `reuse_verify`, `local_copilot_burst`).
   - Includes KVBM metrics snapshots/deltas by phase.
   - Can capture raw Prometheus snapshots from both Dynamo system metrics and KVBM metrics endpoints.
   - Includes per-request identity hashes (prompt bytes + generation params).
-  - Includes `--kv-mode {off,cpu_only,cpu_disk}` metadata.
+  - Includes canonical mode mapping `--tier-mode {B0,B1,B2}` plus `--kv-mode {off,cpu_only,cpu_disk}` metadata.
+  - Emits per-phase delta artifacts for KVBM metrics and OS I/O (block device + worker `/proc/*/io`).
+  - Captures NVMe identity + SMART pre/post snapshots into every run bundle.
   - Enforces prompt preflight guardrails against engine token limits.
   - Marks invalid runs explicitly and emits `report.md`.
 - `bench/prompts.py`: deterministic short/long/mixed and replay prompt generation.
@@ -153,6 +155,7 @@ For the scripted workflow around this harness, use:
 - `scripts/bench_run_mode_compare.sh`
 - `scripts/bench_phase56_like_probe_trtllm.sh`
 - `scripts/bench_phase58_eviction_thrash.sh`
+- `scripts/bench_workload_local_copilot_burst.sh`
   - For current Spark stability: `BENCH_COMPARE_SKIP_READY=1 BENCH_KV_MODE_LIST="cpu_only cpu_disk" scripts/bench_run_mode_compare.sh`
 
 ## Concurrency Sweep Example
@@ -179,11 +182,15 @@ done
 Each run writes to `bench/results/<run_id>/`:
 
 - `config.json`: run parameters, phase plan, tokenizer mode.
+- `manifest.json`: canonical run manifest with tier mode + KVBM env snapshot.
 - `prompts_manifest.jsonl`: prompt IDs + token targets/estimates + hashes.
+- `request_manifest.jsonl`: deterministic per-request schedule including `prefix_hash`/`session_id` where available.
 - `requests.jsonl`: per-request raw records:
   `start_ts`, `end_ts`, `latency_ms`, `status_code`, `prompt_id`, `prompt_tokens_est`, `output_len_chars`, `error`, `request_id`, `ttft_ms` (if stream).
 - `kvbm_metrics_snapshots.jsonl`: raw `/metrics` snapshots at phase boundaries.
 - `summary.json`: includes run validity, per-phase + overall metrics, KVBM deltas, eviction replay signals.
+- `phase_deltas/`: `phase_<name>_kvbm_metrics_{start,end,delta}.json` and `phase_<name>_os_io_{start,end,delta}.json`.
+- `nvme_identity.json`, `nvme_smart_pre.json`, `nvme_smart_post.json`: NVMe identity + health snapshots.
 - `report.md`: human-readable run report (brief-ready).
 - `telemetry/`: iostat, pidstat, nvidia-smi, KVBM cache snapshots, docker logs, cuFile logs.
 - `responses/` (optional with `--store-responses`): raw text outputs.

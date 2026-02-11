@@ -22,7 +22,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from .prompts import PromptSpec, TokenEstimator, generate_prompt_set, generate_replay_sets, manifest_rows
+from .prompts import (
+    PromptSpec,
+    TokenEstimator,
+    generate_local_project_copilot_burst,
+    generate_prompt_set,
+    generate_rehydrate_replay_sets,
+    generate_replay_sets,
+    manifest_rows,
+)
 from .telemetry import TelemetryManager
 
 LOG = logging.getLogger("bench.run_bench")
@@ -31,7 +39,9 @@ PROM_LINE_RE = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{.*\})?\s+([0-9.eE+-]
 
 METRICS_SNAPSHOT_PHASE_SUFFIX: dict[str, str] = {
     "pressure_B": "pressure",
+    "thrash": "pressure",
     "replay_A": "replay",
+    "replay": "replay",
 }
 
 METRIC_INVENTORY_DEFAULT_KEYWORDS: tuple[str, ...] = (
@@ -68,6 +78,19 @@ KVBM_GAUGE_METRICS: tuple[str, ...] = (
 )
 
 PROMPT_LIMIT_ERROR_RE = re.compile(r"(max_num_tokens|should not exceed max_num_tokens)", re.IGNORECASE)
+
+KVBM_ENV_KEYS: tuple[str, ...] = (
+    "BENCH_TIER_MODE",
+    "BENCH_KV_MODE",
+    "DYN_KVBM_CPU_CACHE_GB",
+    "DYN_KVBM_DISK_CACHE_GB",
+    "DYN_KVBM_DISK_CACHE_DIR",
+    "DYN_KVBM_METRICS",
+    "DYN_KVBM_METRICS_PORT",
+    "DYN_KVBM_DISABLE_DISK_OFFLOAD_FILTER",
+    "DYN_SYSTEM_PORT",
+    "DYN_REQUEST_PLANE",
+)
 
 
 @dataclass
@@ -179,7 +202,11 @@ def parse_args() -> argparse.Namespace:
         default=2.0,
         help="Polling interval while waiting for model discovery.",
     )
-    parser.add_argument("--scenario", choices=["standard", "eviction_replay", "reuse_verify"], default="standard")
+    parser.add_argument(
+        "--scenario",
+        choices=["standard", "eviction_replay", "reuse_verify", "local_copilot_burst", "rehydrate_replay"],
+        default="standard",
+    )
     parser.add_argument("--prompt-set", choices=["short", "long", "mixed"], default="short")
     parser.add_argument("--requests", type=int, default=64, help="Measured requests for standard scenario.")
     parser.add_argument("--warmup", type=int, default=8, help="Warmup requests (excluded from overall summary).")
@@ -230,7 +257,86 @@ def parse_args() -> argparse.Namespace:
         help="Prompt set for reuse_verify scenario.",
     )
 
+    parser.add_argument(
+        "--copilot-session-count",
+        type=int,
+        default=8,
+        help="Session cardinality for local_copilot_burst scenario.",
+    )
+    parser.add_argument(
+        "--copilot-burst-size",
+        type=int,
+        default=4,
+        help="Number of sequential turns per session burst for local_copilot_burst.",
+    )
+    parser.add_argument(
+        "--copilot-shared-prefix-target-tokens",
+        type=int,
+        default=3072,
+        help="Approximate token budget for shared project prefix in local_copilot_burst.",
+    )
+    parser.add_argument(
+        "--rehydrate-populate-sessions",
+        type=int,
+        default=16,
+        help="Session cardinality used to populate reusable KV state before thrash.",
+    )
+    parser.add_argument(
+        "--rehydrate-thrash-sessions",
+        type=int,
+        default=96,
+        help="Unique session cardinality used to apply cache pressure during thrash.",
+    )
+    parser.add_argument(
+        "--rehydrate-turns",
+        type=int,
+        default=2,
+        help="Turns per populate session reused again during replay.",
+    )
+    parser.add_argument(
+        "--rehydrate-prefix-target-tokens",
+        type=int,
+        default=4096,
+        help="Approximate token budget for the shared session prefix in rehydrate_replay.",
+    )
+    parser.add_argument(
+        "--rehydrate-populate-concurrency",
+        type=int,
+        default=None,
+        help="Populate phase concurrency (defaults to --concurrency).",
+    )
+    parser.add_argument(
+        "--rehydrate-thrash-concurrency",
+        type=int,
+        default=None,
+        help="Thrash phase concurrency (defaults to max(populate, 2x --concurrency)).",
+    )
+    parser.add_argument(
+        "--rehydrate-replay-concurrency",
+        type=int,
+        default=None,
+        help="Replay phase concurrency (defaults to populate concurrency).",
+    )
+    parser.add_argument(
+        "--rehydrate-replay-repeats",
+        type=int,
+        default=1,
+        help="Replay phase repetitions for rehydrate_replay scenario.",
+    )
+    parser.add_argument(
+        "--rehydrate-gen-tokens",
+        type=int,
+        default=None,
+        help="Optional max_tokens override used only for rehydrate_replay requests.",
+    )
+
     parser.add_argument("--kv-mode", choices=["off", "cpu_only", "cpu_disk"], default="cpu_disk")
+    parser.add_argument(
+        "--tier-mode",
+        choices=["B0", "B1", "B2", "b0", "b1", "b2"],
+        default=None,
+        help="Canonical serving mode mapping: B0=off, B1=cpu_only, B2=cpu_disk.",
+    )
     parser.add_argument("--kv-cpu-cache-gb", type=float, default=None, help="Resolved CPU cache size tag for artifacts.")
     parser.add_argument("--kv-disk-cache-gb", type=float, default=None, help="Resolved disk cache size tag for artifacts.")
     parser.add_argument("--variant-tag", action="append", default=[], help="Optional variant tags for metadata/report.")
@@ -242,6 +348,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-token-safety-margin", type=int, default=256)
 
     parser.add_argument("--phase-io-device", default="nvme0n1", help="Block device for phase read/write deltas.")
+    parser.add_argument(
+        "--worker-proc-pattern",
+        default=r"dynamo\.trtllm",
+        help="Regex used to sample worker process /proc/*/io counters at phase boundaries.",
+    )
+    parser.add_argument(
+        "--nvme-device",
+        default=os.environ.get("BENCH_NVME_DEVICE", "/dev/nvme0"),
+        help="NVMe device path used for identity + SMART pre/post captures.",
+    )
     parser.add_argument("--collect-telemetry", action="store_true", help="Start/stop bench/scripts collectors.")
     parser.add_argument("--telemetry-interval-s", type=int, default=1)
     parser.add_argument("--telemetry-pid", default="ALL", help="PID target for pidstat (`ALL` by default).")
@@ -420,14 +536,19 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
     short_range = parse_token_range(args.short_range, "short-range")
     long_range = parse_token_range(args.long_range, "long-range")
     kv_mode_resolved = resolve_kv_mode(args)
+    kv_runtime_env = collect_env_snapshot(KVBM_ENV_KEYS)
     phase_plan = build_phase_plan(
         args=args,
         estimator=estimator,
         short_range=short_range,
         long_range=long_range,
     )
+    phase_delta_dir = run_dir / "phase_deltas"
+    phase_delta_dir.mkdir(parents=True, exist_ok=True)
+    phase_delta_artifacts: dict[str, dict[str, str]] = {}
     unique_prompts = dedupe_prompts([p for phase in phase_plan for p in phase.prompts])
     write_prompt_manifest(run_dir / "prompts_manifest.jsonl", unique_prompts)
+    write_request_manifest(run_dir / "request_manifest.jsonl", phase_plan)
     preflight = preflight_validate_prompts(unique_prompts, args)
 
     telemetry_manager: Optional[TelemetryManager] = None
@@ -455,6 +576,12 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
     model_id = args.model_id
     model_count_end: Optional[int] = None
 
+    nvme_identity = collect_nvme_identity(args.nvme_device)
+    nvme_smart_pre = collect_nvme_smart(args.nvme_device)
+    nvme_smart_post: dict[str, Any] = {}
+    (run_dir / "nvme_identity.json").write_text(json.dumps(nvme_identity, indent=2), encoding="utf-8")
+    (run_dir / "nvme_smart_pre.json").write_text(json.dumps(nvme_smart_pre, indent=2), encoding="utf-8")
+
     run_config = {
         "run_id": run_id,
         "created_utc": now_utc_iso(),
@@ -465,7 +592,9 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
         "short_range": short_range,
         "long_range": long_range,
         "tokenizer": estimator.tokenizer_name or "heuristic",
+        "tier_mode": kv_mode_resolved.get("tier_mode"),
         "kv_mode": kv_mode_resolved,
+        "kv_runtime_env": kv_runtime_env,
         "preflight": preflight,
         "client_request_parameters": {
             "max_tokens": int(args.max_tokens),
@@ -488,6 +617,22 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
     }
 
     (run_dir / "config.json").write_text(json.dumps(run_config, indent=2), encoding="utf-8")
+    write_manifest(
+        run_dir / "manifest.json",
+        {
+            "run_id": run_id,
+            "created_utc": run_config["created_utc"],
+            "scenario": args.scenario,
+            "tier_mode": kv_mode_resolved.get("tier_mode"),
+            "kv_mode": kv_mode_resolved,
+            "model_id_requested": args.model_id,
+            "base_url": args.base_url,
+            "phases": run_config["phases"],
+            "kv_runtime_env": kv_runtime_env,
+            "nvme_device": args.nvme_device,
+            "args": vars(args),
+        },
+    )
 
     executed_workload = not preflight["failed"]
     if preflight["failed"]:
@@ -514,6 +659,23 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
                     LOG.info("Resolved model ID from /v1/models: %s", model_id)
                 run_config["model_id"] = model_id
                 (run_dir / "config.json").write_text(json.dumps(run_config, indent=2), encoding="utf-8")
+                write_manifest(
+                    run_dir / "manifest.json",
+                    {
+                        "run_id": run_id,
+                        "created_utc": run_config["created_utc"],
+                        "scenario": args.scenario,
+                        "tier_mode": kv_mode_resolved.get("tier_mode"),
+                        "kv_mode": kv_mode_resolved,
+                        "model_id_requested": args.model_id,
+                        "model_id_resolved": model_id,
+                        "base_url": args.base_url,
+                        "phases": run_config["phases"],
+                        "kv_runtime_env": kv_runtime_env,
+                        "nvme_device": args.nvme_device,
+                        "args": vars(args),
+                    },
+                )
 
                 snap = kvbm_probe.snapshot("run_start")
                 kvbm_snapshots.append(snap)
@@ -531,6 +693,7 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
                         if telemetry_manager is not None:
                             telemetry_manager.snapshot_kvbm_dir(f"before_{phase.name}")
                         before_io = read_block_device_stats(args.phase_io_device)
+                        before_proc_io = read_worker_process_io(args.worker_proc_pattern, args.container_name)
                         before_kvbm = kvbm_probe.snapshot(f"before_{phase.name}")
                         kvbm_snapshots.append(before_kvbm)
                         append_jsonl(kvbm_snapshots_path, before_kvbm)
@@ -548,6 +711,7 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
                         )
 
                         after_io = read_block_device_stats(args.phase_io_device)
+                        after_proc_io = read_worker_process_io(args.worker_proc_pattern, args.container_name)
                         after_kvbm = kvbm_probe.snapshot(f"after_{phase.name}")
                         kvbm_snapshots.append(after_kvbm)
                         append_jsonl(kvbm_snapshots_path, after_kvbm)
@@ -555,6 +719,10 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
                             telemetry_manager.snapshot_kvbm_dir(f"after_{phase.name}")
 
                         suffix = METRICS_SNAPSHOT_PHASE_SUFFIX.get(phase.name)
+                        if suffix is None and str(phase.name).startswith("replay"):
+                            suffix = "replay"
+                        if suffix is None and str(phase.name).startswith("thrash"):
+                            suffix = "pressure"
                         if args.capture_metrics_snapshot and suffix:
                             system_snap = fetch_metrics_text(args.metrics_system_url, args.kvbm_metrics_timeout_s)
                             kvbm_snap = fetch_metrics_text(args.metrics_kvbm_url, args.kvbm_metrics_timeout_s)
@@ -596,8 +764,55 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
                             )
 
                         io_delta = diff_block_device_stats(before_io, after_io)
+                        proc_io_delta = diff_process_io_stats(before_proc_io, after_proc_io)
                         kvbm_delta = kvbm_probe.delta(before_kvbm, after_kvbm)
                         kvbm_phase_deltas[phase.name] = kvbm_delta
+                        phase_name_safe = safe_name(phase.name)
+
+                        phase_kvbm_start_path = phase_delta_dir / f"phase_{phase_name_safe}_kvbm_metrics_start.json"
+                        phase_kvbm_end_path = phase_delta_dir / f"phase_{phase_name_safe}_kvbm_metrics_end.json"
+                        phase_kvbm_delta_path = phase_delta_dir / f"phase_{phase_name_safe}_kvbm_metrics_delta.json"
+                        phase_os_start_path = phase_delta_dir / f"phase_{phase_name_safe}_os_io_start.json"
+                        phase_os_end_path = phase_delta_dir / f"phase_{phase_name_safe}_os_io_end.json"
+                        phase_os_delta_path = phase_delta_dir / f"phase_{phase_name_safe}_os_io_delta.json"
+
+                        phase_os_start_payload = {
+                            "phase": phase.name,
+                            "block_device": args.phase_io_device,
+                            "block_device_stats": before_io,
+                            "worker_process_pattern": args.worker_proc_pattern,
+                            "worker_process_io": before_proc_io,
+                        }
+                        phase_os_end_payload = {
+                            "phase": phase.name,
+                            "block_device": args.phase_io_device,
+                            "block_device_stats": after_io,
+                            "worker_process_pattern": args.worker_proc_pattern,
+                            "worker_process_io": after_proc_io,
+                        }
+                        phase_os_delta_payload = {
+                            "phase": phase.name,
+                            "block_device": args.phase_io_device,
+                            "block_device_delta": io_delta,
+                            "worker_process_pattern": args.worker_proc_pattern,
+                            "worker_process_io_delta": proc_io_delta,
+                        }
+
+                        write_manifest(phase_kvbm_start_path, before_kvbm)
+                        write_manifest(phase_kvbm_end_path, after_kvbm)
+                        write_manifest(phase_kvbm_delta_path, kvbm_delta)
+                        write_manifest(phase_os_start_path, phase_os_start_payload)
+                        write_manifest(phase_os_end_path, phase_os_end_payload)
+                        write_manifest(phase_os_delta_path, phase_os_delta_payload)
+
+                        phase_delta_artifacts[phase.name] = {
+                            "kvbm_metrics_start": str(phase_kvbm_start_path),
+                            "kvbm_metrics_end": str(phase_kvbm_end_path),
+                            "kvbm_metrics_delta": str(phase_kvbm_delta_path),
+                            "os_io_start": str(phase_os_start_path),
+                            "os_io_end": str(phase_os_end_path),
+                            "os_io_delta": str(phase_os_delta_path),
+                        }
 
                         summary = summarize_phase(phase_rows, phase_duration_s)
                         summary["phase"] = phase.name
@@ -607,6 +822,9 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
                         if io_delta is not None:
                             summary["block_device"] = args.phase_io_device
                             summary["io_delta"] = io_delta
+                        if proc_io_delta is not None:
+                            summary["worker_process_pattern"] = args.worker_proc_pattern
+                            summary["worker_process_io_delta"] = proc_io_delta
                         phase_summaries.append(summary)
                         all_rows.extend(phase_rows)
                         if phase.include_in_overall:
@@ -645,6 +863,9 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
         finally:
             if telemetry_manager is not None:
                 telemetry_stop_report = telemetry_manager.stop_default()
+
+    nvme_smart_post = collect_nvme_smart(args.nvme_device)
+    (run_dir / "nvme_smart_post.json").write_text(json.dumps(nvme_smart_post, indent=2), encoding="utf-8")
 
     telemetry_payload = {
         "started": telemetry_start_report.__dict__ if telemetry_start_report else None,
@@ -686,9 +907,19 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
             kvbm_onboard_offload_samples,
         )
 
-    kvbm_summary = build_kvbm_metrics_summary(kvbm_snapshots, kvbm_phase_deltas, args.scenario, args.kv_mode)
+    kvbm_summary = build_kvbm_metrics_summary(
+        kvbm_snapshots,
+        kvbm_phase_deltas,
+        args.scenario,
+        str(kv_mode_resolved.get("mode")),
+    )
     request_identity_summary = analyze_request_identity(all_rows, args.scenario)
-    if executed_workload and args.kv_mode != "off" and not args.allow_missing_kvbm_metrics and not kvbm_summary.get("available", False):
+    if (
+        executed_workload
+        and str(kv_mode_resolved.get("mode")) != "off"
+        and not args.allow_missing_kvbm_metrics
+        and not kvbm_summary.get("available", False)
+    ):
         run_valid = False
         if invalid_reason is None:
             invalid_reason = "kvbm_metrics_unavailable"
@@ -715,6 +946,9 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
     if args.scenario == "eviction_replay":
         overall_summary["eviction_replay_signal_io"] = analyze_eviction_signal_io(phase_summaries)
         overall_summary["eviction_replay_signal_kvbm"] = kvbm_summary.get("eviction_replay_signal")
+    if args.scenario == "rehydrate_replay":
+        overall_summary["rehydrate_replay_signal_io"] = analyze_rehydrate_signal_io(phase_summaries)
+        overall_summary["rehydrate_replay_signal_kvbm"] = kvbm_summary.get("rehydrate_replay_signal")
     if args.scenario == "reuse_verify":
         overall_summary["reuse_verify_signal_kvbm"] = kvbm_summary.get("reuse_verify_signal")
         overall_summary["reuse_verify_identity"] = request_identity_summary.get("reuse_verify_identity")
@@ -730,8 +964,21 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
         "model_count_end": model_count_end,
         "scenario": args.scenario,
         "stream": bool(args.stream),
+        "tier_mode": kv_mode_resolved.get("tier_mode"),
         "kv_mode": kv_mode_resolved,
+        "kv_runtime_env": kv_runtime_env,
         "variant_tags": list(args.variant_tag or []),
+        "request_manifest_path": str(run_dir / "request_manifest.jsonl"),
+        "phase_delta_artifacts": phase_delta_artifacts,
+        "nvme": {
+            "device": args.nvme_device,
+            "identity": nvme_identity,
+            "smart_pre": nvme_smart_pre,
+            "smart_post": nvme_smart_post,
+            "identity_path": str(run_dir / "nvme_identity.json"),
+            "smart_pre_path": str(run_dir / "nvme_smart_pre.json"),
+            "smart_post_path": str(run_dir / "nvme_smart_post.json"),
+        },
         "phase_summaries": phase_summaries,
         "overall_summary": overall_summary,
         "kvbm_metrics": kvbm_summary,
@@ -758,53 +1005,62 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
 
 
 def resolve_kv_mode(args: argparse.Namespace) -> dict[str, Any]:
-    mode = args.kv_mode
+    tier_mode_raw = str(args.tier_mode or "").strip().upper()
+    tier_to_mode = {
+        "B0": "off",
+        "B1": "cpu_only",
+        "B2": "cpu_disk",
+    }
+    mode = tier_to_mode.get(tier_mode_raw, args.kv_mode)
+    mode_to_tier = {
+        "off": "B0",
+        "cpu_only": "B1",
+        "cpu_disk": "B2",
+    }
+    tier_mode = mode_to_tier.get(mode, "B2")
+    diagnostic = {
+        "disable_partial_reuse": bool(args.diagnostic_disable_partial_reuse),
+        "disable_block_reuse": bool(args.diagnostic_disable_block_reuse),
+        "disable_disk_offload_filter": bool(args.diagnostic_disable_disk_offload_filter),
+    }
     if mode == "off":
         return {
             "mode": mode,
+            "tier_mode": tier_mode,
             "kvbm_enabled": False,
             "cpu_cache_gb": 0.0,
             "disk_cache_gb": 0.0,
-            "diagnostic": {
-                "disable_partial_reuse": bool(args.diagnostic_disable_partial_reuse),
-                "disable_block_reuse": bool(args.diagnostic_disable_block_reuse),
-                "disable_disk_offload_filter": bool(args.diagnostic_disable_disk_offload_filter),
-            },
+            "diagnostic": diagnostic,
         }
     if mode == "cpu_only":
         return {
             "mode": mode,
+            "tier_mode": tier_mode,
             "kvbm_enabled": True,
             "cpu_cache_gb": float(args.kv_cpu_cache_gb if args.kv_cpu_cache_gb is not None else 8.0),
             "disk_cache_gb": 0.0,
-            "diagnostic": {
-                "disable_partial_reuse": bool(args.diagnostic_disable_partial_reuse),
-                "disable_block_reuse": bool(args.diagnostic_disable_block_reuse),
-                "disable_disk_offload_filter": bool(args.diagnostic_disable_disk_offload_filter),
-            },
+            "diagnostic": diagnostic,
         }
     return {
         "mode": mode,
+        "tier_mode": tier_mode,
         "kvbm_enabled": True,
         "cpu_cache_gb": float(args.kv_cpu_cache_gb if args.kv_cpu_cache_gb is not None else 8.0),
         "disk_cache_gb": float(args.kv_disk_cache_gb if args.kv_disk_cache_gb is not None else 32.0),
-        "diagnostic": {
-            "disable_partial_reuse": bool(args.diagnostic_disable_partial_reuse),
-            "disable_block_reuse": bool(args.diagnostic_disable_block_reuse),
-            "disable_disk_offload_filter": bool(args.diagnostic_disable_disk_offload_filter),
-        },
+        "diagnostic": diagnostic,
     }
 
 
 def preflight_validate_prompts(prompts: list[PromptSpec], args: argparse.Namespace) -> dict[str, Any]:
-    ceiling = args.engine_max_input_tokens - args.max_tokens - args.input_token_safety_margin
+    max_tokens = resolve_phase_max_tokens(args)
+    ceiling = args.engine_max_input_tokens - max_tokens - args.input_token_safety_margin
     if ceiling <= 0:
         return {
             "failed": True,
             "ceiling_tokens": ceiling,
             "errors": [
                 "Invalid preflight configuration: computed prompt ceiling <= 0 "
-                f"(engine={args.engine_max_input_tokens}, max_tokens={args.max_tokens}, margin={args.input_token_safety_margin})."
+                f"(engine={args.engine_max_input_tokens}, max_tokens={max_tokens}, margin={args.input_token_safety_margin})."
             ],
         }
     failures: list[str] = []
@@ -871,6 +1127,70 @@ def build_phase_plan(
             phases.append(PhasePlan(name="reuse_3", prompts=[identical_prompt], concurrency=1, include_in_overall=True))
         return phases
 
+    if args.scenario == "local_copilot_burst":
+        if args.warmup > 0:
+            warmup_prompts = generate_local_project_copilot_burst(
+                count=args.warmup,
+                seed=args.seed + 17,
+                estimator=estimator,
+                session_count=max(1, args.copilot_session_count),
+                burst_size=max(1, args.copilot_burst_size),
+                shared_prefix_target_tokens=max(512, args.copilot_shared_prefix_target_tokens),
+                prompt_id_prefix="copilot_warmup",
+            )
+            phases.append(
+                PhasePlan(
+                    name="warmup",
+                    prompts=warmup_prompts,
+                    concurrency=max(1, args.concurrency),
+                    include_in_overall=False,
+                )
+            )
+        burst_prompts = generate_local_project_copilot_burst(
+            count=args.requests,
+            seed=args.seed,
+            estimator=estimator,
+            session_count=max(1, args.copilot_session_count),
+            burst_size=max(1, args.copilot_burst_size),
+            shared_prefix_target_tokens=max(512, args.copilot_shared_prefix_target_tokens),
+            prompt_id_prefix="copilot_main",
+        )
+        phases.append(
+            PhasePlan(
+                name="copilot_burst",
+                prompts=burst_prompts,
+                concurrency=max(1, args.concurrency),
+                include_in_overall=True,
+            )
+        )
+        return phases
+
+    if args.scenario == "rehydrate_replay":
+        populate_prompts, thrash_prompts = generate_rehydrate_replay_sets(
+            populate_sessions=max(1, int(args.rehydrate_populate_sessions)),
+            thrash_sessions=max(1, int(args.rehydrate_thrash_sessions)),
+            turns=max(1, int(args.rehydrate_turns)),
+            seed=args.seed,
+            estimator=estimator,
+            prefix_target_tokens=max(512, int(args.rehydrate_prefix_target_tokens)),
+            prompt_id_prefix="rehydrate",
+        )
+        populate_conc = max(1, int(args.rehydrate_populate_concurrency or args.concurrency))
+        thrash_default = max(populate_conc, int(args.concurrency) * 2)
+        thrash_conc = max(1, int(args.rehydrate_thrash_concurrency or thrash_default))
+        replay_conc = max(1, int(args.rehydrate_replay_concurrency or populate_conc))
+        phases.append(
+            PhasePlan(name="populate", prompts=populate_prompts, concurrency=populate_conc, include_in_overall=True)
+        )
+        phases.append(PhasePlan(name="thrash", prompts=thrash_prompts, concurrency=thrash_conc, include_in_overall=True))
+        replay_repeats = max(1, int(args.rehydrate_replay_repeats))
+        for replay_idx in range(replay_repeats):
+            replay_name = "replay" if replay_idx == 0 else f"replay_{replay_idx + 1}"
+            phases.append(
+                PhasePlan(name=replay_name, prompts=populate_prompts, concurrency=replay_conc, include_in_overall=True)
+            )
+        return phases
+
     if args.warmup > 0:
         warmup_prompts = generate_prompt_set(
             prompt_set="long",
@@ -900,6 +1220,12 @@ def build_phase_plan(
     return phases
 
 
+def resolve_phase_max_tokens(args: argparse.Namespace) -> int:
+    if args.scenario == "rehydrate_replay" and args.rehydrate_gen_tokens is not None:
+        return max(1, int(args.rehydrate_gen_tokens))
+    return max(1, int(args.max_tokens))
+
+
 async def run_phase(
     *,
     phase: PhasePlan,
@@ -914,6 +1240,7 @@ async def run_phase(
 ) -> tuple[list[dict[str, Any]], float]:
     if not phase.prompts:
         return [], 0.0
+    phase_max_tokens = resolve_phase_max_tokens(args)
 
     queue: asyncio.Queue[PromptSpec] = asyncio.Queue()
     for prompt in phase.prompts:
@@ -934,7 +1261,7 @@ async def run_phase(
             request_identity = build_request_identity(
                 model_id=model_id,
                 prompt_text=prompt.prompt,
-                max_tokens=args.max_tokens,
+                max_tokens=phase_max_tokens,
                 temperature=args.temperature,
                 top_p=args.top_p,
                 stop=args.stop,
@@ -944,7 +1271,7 @@ async def run_phase(
             completion = await client.create_completion(
                 model=model_id,
                 prompt=prompt.prompt,
-                max_tokens=args.max_tokens,
+                max_tokens=phase_max_tokens,
                 temperature=args.temperature,
                 top_p=args.top_p,
                 stop=args.stop,
@@ -986,7 +1313,20 @@ async def run_phase(
                 "stream": bool(args.stream),
                 "response_path": response_path,
                 "response_header_hints": completion.response_headers,
+                "max_tokens_effective": phase_max_tokens,
             }
+            prompt_metadata = dict(prompt.metadata or {})
+            if prompt_metadata:
+                row["prompt_metadata"] = prompt_metadata
+                if prompt_metadata.get("prefix_hash"):
+                    row["prefix_hash"] = str(prompt_metadata.get("prefix_hash"))
+                if prompt_metadata.get("session_id"):
+                    row["session_id"] = str(prompt_metadata.get("session_id"))
+                if prompt_metadata.get("session_turn_index") is not None:
+                    try:
+                        row["session_turn_index"] = int(prompt_metadata.get("session_turn_index"))
+                    except Exception:
+                        row["session_turn_index"] = prompt_metadata.get("session_turn_index")
             async with requests_lock:
                 requests_fp.write(json.dumps(row, sort_keys=True) + "\n")
                 requests_fp.flush()
@@ -1083,6 +1423,41 @@ def write_prompt_manifest(path: Path, prompts: list[PromptSpec]) -> None:
             fp.write(json.dumps(row, sort_keys=True) + "\n")
 
 
+def write_request_manifest(path: Path, phases: list[PhasePlan]) -> None:
+    with path.open("w", encoding="utf-8") as fp:
+        for phase in phases:
+            for phase_idx, prompt in enumerate(phase.prompts, start=1):
+                row = {
+                    "phase": phase.name,
+                    "phase_request_index": phase_idx,
+                    "prompt_id": prompt.prompt_id,
+                    "prompt_set": prompt.prompt_set,
+                    "prompt_tokens_est": prompt.prompt_tokens_est,
+                    "prompt_sha256": hashlib.sha256(prompt.prompt.encode("utf-8")).hexdigest(),
+                }
+                metadata = dict(prompt.metadata or {})
+                if metadata:
+                    row["prompt_metadata"] = metadata
+                    if metadata.get("prefix_hash"):
+                        row["prefix_hash"] = metadata.get("prefix_hash")
+                    if metadata.get("session_id"):
+                        row["session_id"] = metadata.get("session_id")
+                fp.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def collect_env_snapshot(keys: tuple[str, ...]) -> dict[str, str]:
+    snapshot: dict[str, str] = {}
+    for key in keys:
+        value = os.environ.get(key)
+        if value is not None:
+            snapshot[key] = value
+    return snapshot
+
+
+def write_manifest(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def dedupe_prompts(prompts: list[PromptSpec]) -> list[PromptSpec]:
     seen: dict[str, PromptSpec] = {}
     for prompt in prompts:
@@ -1173,21 +1548,742 @@ def diff_block_device_stats(before: Optional[dict[str, Any]], after: Optional[di
     }
 
 
+def read_worker_process_io(proc_pattern: str, container_name: str) -> dict[str, Any]:
+    container_snapshot = _read_container_process_io(proc_pattern, container_name)
+    host_snapshot = _read_host_process_io(proc_pattern)
+    cgroup_snapshot = _read_container_cgroup_io(container_name)
+
+    if container_snapshot.get("available"):
+        primary = dict(container_snapshot)
+    elif host_snapshot.get("available"):
+        primary = dict(host_snapshot)
+    else:
+        primary = dict(container_snapshot)
+        if not primary:
+            primary = dict(host_snapshot)
+    primary.setdefault("timestamp_utc", now_utc_iso())
+    primary.setdefault("available", False)
+    primary.setdefault("source", "process_io_unavailable")
+    primary.setdefault("pattern", proc_pattern)
+    primary.setdefault("processes", [])
+    primary["cgroup_io"] = cgroup_snapshot
+    primary["attribution_sources"] = {
+        "selected_source": primary.get("source"),
+        "container_proc_available": bool(container_snapshot.get("available")),
+        "host_proc_available": bool(host_snapshot.get("available")),
+        "cgroup_io_available": bool(cgroup_snapshot.get("available")),
+    }
+    if primary.get("source") != "docker_exec":
+        primary["container_probe"] = _summarize_io_probe(container_snapshot)
+    if primary.get("source") != "host_proc":
+        primary["host_probe"] = _summarize_io_probe(host_snapshot)
+    return primary
+
+
+def _read_host_process_io(proc_pattern: str) -> dict[str, Any]:
+    timestamp = now_utc_iso()
+    try:
+        pattern = re.compile(proc_pattern)
+    except re.error as exc:
+        return {
+            "timestamp_utc": timestamp,
+            "available": False,
+            "source": "host_proc",
+            "error": f"invalid_regex:{exc}",
+            "processes": [],
+        }
+    processes: list[dict[str, Any]] = []
+    errors: list[str] = []
+    proc_root = Path("/proc")
+    for pid_dir in proc_root.iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        cmdline_path = pid_dir / "cmdline"
+        io_path = pid_dir / "io"
+        try:
+            cmdline_bytes = cmdline_path.read_bytes()
+        except OSError:
+            continue
+        cmdline = cmdline_bytes.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+        if not cmdline or not pattern.search(cmdline):
+            continue
+        io_fields: dict[str, int] = {}
+        try:
+            for raw in io_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if ":" not in raw:
+                    continue
+                k, v = raw.split(":", 1)
+                io_fields[k.strip()] = int(v.strip())
+        except PermissionError:
+            errors.append(f"permission_denied:{pid_dir.name}")
+            continue
+        except OSError:
+            errors.append(f"io_unreadable:{pid_dir.name}")
+            continue
+        processes.append(
+            {
+                "pid": int(pid_dir.name),
+                "cmdline": cmdline,
+                "read_bytes": int(io_fields.get("read_bytes", 0)),
+                "write_bytes": int(io_fields.get("write_bytes", 0)),
+                "syscr": int(io_fields.get("syscr", 0)),
+                "syscw": int(io_fields.get("syscw", 0)),
+            }
+        )
+
+    total_read = sum(int(p.get("read_bytes", 0)) for p in processes)
+    total_write = sum(int(p.get("write_bytes", 0)) for p in processes)
+    return {
+        "timestamp_utc": timestamp,
+        "available": bool(processes),
+        "source": "host_proc",
+        "pattern": proc_pattern,
+        "processes": processes,
+        "totals": {
+            "read_bytes": total_read,
+            "write_bytes": total_write,
+        },
+        "errors": errors,
+    }
+
+
+def _read_container_process_io(proc_pattern: str, container_name: str) -> dict[str, Any]:
+    timestamp = now_utc_iso()
+    if not container_name:
+        return {
+            "timestamp_utc": timestamp,
+            "available": False,
+            "source": "docker_exec",
+            "error": "container_name_missing",
+            "processes": [],
+        }
+    script = """
+import json
+import os
+import re
+from pathlib import Path
+
+pattern = os.environ.get("BENCH_WORKER_PROC_PATTERN", "dynamo\\\\.trtllm")
+out = {
+    "available": False,
+    "source": "docker_exec",
+    "pattern": pattern,
+    "processes": [],
+    "errors": [],
+}
+try:
+    rx = re.compile(pattern)
+except re.error as exc:
+    out["error"] = f"invalid_regex:{exc}"
+    print(json.dumps(out))
+    raise SystemExit(0)
+
+for entry in Path("/proc").iterdir():
+    if not entry.name.isdigit():
+        continue
+    cmdline_path = entry / "cmdline"
+    io_path = entry / "io"
+    try:
+        cmdline = cmdline_path.read_bytes().replace(b"\\x00", b" ").decode("utf-8", errors="replace").strip()
+    except OSError:
+        continue
+    if not cmdline or not rx.search(cmdline):
+        continue
+    fields = {}
+    try:
+        for raw in io_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if ":" not in raw:
+                continue
+            key, value = raw.split(":", 1)
+            fields[key.strip()] = int(value.strip())
+    except OSError as exc:
+        out["errors"].append(f"io_unreadable:{entry.name}:{exc}")
+        continue
+    out["processes"].append(
+        {
+            "pid": int(entry.name),
+            "cmdline": cmdline,
+            "read_bytes": int(fields.get("read_bytes", 0)),
+            "write_bytes": int(fields.get("write_bytes", 0)),
+            "syscr": int(fields.get("syscr", 0)),
+            "syscw": int(fields.get("syscw", 0)),
+        }
+    )
+
+out["available"] = bool(out["processes"])
+out["totals"] = {
+    "read_bytes": sum(int(p.get("read_bytes", 0)) for p in out["processes"]),
+    "write_bytes": sum(int(p.get("write_bytes", 0)) for p in out["processes"]),
+}
+print(json.dumps(out))
+"""
+    try:
+        completed = subprocess.run(
+            [
+                "docker",
+                "exec",
+                "-e",
+                f"BENCH_WORKER_PROC_PATTERN={proc_pattern}",
+                container_name,
+                "python3",
+                "-c",
+                script,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except Exception as exc:
+        return {
+            "timestamp_utc": timestamp,
+            "available": False,
+            "source": "docker_exec",
+            "pattern": proc_pattern,
+            "error": str(exc),
+            "processes": [],
+        }
+    if completed.returncode != 0:
+        return {
+            "timestamp_utc": timestamp,
+            "available": False,
+            "source": "docker_exec",
+            "pattern": proc_pattern,
+            "error": (completed.stderr or completed.stdout).strip() or f"rc={completed.returncode}",
+            "processes": [],
+        }
+    raw = (completed.stdout or "").strip()
+    try:
+        payload = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        payload = {
+            "available": False,
+            "source": "docker_exec",
+            "pattern": proc_pattern,
+            "error": "invalid_json_response",
+            "stdout": raw,
+            "processes": [],
+        }
+    payload.setdefault("available", False)
+    payload.setdefault("source", "docker_exec")
+    payload.setdefault("pattern", proc_pattern)
+    payload.setdefault("processes", [])
+    payload["timestamp_utc"] = timestamp
+    return payload
+
+
+def _summarize_io_probe(snapshot: dict[str, Any]) -> dict[str, Any]:
+    totals = snapshot.get("totals") if isinstance(snapshot, dict) else {}
+    if not isinstance(totals, dict):
+        totals = {}
+    return {
+        "available": bool((snapshot or {}).get("available")),
+        "source": (snapshot or {}).get("source"),
+        "error": (snapshot or {}).get("error"),
+        "process_count": len((snapshot or {}).get("processes") or []),
+        "totals": {
+            "read_bytes": int(totals.get("read_bytes", 0) or 0),
+            "write_bytes": int(totals.get("write_bytes", 0) or 0),
+        },
+    }
+
+
+def _read_container_cgroup_io(container_name: str) -> dict[str, Any]:
+    timestamp = now_utc_iso()
+    if not container_name:
+        return {
+            "timestamp_utc": timestamp,
+            "available": False,
+            "source": "cgroup_io",
+            "error": "container_name_missing",
+            "totals": {"read_bytes": 0, "write_bytes": 0},
+            "devices": [],
+        }
+    try:
+        inspect = subprocess.run(
+            ["docker", "inspect", "--format", "{{.State.Pid}}", container_name],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except Exception as exc:
+        return {
+            "timestamp_utc": timestamp,
+            "available": False,
+            "source": "cgroup_io",
+            "error": str(exc),
+            "totals": {"read_bytes": 0, "write_bytes": 0},
+            "devices": [],
+        }
+    if inspect.returncode != 0:
+        return {
+            "timestamp_utc": timestamp,
+            "available": False,
+            "source": "cgroup_io",
+            "error": (inspect.stderr or inspect.stdout).strip() or f"rc={inspect.returncode}",
+            "totals": {"read_bytes": 0, "write_bytes": 0},
+            "devices": [],
+        }
+    pid_raw = (inspect.stdout or "").strip()
+    try:
+        pid = int(pid_raw)
+    except Exception:
+        return {
+            "timestamp_utc": timestamp,
+            "available": False,
+            "source": "cgroup_io",
+            "error": f"invalid_container_pid:{pid_raw}",
+            "totals": {"read_bytes": 0, "write_bytes": 0},
+            "devices": [],
+        }
+    if pid <= 0:
+        return {
+            "timestamp_utc": timestamp,
+            "available": False,
+            "source": "cgroup_io",
+            "error": f"container_not_running:pid={pid}",
+            "totals": {"read_bytes": 0, "write_bytes": 0},
+            "devices": [],
+        }
+
+    cgroup_rel = None
+    cgroup_file = Path(f"/proc/{pid}/cgroup")
+    try:
+        cgroup_text = cgroup_file.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return {
+            "timestamp_utc": timestamp,
+            "available": False,
+            "source": "cgroup_io",
+            "error": str(exc),
+            "container_pid": pid,
+            "totals": {"read_bytes": 0, "write_bytes": 0},
+            "devices": [],
+        }
+    for raw in cgroup_text.splitlines():
+        parts = raw.split(":", 2)
+        if len(parts) != 3:
+            continue
+        if parts[1] == "":
+            cgroup_rel = parts[2]
+            break
+    if cgroup_rel is None:
+        for raw in cgroup_text.splitlines():
+            parts = raw.split(":", 2)
+            if len(parts) == 3:
+                cgroup_rel = parts[2]
+                break
+    if not cgroup_rel:
+        return {
+            "timestamp_utc": timestamp,
+            "available": False,
+            "source": "cgroup_io",
+            "error": "cgroup_path_not_found",
+            "container_pid": pid,
+            "totals": {"read_bytes": 0, "write_bytes": 0},
+            "devices": [],
+        }
+
+    cgroup_path = Path("/sys/fs/cgroup") / str(cgroup_rel).lstrip("/")
+    io_stat_path = cgroup_path / "io.stat"
+    blkio_throttle_path = cgroup_path / "blkio.throttle.io_service_bytes"
+    blkio_path = cgroup_path / "blkio.io_service_bytes"
+
+    if io_stat_path.exists():
+        devices: list[dict[str, Any]] = []
+        read_total = 0
+        write_total = 0
+        try:
+            for raw in io_stat_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if not parts:
+                    continue
+                dev = parts[0]
+                stats: dict[str, int] = {}
+                for token in parts[1:]:
+                    if "=" not in token:
+                        continue
+                    key, value = token.split("=", 1)
+                    try:
+                        stats[key] = int(value)
+                    except ValueError:
+                        continue
+                read_bytes = int(stats.get("rbytes", 0))
+                write_bytes = int(stats.get("wbytes", 0))
+                read_total += read_bytes
+                write_total += write_bytes
+                devices.append({"device": dev, "read_bytes": read_bytes, "write_bytes": write_bytes, "stats": stats})
+        except OSError as exc:
+            return {
+                "timestamp_utc": timestamp,
+                "available": False,
+                "source": "cgroup_v2_io_stat",
+                "error": str(exc),
+                "container_pid": pid,
+                "cgroup_path": str(cgroup_path),
+                "totals": {"read_bytes": 0, "write_bytes": 0},
+                "devices": [],
+            }
+        return {
+            "timestamp_utc": timestamp,
+            "available": True,
+            "source": "cgroup_v2_io_stat",
+            "container_pid": pid,
+            "cgroup_path": str(cgroup_path),
+            "totals": {"read_bytes": int(read_total), "write_bytes": int(write_total)},
+            "devices": devices,
+        }
+
+    for path in (blkio_throttle_path, blkio_path):
+        if not path.exists():
+            continue
+        devices = {}
+        read_total = 0
+        write_total = 0
+        try:
+            for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                if parts[0].lower() == "total":
+                    continue
+                dev = parts[0]
+                op = parts[1].lower()
+                try:
+                    value = int(parts[2])
+                except ValueError:
+                    continue
+                item = devices.setdefault(dev, {"device": dev, "read_bytes": 0, "write_bytes": 0})
+                if op.startswith("read"):
+                    item["read_bytes"] += value
+                    read_total += value
+                elif op.startswith("write"):
+                    item["write_bytes"] += value
+                    write_total += value
+        except OSError as exc:
+            return {
+                "timestamp_utc": timestamp,
+                "available": False,
+                "source": "cgroup_blkio",
+                "error": str(exc),
+                "container_pid": pid,
+                "cgroup_path": str(cgroup_path),
+                "totals": {"read_bytes": 0, "write_bytes": 0},
+                "devices": [],
+            }
+        return {
+            "timestamp_utc": timestamp,
+            "available": True,
+            "source": f"cgroup_{path.name}",
+            "container_pid": pid,
+            "cgroup_path": str(cgroup_path),
+            "totals": {"read_bytes": int(read_total), "write_bytes": int(write_total)},
+            "devices": list(devices.values()),
+        }
+
+    return {
+        "timestamp_utc": timestamp,
+        "available": False,
+        "source": "cgroup_io",
+        "error": "io_stat_not_found",
+        "container_pid": pid,
+        "cgroup_path": str(cgroup_path),
+        "totals": {"read_bytes": 0, "write_bytes": 0},
+        "devices": [],
+    }
+
+
+def diff_process_io_stats(before: dict[str, Any], after: dict[str, Any]) -> Optional[dict[str, Any]]:
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return None
+    before_procs = before.get("processes") if isinstance(before.get("processes"), list) else []
+    after_procs = after.get("processes") if isinstance(after.get("processes"), list) else []
+    before_map = {int(p.get("pid")): p for p in before_procs if isinstance(p, dict) and p.get("pid") is not None}
+    after_map = {int(p.get("pid")): p for p in after_procs if isinstance(p, dict) and p.get("pid") is not None}
+
+    per_pid: list[dict[str, Any]] = []
+    total_read = 0
+    total_write = 0
+    for pid, after_item in after_map.items():
+        before_item = before_map.get(pid, {})
+        read_delta = max(0, int(after_item.get("read_bytes", 0)) - int(before_item.get("read_bytes", 0)))
+        write_delta = max(0, int(after_item.get("write_bytes", 0)) - int(before_item.get("write_bytes", 0)))
+        total_read += read_delta
+        total_write += write_delta
+        per_pid.append(
+            {
+                "pid": pid,
+                "cmdline": after_item.get("cmdline"),
+                "read_bytes_delta": read_delta,
+                "write_bytes_delta": write_delta,
+            }
+        )
+    top_writers = sorted(per_pid, key=lambda x: int(x.get("write_bytes_delta", 0)), reverse=True)[:5]
+    top_readers = sorted(per_pid, key=lambda x: int(x.get("read_bytes_delta", 0)), reverse=True)[:5]
+
+    cgroup_before = _extract_io_totals((before.get("cgroup_io") or {}))
+    cgroup_after = _extract_io_totals((after.get("cgroup_io") or {}))
+    cgroup_read_delta: Optional[int] = None
+    cgroup_write_delta: Optional[int] = None
+    if cgroup_before is not None and cgroup_after is not None:
+        cgroup_read_delta = max(0, cgroup_after["read_bytes"] - cgroup_before["read_bytes"])
+        cgroup_write_delta = max(0, cgroup_after["write_bytes"] - cgroup_before["write_bytes"])
+
+    return {
+        "available": bool(per_pid) or (cgroup_read_delta is not None and cgroup_write_delta is not None),
+        "source_before": before.get("source"),
+        "source_after": after.get("source"),
+        "attribution_sources_before": before.get("attribution_sources"),
+        "attribution_sources_after": after.get("attribution_sources"),
+        "matched_pids_before": len(before_map),
+        "matched_pids_after": len(after_map),
+        "read_bytes_delta": total_read,
+        "write_bytes_delta": total_write,
+        "read_mib_delta": round(total_read / (1024 * 1024), 3),
+        "write_mib_delta": round(total_write / (1024 * 1024), 3),
+        "cgroup_source_before": ((before.get("cgroup_io") or {}).get("source") if isinstance(before.get("cgroup_io"), dict) else None),
+        "cgroup_source_after": ((after.get("cgroup_io") or {}).get("source") if isinstance(after.get("cgroup_io"), dict) else None),
+        "cgroup_read_bytes_delta": cgroup_read_delta,
+        "cgroup_write_bytes_delta": cgroup_write_delta,
+        "cgroup_read_mib_delta": (
+            round(cgroup_read_delta / (1024 * 1024), 3) if cgroup_read_delta is not None else None
+        ),
+        "cgroup_write_mib_delta": (
+            round(cgroup_write_delta / (1024 * 1024), 3) if cgroup_write_delta is not None else None
+        ),
+        "top_writers": top_writers,
+        "top_readers": top_readers,
+    }
+
+
+def _extract_io_totals(snapshot: dict[str, Any]) -> Optional[dict[str, int]]:
+    if not isinstance(snapshot, dict):
+        return None
+    totals = snapshot.get("totals")
+    if not isinstance(totals, dict):
+        return None
+    try:
+        return {
+            "read_bytes": int(totals.get("read_bytes", 0)),
+            "write_bytes": int(totals.get("write_bytes", 0)),
+        }
+    except Exception:
+        return None
+
+
+def collect_nvme_identity(device: str) -> dict[str, Any]:
+    return _collect_nvme_with_fallback("id-ctrl", device)
+
+
+def collect_nvme_smart(device: str) -> dict[str, Any]:
+    return _collect_nvme_with_fallback("smart-log", device)
+
+
+def _run_capture_command(cmd: list[str], timeout_s: float = 10.0) -> dict[str, Any]:
+    timestamp = now_utc_iso()
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_s,
+        )
+    except FileNotFoundError:
+        return {
+            "timestamp_utc": timestamp,
+            "success": False,
+            "error": "command_not_found",
+            "command": cmd,
+        }
+    except Exception as exc:
+        return {
+            "timestamp_utc": timestamp,
+            "success": False,
+            "error": str(exc),
+            "command": cmd,
+        }
+    stdout = (completed.stdout or "")
+    stderr = (completed.stderr or "")
+    if completed.returncode != 0:
+        return {
+            "timestamp_utc": timestamp,
+            "success": False,
+            "error": (stderr.strip() or stdout.strip() or f"rc={completed.returncode}"),
+            "return_code": completed.returncode,
+            "command": cmd,
+            "stdout": stdout,
+            "stderr": stderr,
+        }
+    return {
+        "timestamp_utc": timestamp,
+        "success": True,
+        "return_code": completed.returncode,
+        "command": cmd,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+
+
+def _collect_nvme_with_fallback(subcommand: str, device: str, timeout_s: float = 10.0) -> dict[str, Any]:
+    attempts: list[dict[str, Any]] = []
+    device_candidates = [device]
+    if re.match(r"^/dev/nvme\d+$", device):
+        device_candidates.append(f"{device}n1")
+    seen_commands: set[tuple[str, ...]] = set()
+    variants: list[tuple[str, list[str], str]] = []
+    for candidate in device_candidates:
+        for fmt, cmd in [
+            ("json", ["nvme", subcommand, candidate, "--output-format=json"]),
+            ("json", ["nvme", subcommand, candidate, "-o", "json"]),
+            ("normal", ["nvme", subcommand, candidate, "--output-format=normal"]),
+            ("normal", ["nvme", subcommand, candidate]),
+        ]:
+            key = tuple(cmd)
+            if key in seen_commands:
+                continue
+            seen_commands.add(key)
+            variants.append((fmt, cmd, candidate))
+    for fmt, cmd, candidate in variants:
+        result = _run_capture_command(cmd, timeout_s=timeout_s)
+        attempt = {
+            "command": cmd,
+            "format": fmt,
+            "device_candidate": candidate,
+            "success": bool(result.get("success")),
+            "return_code": result.get("return_code"),
+            "error": result.get("error"),
+        }
+        attempts.append(attempt)
+        stdout = str(result.get("stdout") or "")
+        stderr = str(result.get("stderr") or "")
+        if not result.get("success"):
+            if fmt == "json" and stdout.strip():
+                try:
+                    parsed_nonzero = json.loads(stdout)
+                except json.JSONDecodeError:
+                    parsed_nonzero = None
+                if isinstance(parsed_nonzero, dict):
+                    attempt["parsed_with_nonzero_status"] = True
+                    payload_ok = not (
+                        isinstance(parsed_nonzero.get("error"), str)
+                        and bool(str(parsed_nonzero.get("error")).strip())
+                    )
+                    return {
+                        "timestamp_utc": now_utc_iso(),
+                        "success": True,
+                        "device": device,
+                        "device_used": candidate,
+                        "subcommand": subcommand,
+                        "format": "json",
+                        "command": cmd,
+                        "return_code": result.get("return_code"),
+                        "payload": parsed_nonzero,
+                        "payload_ok": bool(payload_ok),
+                        "stderr": stderr.strip() or None,
+                        "attempts": attempts,
+                    }
+            if result.get("error") == "command_not_found":
+                break
+            continue
+        if fmt == "json":
+            try:
+                parsed = json.loads(stdout) if stdout.strip() else {}
+            except json.JSONDecodeError as exc:
+                attempt["parse_error"] = str(exc)
+                continue
+            payload_ok = not (
+                isinstance(parsed, dict)
+                and isinstance(parsed.get("error"), str)
+                and bool(str(parsed.get("error")).strip())
+            )
+            return {
+                "timestamp_utc": now_utc_iso(),
+                "success": True,
+                "device": device,
+                "device_used": candidate,
+                "subcommand": subcommand,
+                "format": "json",
+                "command": cmd,
+                "payload": parsed,
+                "payload_ok": bool(payload_ok),
+                "stderr": stderr.strip() or None,
+                "attempts": attempts,
+            }
+        payload_ok = "permission denied" not in stdout.lower() and "permission denied" not in stderr.lower()
+        return {
+            "timestamp_utc": now_utc_iso(),
+            "success": True,
+            "device": device,
+            "device_used": candidate,
+            "subcommand": subcommand,
+            "format": "normal",
+            "command": cmd,
+            "payload": {"raw_stdout": stdout},
+            "payload_ok": bool(payload_ok),
+            "stdout": stdout,
+            "stderr": stderr,
+            "attempts": attempts,
+        }
+    return {
+        "timestamp_utc": now_utc_iso(),
+        "success": False,
+        "device": device,
+        "subcommand": subcommand,
+        "format": None,
+        "error": attempts[-1].get("error") if attempts else "unknown_error",
+        "payload_ok": False,
+        "attempts": attempts,
+    }
+
+
 def analyze_eviction_signal_io(phase_summaries: list[dict[str, Any]]) -> dict[str, Any]:
-    by_name = {p.get("phase"): p for p in phase_summaries}
-    warm = by_name.get("warm_A", {})
-    pressure = by_name.get("pressure_B", {})
-    replay = by_name.get("replay_A", {})
-    warm_io = (warm.get("io_delta") or {}) if isinstance(warm, dict) else {}
+    payload = _analyze_rehydrate_like_signal_io(
+        phase_summaries,
+        baseline_phase="warm_A",
+        pressure_phase="pressure_B",
+        replay_phase="replay_A",
+    )
+    payload["warm_read_mib"] = payload.get("baseline_read_mib")
+    return payload
+
+
+def analyze_rehydrate_signal_io(phase_summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    return _analyze_rehydrate_like_signal_io(
+        phase_summaries,
+        baseline_phase="populate",
+        pressure_phase="thrash",
+        replay_phase="replay",
+    )
+
+
+def _analyze_rehydrate_like_signal_io(
+    phase_summaries: list[dict[str, Any]],
+    *,
+    baseline_phase: str,
+    pressure_phase: str,
+    replay_phase: str,
+) -> dict[str, Any]:
+    by_name = {str(p.get("phase")): p for p in phase_summaries}
+    baseline = by_name.get(baseline_phase, {})
+    pressure = by_name.get(pressure_phase, {})
+    replay = by_name.get(replay_phase, {})
+    baseline_io = (baseline.get("io_delta") or {}) if isinstance(baseline, dict) else {}
     pressure_io = (pressure.get("io_delta") or {}) if isinstance(pressure, dict) else {}
     replay_io = (replay.get("io_delta") or {}) if isinstance(replay, dict) else {}
-    warm_read = float(warm_io.get("read_mib_delta", 0.0))
+    baseline_read = float(baseline_io.get("read_mib_delta", 0.0))
     pressure_write = float(pressure_io.get("write_mib_delta", 0.0))
     replay_read = float(replay_io.get("read_mib_delta", 0.0))
-
-    if replay_read > max(1.0, warm_read * 1.20):
+    if replay_read > max(1.0, baseline_read * 1.20):
         signal = "possible_readback"
-        interpretation = "Replay phase shows higher NVMe reads than warm phase."
+        interpretation = "Replay phase shows higher NVMe reads than baseline phase."
     elif replay_read > 0.0:
         signal = "weak_read_signal"
         interpretation = "Replay phase has non-zero reads, attribution is weak."
@@ -1196,7 +2292,10 @@ def analyze_eviction_signal_io(phase_summaries: list[dict[str, Any]]) -> dict[st
         interpretation = "No replay read spike in block-device counters."
     return {
         "signal": signal,
-        "warm_read_mib": round(warm_read, 3),
+        "baseline_phase": baseline_phase,
+        "pressure_phase": pressure_phase,
+        "replay_phase": replay_phase,
+        "baseline_read_mib": round(baseline_read, 3),
         "pressure_write_mib": round(pressure_write, 3),
         "replay_read_mib": round(replay_read, 3),
         "interpretation": interpretation,
@@ -1224,14 +2323,18 @@ def build_kvbm_metrics_summary(
             "matched_tokens_total_delta": round(total_matched, 3),
         },
     }
-    if scenario == "eviction_replay":
-        warm = phase_deltas.get("warm_A", {})
-        pressure = phase_deltas.get("pressure_B", {})
-        replay = phase_deltas.get("replay_A", {})
-        warm_onboard = float(warm.get("onboard_blocks_total_delta", 0.0))
+    if scenario in ("eviction_replay", "rehydrate_replay"):
+        baseline_phase = "warm_A" if scenario == "eviction_replay" else "populate"
+        pressure_phase = "pressure_B" if scenario == "eviction_replay" else "thrash"
+        replay_phase = "replay_A" if scenario == "eviction_replay" else "replay"
+        signal_key = "eviction_replay_signal" if scenario == "eviction_replay" else "rehydrate_replay_signal"
+        baseline = phase_deltas.get(baseline_phase, {})
+        pressure = phase_deltas.get(pressure_phase, {})
+        replay = phase_deltas.get(replay_phase, {})
+        baseline_onboard = float(baseline.get("onboard_blocks_total_delta", 0.0))
         pressure_onboard = float(pressure.get("onboard_blocks_total_delta", 0.0))
         replay_onboard = float(replay.get("onboard_blocks_total_delta", 0.0))
-        warm_matched = float(warm.get("kvbm_matched_tokens_delta", 0.0))
+        baseline_matched = float(baseline.get("kvbm_matched_tokens_delta", 0.0))
         pressure_matched = float(pressure.get("kvbm_matched_tokens_delta", 0.0))
         replay_matched = float(replay.get("kvbm_matched_tokens_delta", 0.0))
         if replay_onboard > 0.0:
@@ -1245,7 +2348,7 @@ def build_kvbm_metrics_summary(
                 "rehydrate path was not eligible because cross-request reuse did not trigger."
             )
             reuse_gate = "reuse_absent"
-        elif pressure_onboard > 0.0 or warm_onboard > 0.0:
+        elif pressure_onboard > 0.0 or baseline_onboard > 0.0:
             signal = "onboard_outside_replay"
             interpretation = "Onboard counters are non-zero, but replay was zero."
             reuse_gate = "reuse_present"
@@ -1253,12 +2356,17 @@ def build_kvbm_metrics_summary(
             signal = "no_onboard_signal"
             interpretation = "No onboard block counters observed despite non-zero matched tokens."
             reuse_gate = "reuse_present"
-        summary["eviction_replay_signal"] = {
+        summary[signal_key] = {
             "signal": signal,
-            "warm_onboard_blocks": round(warm_onboard, 3),
+            "baseline_phase": baseline_phase,
+            "pressure_phase": pressure_phase,
+            "replay_phase": replay_phase,
+            "baseline_onboard_blocks": round(baseline_onboard, 3),
+            "warm_onboard_blocks": round(baseline_onboard, 3),
             "pressure_onboard_blocks": round(pressure_onboard, 3),
             "replay_onboard_blocks": round(replay_onboard, 3),
-            "warm_matched_tokens": round(warm_matched, 3),
+            "baseline_matched_tokens": round(baseline_matched, 3),
+            "warm_matched_tokens": round(baseline_matched, 3),
             "pressure_matched_tokens": round(pressure_matched, 3),
             "replay_matched_tokens": round(replay_matched, 3),
             "replay_onboard_blocks_h2d": round(float(replay.get("kvbm_onboard_blocks_h2d_delta", 0.0)), 3),
@@ -1331,6 +2439,14 @@ def analyze_request_identity(rows: list[dict[str, Any]], scenario: str) -> dict[
     params_hashes = {str(r.get("generation_params_sha256")) for r in rows if r.get("generation_params_sha256")}
     identity_hashes = {str(r.get("request_identity_sha256")) for r in rows if r.get("request_identity_sha256")}
     payload_hashes = {str(r.get("request_payload_sha256")) for r in rows if r.get("request_payload_sha256")}
+    prefix_hashes = {str(r.get("prefix_hash")) for r in rows if r.get("prefix_hash")}
+    session_ids = {str(r.get("session_id")) for r in rows if r.get("session_id")}
+    session_counts: dict[str, int] = {}
+    for row in rows:
+        sid = row.get("session_id")
+        if sid:
+            key = str(sid)
+            session_counts[key] = session_counts.get(key, 0) + 1
 
     phase_identity: dict[str, dict[str, Any]] = {}
     header_keys: set[str] = set()
@@ -1372,6 +2488,9 @@ def analyze_request_identity(rows: list[dict[str, Any]], scenario: str) -> dict[
         "unique_generation_params_sha256_count": len(params_hashes),
         "unique_request_identity_sha256_count": len(identity_hashes),
         "unique_request_payload_sha256_count": len(payload_hashes),
+        "unique_prefix_hash_count": len(prefix_hashes),
+        "unique_session_id_count": len(session_ids),
+        "session_request_counts": {k: session_counts[k] for k in sorted(session_counts)},
         "response_header_keys_seen": sorted(header_keys),
         "phase_identity": phase_identity_sorted,
     }
@@ -1514,6 +2633,7 @@ def render_report_markdown(summary: dict[str, Any]) -> str:
             f"- Python: `{fingerprint.get('python_version')}`",
             "",
             "## KV Configuration",
+            f"- Tier mode: `{summary.get('tier_mode')}`",
             f"- KV mode: `{kv_mode.get('mode')}`",
             f"- KVBM enabled: `{kv_mode.get('kvbm_enabled')}`",
             f"- CPU cache GB: `{kv_mode.get('cpu_cache_gb')}`",
@@ -1535,10 +2655,12 @@ def render_report_markdown(summary: dict[str, Any]) -> str:
     for phase in phase_summaries:
         phase_name = phase.get("phase")
         io_delta = phase.get("io_delta") or {}
+        proc_io_delta = phase.get("worker_process_io_delta") or {}
         kvbm_delta = phase.get("kvbm_metrics_delta") or {}
         lines.append(
             f"- `{phase_name}`: err={phase.get('error_rate')} req/s={phase.get('req_per_s')} "
             f"nvme_write_mib={io_delta.get('write_mib_delta')} nvme_read_mib={io_delta.get('read_mib_delta')} "
+            f"proc_write_mib={proc_io_delta.get('write_mib_delta')} proc_read_mib={proc_io_delta.get('read_mib_delta')} "
             f"offload_blocks_delta={kvbm_delta.get('offload_blocks_total_delta')} "
             f"onboard_blocks_delta={kvbm_delta.get('onboard_blocks_total_delta')} "
             f"matched_tokens_delta={kvbm_delta.get('kvbm_matched_tokens_delta')}"
@@ -1547,19 +2669,24 @@ def render_report_markdown(summary: dict[str, Any]) -> str:
     lines.extend(["", "## KVBM Metrics Signal"])
     lines.append(f"- KVBM metrics available: `{kvbm.get('available')}`")
     evict_signal_raw = kvbm.get("eviction_replay_signal")
+    signal_label = "Eviction replay"
+    if not isinstance(evict_signal_raw, dict):
+        evict_signal_raw = kvbm.get("rehydrate_replay_signal")
+        signal_label = "Rehydrate replay"
     evict_signal: dict[str, Any] = dict(evict_signal_raw) if isinstance(evict_signal_raw, dict) else {}
     if evict_signal:
+        replay_phase_name = str(evict_signal.get("replay_phase") or "replay_A")
         replay_matched = evict_signal.get("replay_matched_tokens")
         if replay_matched is None:
-            replay_matched = round(phase_kvbm_value("replay_A", "kvbm_matched_tokens_delta"), 3)
+            replay_matched = round(phase_kvbm_value(replay_phase_name, "kvbm_matched_tokens_delta"), 3)
             evict_signal["replay_matched_tokens"] = replay_matched
         replay_h2d = evict_signal.get("replay_onboard_blocks_h2d")
         if replay_h2d is None:
-            replay_h2d = round(phase_kvbm_value("replay_A", "kvbm_onboard_blocks_h2d_delta"), 3)
+            replay_h2d = round(phase_kvbm_value(replay_phase_name, "kvbm_onboard_blocks_h2d_delta"), 3)
             evict_signal["replay_onboard_blocks_h2d"] = replay_h2d
         replay_d2d = evict_signal.get("replay_onboard_blocks_d2d")
         if replay_d2d is None:
-            replay_d2d = round(phase_kvbm_value("replay_A", "kvbm_onboard_blocks_d2d_delta"), 3)
+            replay_d2d = round(phase_kvbm_value(replay_phase_name, "kvbm_onboard_blocks_d2d_delta"), 3)
             evict_signal["replay_onboard_blocks_d2d"] = replay_d2d
         reuse_gate = evict_signal.get("reuse_gate")
         if reuse_gate is None:
@@ -1576,7 +2703,7 @@ def render_report_markdown(summary: dict[str, Any]) -> str:
         elif not interpretation:
             evict_signal["interpretation"] = "Replay onboard counters are zero despite non-zero matched tokens."
 
-        lines.append(f"- Eviction replay signal: `{evict_signal.get('signal')}`")
+        lines.append(f"- {signal_label} signal: `{evict_signal.get('signal')}`")
         lines.append(
             f"- Replay matched/onboard(h2d,d2d): `{evict_signal.get('replay_matched_tokens')}` / "
             f"`{evict_signal.get('replay_onboard_blocks_h2d')}`, `{evict_signal.get('replay_onboard_blocks_d2d')}`"

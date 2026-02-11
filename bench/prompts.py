@@ -6,9 +6,9 @@ import logging
 import os
 import random
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Any, Iterable, Optional, Sequence
 
 LOG = logging.getLogger(__name__)
 
@@ -80,6 +80,7 @@ class PromptSpec:
     target_tokens: int
     prompt_tokens_est: int
     prompt: str
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class TokenEstimator:
@@ -296,9 +297,200 @@ def generate_replay_sets(
     return a, b
 
 
+def generate_local_project_copilot_burst(
+    *,
+    count: int,
+    seed: int,
+    estimator: TokenEstimator,
+    session_count: int = 8,
+    burst_size: int = 4,
+    shared_prefix_target_tokens: int = 3072,
+    prompt_id_prefix: str = "copilot",
+) -> list[PromptSpec]:
+    if count <= 0:
+        return []
+    session_count = max(1, int(session_count))
+    burst_size = max(1, int(burst_size))
+    rng = random.Random(seed)
+    prefix_rng = random.Random(seed + 1_000_003)
+
+    shared_prefix_body = _build_payload(
+        target_tokens=max(512, int(shared_prefix_target_tokens)),
+        rng=prefix_rng,
+        topic="local project copilot baseline context",
+        doc_id=f"{prompt_id_prefix}-shared-prefix",
+    )
+    shared_prefix_text = (
+        "Shared Project Context:\n"
+        "Repository scope: inference runtime, telemetry, and runbook controls.\n"
+        "Coding constraints: deterministic outputs, explicit guardrails, and operator-safe defaults.\n\n"
+        f"{shared_prefix_body}"
+    )
+    shared_prefix_hash = _sha256_hex(shared_prefix_text)
+    shared_prefix_tokens_est = estimator.estimate(shared_prefix_text)
+
+    requests: list[PromptSpec] = []
+    session_turns: dict[str, int] = {}
+    burst_index = 0
+    request_index = 0
+    while request_index < count:
+        session_idx = burst_index % session_count
+        session_id = f"session_{session_idx + 1:02d}"
+        burst_id = f"burst_{burst_index + 1:04d}"
+        for _ in range(burst_size):
+            if request_index >= count:
+                break
+            turn_idx = session_turns.get(session_id, 0) + 1
+            session_turns[session_id] = turn_idx
+            topic = rng.choice(_TOPICS)
+            subject = rng.choice(_SUBJECTS)
+            qualifier = rng.choice(_QUALIFIERS)
+            action = rng.choice(_ACTIONS)
+            user_turn = (
+                f"Session ID: {session_id}\n"
+                f"Burst ID: {burst_id}\n"
+                f"Turn: {turn_idx}\n"
+                f"Task: In 5 bullets, explain how {subject.lower()} {action} the {topic} pipeline {qualifier}. "
+                "Call out one concrete risk and one mitigation."
+            )
+            prompt_text = render_llama3_completion_prompt(
+                f"{shared_prefix_text}\n\nUser Turn:\n{user_turn}"
+            )
+            prompt_tokens_est = estimator.estimate(prompt_text)
+            prompt_id = f"{prompt_id_prefix}-{request_index:05d}"
+            metadata = {
+                "workload": "local_project_copilot_shared_prefix_burst",
+                "prefix_hash": shared_prefix_hash,
+                "shared_prefix_tokens_est": shared_prefix_tokens_est,
+                "session_id": session_id,
+                "session_turn_index": turn_idx,
+                "burst_index": burst_index + 1,
+                "burst_id": burst_id,
+            }
+            requests.append(
+                PromptSpec(
+                    prompt_id=prompt_id,
+                    prompt_set="local_copilot_burst",
+                    target_tokens=prompt_tokens_est,
+                    prompt_tokens_est=prompt_tokens_est,
+                    prompt=prompt_text,
+                    metadata=metadata,
+                )
+            )
+            request_index += 1
+        burst_index += 1
+    return requests
+
+
+def generate_rehydrate_replay_sets(
+    *,
+    populate_sessions: int,
+    thrash_sessions: int,
+    turns: int,
+    seed: int,
+    estimator: TokenEstimator,
+    prefix_target_tokens: int = 4096,
+    prompt_id_prefix: str = "rehydrate",
+) -> tuple[list[PromptSpec], list[PromptSpec]]:
+    populate_sessions = max(1, int(populate_sessions))
+    thrash_sessions = max(1, int(thrash_sessions))
+    turns = max(1, int(turns))
+    prefix_target_tokens = max(512, int(prefix_target_tokens))
+
+    session_rng = random.Random(seed)
+    prefix_rng = random.Random(seed + 7_003)
+    thrash_rng = random.Random(seed + 19_001)
+
+    populate_prompts: list[PromptSpec] = []
+    thrash_prompts: list[PromptSpec] = []
+
+    for session_idx in range(populate_sessions):
+        session_id = f"rehydrate_session_{session_idx + 1:04d}"
+        topic = session_rng.choice(_TOPICS)
+        prefix_doc = _build_payload(
+            target_tokens=prefix_target_tokens,
+            rng=prefix_rng,
+            topic=f"rehydrate baseline {topic}",
+            doc_id=f"{prompt_id_prefix}-populate-{session_idx:04d}",
+        )
+        shared_prefix = (
+            "Session Context:\n"
+            f"Session: {session_id}\n"
+            "Goal: preserve reusable project context across pressure and replay.\n\n"
+            f"{prefix_doc}"
+        )
+        prefix_hash = _sha256_hex(shared_prefix)
+        prefix_tokens_est = estimator.estimate(shared_prefix)
+        for turn_idx in range(1, turns + 1):
+            user_turn = (
+                f"Turn {turn_idx}: summarize the key deltas for {topic}, "
+                "call out one risk, and propose one mitigation."
+            )
+            prompt = render_llama3_completion_prompt(f"{shared_prefix}\n\nUser Query:\n{user_turn}")
+            prompt_tokens_est = estimator.estimate(prompt)
+            prompt_id = f"{prompt_id_prefix}_populate_{session_idx:04d}_t{turn_idx:02d}"
+            populate_prompts.append(
+                PromptSpec(
+                    prompt_id=prompt_id,
+                    prompt_set="rehydrate_populate",
+                    target_tokens=prompt_tokens_est,
+                    prompt_tokens_est=prompt_tokens_est,
+                    prompt=prompt,
+                    metadata={
+                        "workload": "rehydrate_replay",
+                        "phase_intent": "populate_or_replay",
+                        "session_id": session_id,
+                        "session_turn_index": turn_idx,
+                        "prefix_hash": prefix_hash,
+                        "shared_prefix_tokens_est": prefix_tokens_est,
+                    },
+                )
+            )
+
+    for session_idx in range(thrash_sessions):
+        session_id = f"thrash_session_{session_idx + 1:04d}"
+        topic = thrash_rng.choice(_TOPICS)
+        prefix_doc = _build_payload(
+            target_tokens=prefix_target_tokens,
+            rng=thrash_rng,
+            topic=f"thrash pressure {topic}",
+            doc_id=f"{prompt_id_prefix}-thrash-{session_idx:04d}",
+        )
+        shared_prefix = (
+            "Thrash Context:\n"
+            f"Session: {session_id}\n"
+            "Goal: generate unique cache pressure to evict prior KV state.\n\n"
+            f"{prefix_doc}"
+        )
+        prefix_hash = _sha256_hex(shared_prefix)
+        prompt = render_llama3_completion_prompt(
+            f"{shared_prefix}\n\nUser Query:\nProvide a compact remediation checklist for {topic}."
+        )
+        prompt_tokens_est = estimator.estimate(prompt)
+        prompt_id = f"{prompt_id_prefix}_thrash_{session_idx:04d}"
+        thrash_prompts.append(
+            PromptSpec(
+                prompt_id=prompt_id,
+                prompt_set="rehydrate_thrash",
+                target_tokens=prompt_tokens_est,
+                prompt_tokens_est=prompt_tokens_est,
+                prompt=prompt,
+                metadata={
+                    "workload": "rehydrate_replay",
+                    "phase_intent": "thrash",
+                    "session_id": session_id,
+                    "session_turn_index": 1,
+                    "prefix_hash": prefix_hash,
+                },
+            )
+        )
+
+    return populate_prompts, thrash_prompts
+
+
 def manifest_rows(specs: Sequence[PromptSpec]) -> Iterable[dict]:
     for spec in specs:
-        yield {
+        row = {
             "prompt_id": spec.prompt_id,
             "prompt_set": spec.prompt_set,
             "target_tokens": spec.target_tokens,
@@ -306,6 +498,14 @@ def manifest_rows(specs: Sequence[PromptSpec]) -> Iterable[dict]:
             "prompt_chars": len(spec.prompt),
             "prompt_sha256": _sha256_hex(spec.prompt),
         }
+        metadata = dict(spec.metadata or {})
+        if metadata:
+            row["metadata"] = metadata
+            if metadata.get("prefix_hash"):
+                row["prefix_hash"] = metadata.get("prefix_hash")
+            if metadata.get("session_id"):
+                row["session_id"] = metadata.get("session_id")
+        yield row
 
 
 def _choose_target(

@@ -1,18 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bench_profile_lib.sh
+source "${SCRIPT_DIR}/bench_profile_lib.sh"
+
 BASE_URL="${BENCH_BASE_URL:-http://127.0.0.1:8000}"
 CONCURRENCIES="${BENCH_CONCURRENCIES:-1 4 8}"
-KV_MODE="${BENCH_KV_MODE:-cpu_disk}"
-KV_CPU_CACHE_GB="${DYN_KVBM_CPU_CACHE_GB:-8}"
-KV_DISK_CACHE_GB="${DYN_KVBM_DISK_CACHE_GB:-32}"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
+
+bench_resolve_tier_mode "${BENCH_TIER_MODE:-${BENCH_KV_MODE:-}}"
+bench_defaults_for_tier_mode "${BENCH_TIER_MODE_RESOLVED}"
+KV_MODE="${BENCH_KV_MODE_RESOLVED}"
+TIER_MODE="${BENCH_TIER_MODE_RESOLVED}"
+KV_CPU_CACHE_GB="${DYN_KVBM_CPU_CACHE_GB:-${BENCH_CPU_CACHE_GB_DEFAULT}}"
+KV_DISK_CACHE_GB="${DYN_KVBM_DISK_CACHE_GB:-${BENCH_DISK_CACHE_GB_DEFAULT}}"
 
 COMMON_ARGS=(
   --base-url "${BASE_URL}"
+  --tier-mode "${TIER_MODE}"
   --kv-mode "${KV_MODE}"
   --kv-cpu-cache-gb "${KV_CPU_CACHE_GB}"
   --kv-disk-cache-gb "${KV_DISK_CACHE_GB}"
+  --variant-tag "tier_mode:${TIER_MODE}"
   --variant-tag "kv_mode:${KV_MODE}"
   --variant-tag "cpu_cache_gb:${KV_CPU_CACHE_GB}"
   --variant-tag "disk_cache_gb:${KV_DISK_CACHE_GB}"

@@ -97,46 +97,64 @@ class OpenAICompatClient:
 
     async def _create_completion_json(self, payload: dict[str, Any]) -> CompletionResponse:
         start = time.perf_counter()
+        status_code = 0
+        request_id: Optional[str] = None
+        response_headers: dict[str, str] = {}
+        ttft_ms: Optional[float] = None
+        response_id: Optional[str] = None
+        text = ""
+        error: Optional[str] = None
         try:
-            resp = await self._client.post("/v1/completions", json=payload)
+            body_text = ""
+            async with self._client.stream("POST", "/v1/completions", json=payload) as resp:
+                status_code = resp.status_code
+                request_id = resp.headers.get("x-request-id")
+                response_headers = _extract_response_header_hints(resp.headers)
+                # For non-stream responses this is a first-byte proxy for TTFT.
+                header_ms = (time.perf_counter() - start) * 1000.0
+                chunks: list[bytes] = []
+                async for chunk in resp.aiter_bytes():
+                    if chunk:
+                        if ttft_ms is None:
+                            ttft_ms = (time.perf_counter() - start) * 1000.0
+                        chunks.append(chunk)
+                if ttft_ms is None:
+                    ttft_ms = header_ms
+                body_text = b"".join(chunks).decode("utf-8", errors="replace")
             latency_ms = (time.perf_counter() - start) * 1000.0
-            request_id = resp.headers.get("x-request-id")
-            response_headers = _extract_response_header_hints(resp.headers)
-            response_id = None
-            text = ""
-            error: Optional[str] = None
             try:
-                body = resp.json()
+                body = json.loads(body_text) if body_text.strip() else {}
                 response_id = body.get("id")
                 text = _extract_completion_text(body)
-                if resp.is_error:
-                    error = _extract_error(body) or f"HTTP {resp.status_code}"
+                if status_code >= 400:
+                    error = _extract_error(body) or f"HTTP {status_code}"
             except Exception:
-                body_text = resp.text
-                if resp.is_error:
-                    error = f"HTTP {resp.status_code}: {body_text[:400]}"
+                if status_code >= 400:
+                    error = f"HTTP {status_code}: {body_text[:400]}"
                 text = body_text
             return CompletionResponse(
-                status_code=resp.status_code,
+                status_code=status_code,
                 latency_ms=latency_ms,
                 request_id=request_id,
                 text=text,
                 error=error,
-                ttft_ms=None,
+                ttft_ms=ttft_ms,
                 response_id=response_id,
                 response_headers=response_headers,
             )
         except Exception as exc:
             latency_ms = (time.perf_counter() - start) * 1000.0
+            if ttft_ms is None:
+                ttft_ms = latency_ms
             return CompletionResponse(
-                status_code=0,
+                status_code=status_code,
                 latency_ms=latency_ms,
-                request_id=None,
-                text="",
+                request_id=request_id,
+                text=text,
                 error=str(exc),
-                ttft_ms=None,
-                response_id=None,
-                response_headers={},
+                ttft_ms=ttft_ms,
+                response_id=response_id,
+                response_headers=response_headers,
             )
 
     async def _create_completion_streaming(self, payload: dict[str, Any]) -> CompletionResponse:

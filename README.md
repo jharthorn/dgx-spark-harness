@@ -25,6 +25,11 @@ scripts/bench_prepare_host.sh
 scripts/bench_container_up.sh
 ```
 
+Mode/model switches (no manual config edits required):
+
+- `BENCH_TIER_MODE=B0|B1|B2` maps to `off|cpu_only|cpu_disk`.
+- `BENCH_MODEL_PROFILE=llama31_8b_fp8|llama33_70b_nvfp4` selects baseline vs pressure-model defaults.
+
 3. Start worker and frontend:
 
 ```bash
@@ -92,9 +97,12 @@ Artifacts are written under `bench/results/<run_id>/`.
 
 - `bench/run_bench.py`: OpenAI-compatible `/v1/completions` benchmark runner with:
   - KVBM metrics snapshots/deltas
+  - phase delta artifacts for KVBM metrics + OS I/O (`phase_deltas/`)
   - `reuse_verify` scenario for identical-request prefix-reuse checks
+  - `local_copilot_burst` workload with deterministic `request_manifest.jsonl` (`prefix_hash`, `session_id`)
   - request identity hashes (prompt bytes + generation params)
-  - `--kv-mode {off,cpu_only,cpu_disk}`
+  - `--tier-mode {B0,B1,B2}` + `--kv-mode {off,cpu_only,cpu_disk}`
+  - NVMe identity + SMART pre/post capture (`nvme_identity.json`, `nvme_smart_pre.json`, `nvme_smart_post.json`)
   - prompt preflight guardrails
   - invalid-run labeling
   - auto `report.md` generation
@@ -113,17 +121,3 @@ Artifacts are written under `bench/results/<run_id>/`.
 [ASSUMPTION: many local engines are built with `max_num_tokens=8192`.]
 
 If requests exceed that limit, the worker can unregister and frontend model discovery will drop to empty (`/v1/models` returns no models). For this case, keep long prompt generation under the engine cap (for example `--long-range 6000:7600`) unless you rebuild the TRT-LLM engine with higher context/token limits.
-
-## Legacy Archive
-
-Legacy v3.3 implementations were moved under `legacy/` to keep the root workflow clean:
-
-- `legacy/docs/`
-- `legacy/runs/`
-- `legacy/src/`
-- `legacy/analysis/`
-- `legacy/configs/`
-- `legacy/scripts/`
-- `legacy/root/`
-
-Use these only for historical reference. Active development and validation should use `RUNBOOK.md` + `bench/`.

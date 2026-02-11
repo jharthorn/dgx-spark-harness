@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bench_profile_lib.sh
+source "${SCRIPT_DIR}/bench_profile_lib.sh"
+
 BASE_URL="${BENCH_BASE_URL:-http://127.0.0.1:8000}"
-MODES="${BENCH_KV_MODE_LIST:-off cpu_only cpu_disk}"
+MODES="${BENCH_KV_MODE_LIST:-B0 B1 B2}"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 CONTAINER_NAME="${BENCH_CONTAINER_NAME:-dyn}"
 READY_REQUIRE_ENDPOINTS="${BENCH_COMPARE_READY_REQUIRE_ENDPOINTS:-0}"
@@ -29,8 +33,13 @@ trap on_error ERR
 
 for mode in ${MODES}; do
   CURRENT_MODE="${mode}"
-  export BENCH_KV_MODE="${mode}"
-  echo "=== Restarting worker/frontend for mode=${mode} ==="
+  bench_resolve_tier_mode "${mode}"
+  bench_defaults_for_tier_mode "${BENCH_TIER_MODE_RESOLVED}"
+
+  export BENCH_TIER_MODE="${BENCH_TIER_MODE_RESOLVED}"
+  export BENCH_KV_MODE="${BENCH_KV_MODE_RESOLVED}"
+
+  echo "=== Restarting worker/frontend for tier_mode=${BENCH_TIER_MODE_RESOLVED} kv_mode=${BENCH_KV_MODE_RESOLVED} ==="
   scripts/bench_start_worker.sh
   scripts/bench_start_frontend.sh
   if [[ "${SKIP_READY}" == "1" ]]; then
@@ -41,23 +50,19 @@ for mode in ${MODES}; do
     scripts/bench_wait_ready.sh "${READY_TIMEOUT_S}" "${READY_SLEEP_S}"
   fi
 
-  cpu_cache_gb="${DYN_KVBM_CPU_CACHE_GB:-8}"
-  disk_cache_gb="${DYN_KVBM_DISK_CACHE_GB:-32}"
-  if [[ "${mode}" == "off" ]]; then
-    cpu_cache_gb=0
-    disk_cache_gb=0
-  elif [[ "${mode}" == "cpu_only" ]]; then
-    disk_cache_gb=0
-  fi
+  cpu_cache_gb="${DYN_KVBM_CPU_CACHE_GB:-${BENCH_CPU_CACHE_GB_DEFAULT}}"
+  disk_cache_gb="${DYN_KVBM_DISK_CACHE_GB:-${BENCH_DISK_CACHE_GB_DEFAULT}}"
 
   python3 -m bench.run_bench \
     --base-url "${BASE_URL}" \
     --model-resolve-timeout-s "${MODEL_RESOLVE_TIMEOUT_S}" \
     --model-resolve-poll-s "${MODEL_RESOLVE_POLL_S}" \
-    --kv-mode "${mode}" \
+    --tier-mode "${BENCH_TIER_MODE_RESOLVED}" \
+    --kv-mode "${BENCH_KV_MODE_RESOLVED}" \
     --kv-cpu-cache-gb "${cpu_cache_gb}" \
     --kv-disk-cache-gb "${disk_cache_gb}" \
-    --variant-tag "kv_mode:${mode}" \
+    --variant-tag "tier_mode:${BENCH_TIER_MODE_RESOLVED}" \
+    --variant-tag "kv_mode:${BENCH_KV_MODE_RESOLVED}" \
     --scenario standard \
     --prompt-set short \
     --requests "${BENCH_COMPARE_REQUESTS:-32}" \
@@ -69,7 +74,7 @@ for mode in ${MODES}; do
     --collect-telemetry \
     --container-name "${BENCH_CONTAINER_NAME:-dyn}" \
     --kvbm-cache-dir "${DYN_KVBM_DISK_CACHE_DIR:-/mnt/nvme/kvbm}" \
-    --run-id "compare_${mode}_${TS}"
+    --run-id "compare_${BENCH_TIER_MODE_RESOLVED}_${TS}"
 done
 
 echo "Mode comparison runs complete for timestamp ${TS}"

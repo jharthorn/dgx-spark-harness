@@ -7,6 +7,7 @@ __pycache__/
 # Virtual Environment
 
 .venv/
+.venv-bench/
 dyn-venv/
 
 # Generated data, logs, and summaries
