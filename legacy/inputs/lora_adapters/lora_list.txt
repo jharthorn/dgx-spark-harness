@@ -1,4 +1,0 @@
-adapter_finance_v1
-adapter_legal_v2
-adapter_customer_support_v4
-adapter_summarization_v3
