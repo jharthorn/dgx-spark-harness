@@ -276,7 +276,9 @@ Deliverables:
 
 A whitepaper effort dies if runs are ad-hoc. Canonical UX:
 
-* `run_bundle --model llama8b_fp8 --workload W1 --mode B2 --repeats 10`
+* Single probe bundle (TRT-LLM): `scripts/bench_phase56_like_probe_trtllm.sh`
+* Progressive thrash trial bundle: `scripts/bench_phase58_eviction_thrash.sh`
+* Fixed-pressure replay sweep bundle: `scripts/bench_phase60_rehydrate_minimal_sweep.sh`
 
 Output is always a self-describing bundle:
 
@@ -284,10 +286,23 @@ Output is always a self-describing bundle:
 * `summary.json`
 * `quick_summary.json`
 * `verdict.json`
-* `metrics_delta/` (phase deltas)
-* `os/` (iostat/pid/io attribution)
-* `charts/`
-* `raw/`
+* `phase_deltas/` (KVBM + OS I/O deltas)
+* `telemetry/` (iostat/pidstat/GPU/log captures)
+* `nvme_identity.json`, `nvme_smart_pre.json`, `nvme_smart_post.json`
+* `report.md`
+
+Current harness mapping (repo-level):
+
+* Mode control:
+  * `BENCH_TIER_MODE=B0|B1|B2` maps to `off|cpu_only|cpu_disk` and is captured in `manifest.json`.
+* Model profile control:
+  * `BENCH_MODEL_PROFILE=llama31_8b_fp8|llama33_70b_nvfp4` is captured in manifest and worker runtime manifest.
+* Decision-grade sweep:
+  * `scripts/bench_phase60_rehydrate_minimal_sweep.sh` persists baseline/SLO early and supports resumable checkpoints (`BENCH_PHASE60_RESUME_FROM`, `BENCH_PHASE60_RESUME_SKIP_COMPLETED`).
+* Per-run evidence:
+  * `phase_deltas/phase_<name>_kvbm_metrics_delta.json`
+  * `phase_deltas/phase_<name>_os_io_delta.json`
+  * `nvme_identity.json`, `nvme_smart_pre.json`, `nvme_smart_post.json`
 
 ---
 

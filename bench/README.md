@@ -4,12 +4,12 @@ This package adds a focused benchmark harness for DGX Spark Dynamo + TRT-LLM + K
 
 ## Files
 
-- `bench/run_bench.py`: benchmark CLI driver (`standard`, `eviction_replay`, `reuse_verify`, `local_copilot_burst`).
+- `bench/run_bench.py`: benchmark CLI driver (`standard`, `eviction_replay`, `reuse_verify`, `local_copilot_burst`, `rehydrate_replay`).
   - Includes KVBM metrics snapshots/deltas by phase.
   - Can capture raw Prometheus snapshots from both Dynamo system metrics and KVBM metrics endpoints.
   - Includes per-request identity hashes (prompt bytes + generation params).
   - Includes canonical mode mapping `--tier-mode {B0,B1,B2}` plus `--kv-mode {off,cpu_only,cpu_disk}` metadata.
-  - Emits per-phase delta artifacts for KVBM metrics and OS I/O (block device + worker `/proc/*/io`).
+  - Emits per-phase delta artifacts for KVBM metrics and OS I/O (block device + container/worker IO deltas).
   - Captures NVMe identity + SMART pre/post snapshots into every run bundle.
   - Enforces prompt preflight guardrails against engine token limits.
   - Marks invalid runs explicitly and emits `report.md`.
@@ -122,7 +122,7 @@ Inspect:
 - `.overall_summary.reuse_verify_signal_kvbm`
 - `.request_identity.reuse_verify_identity`
 
-### 5) Streaming TTFT proxy (best effort)
+### 5) TTFT collection modes (best effort)
 
 ```bash
 python3 -m bench.run_bench \
@@ -134,7 +134,22 @@ python3 -m bench.run_bench \
   --stream
 ```
 
-If the server does not stream chunks, `ttft_ms` stays empty and you should rely on end-to-end latency and throughput.
+Without `--stream`, the client still records a first-byte TTFT proxy for non-stream completions. With `--stream`, TTFT uses first chunk arrival and is typically a higher-fidelity proxy.
+
+### 6) Phase60 fixed-pressure minimal sweep wrapper
+
+This is the canonical decision-grade B1 vs B2 sweep flow. Populate/thrash pressure stays fixed while replay concurrency is swept.
+
+```bash
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+BENCH_PHASE60_TS=$TS \
+BENCH_PHASE60_SWEEP_CONCURRENCIES="1 2 4" \
+BENCH_PHASE60_PRESSURE_POPULATE_CONCURRENCY=2 \
+BENCH_PHASE60_PRESSURE_THRASH_CONCURRENCY=2 \
+BENCH_PHASE60_BASELINE_REPLAY_CONCURRENCY=1 \
+BENCH_PHASE60_FORCE_NEW_SUMMARY=true \
+scripts/bench_phase60_rehydrate_minimal_sweep.sh
+```
 
 ## Operator Scripts
 
@@ -155,6 +170,7 @@ For the scripted workflow around this harness, use:
 - `scripts/bench_run_mode_compare.sh`
 - `scripts/bench_phase56_like_probe_trtllm.sh`
 - `scripts/bench_phase58_eviction_thrash.sh`
+- `scripts/bench_phase60_rehydrate_minimal_sweep.sh`
 - `scripts/bench_workload_local_copilot_burst.sh`
   - For current Spark stability: `BENCH_COMPARE_SKIP_READY=1 BENCH_KV_MODE_LIST="cpu_only cpu_disk" scripts/bench_run_mode_compare.sh`
 
@@ -186,7 +202,7 @@ Each run writes to `bench/results/<run_id>/`:
 - `prompts_manifest.jsonl`: prompt IDs + token targets/estimates + hashes.
 - `request_manifest.jsonl`: deterministic per-request schedule including `prefix_hash`/`session_id` where available.
 - `requests.jsonl`: per-request raw records:
-  `start_ts`, `end_ts`, `latency_ms`, `status_code`, `prompt_id`, `prompt_tokens_est`, `output_len_chars`, `error`, `request_id`, `ttft_ms` (if stream).
+  `start_ts`, `end_ts`, `latency_ms`, `status_code`, `prompt_id`, `prompt_tokens_est`, `output_len_chars`, `error`, `request_id`, `ttft_ms`.
 - `kvbm_metrics_snapshots.jsonl`: raw `/metrics` snapshots at phase boundaries.
 - `summary.json`: includes run validity, per-phase + overall metrics, KVBM deltas, eviction replay signals.
 - `phase_deltas/`: `phase_<name>_kvbm_metrics_{start,end,delta}.json` and `phase_<name>_os_io_{start,end,delta}.json`.
@@ -231,7 +247,7 @@ Signals of pressure/eviction:
 
 Known limitations:
 
-- TTFT is only a proxy unless streaming chunks are actually emitted.
+- TTFT is a proxy metric (non-stream uses first-byte timing, stream uses first chunk timing).
 - If replay reads do not appear and `kvbm_matched_tokens_delta` is zero, disk rehydrate is gated because no cross-request reuse path activated.
 
 ## Interactive Validation Notes (2026-02-08)

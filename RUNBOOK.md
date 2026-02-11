@@ -29,6 +29,9 @@ source ~/dynamo-venv/bin/activate
 scripts/bench_run_smoke.sh
 scripts/bench_run_matrix.sh
 BENCH_COMPARE_SKIP_READY=1 BENCH_KV_MODE_LIST="cpu_only cpu_disk" scripts/bench_run_mode_compare.sh
+BENCH_BACKEND=trtllm BENCH_PHASE58_PATTERN=progressive_thrash BENCH_PHASE58_MAX_ATTEMPTS=1 scripts/bench_phase58_eviction_thrash.sh
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+BENCH_PHASE60_TS=$TS BENCH_PHASE60_SWEEP_CONCURRENCIES="1 2 4" BENCH_PHASE60_PRESSURE_POPULATE_CONCURRENCY=2 BENCH_PHASE60_PRESSURE_THRASH_CONCURRENCY=2 BENCH_PHASE60_BASELINE_REPLAY_CONCURRENCY=1 BENCH_PHASE60_FORCE_NEW_SUMMARY=true scripts/bench_phase60_rehydrate_minimal_sweep.sh
 scripts/bench_results_summary.sh
 ```
 
@@ -41,6 +44,62 @@ BENCH_ENABLE_LOCAL_INDEXER=true BENCH_PUBLISH_EVENTS_AND_METRICS=0 scripts/bench
 BENCH_ROUTER_MODE=kv BENCH_KV_EVENTS=on scripts/bench_start_frontend.sh
 scripts/bench_wait_ready.sh
 ```
+
+## 0) Canonical Decision-Grade Flow (Phase60 Fixed-Pressure Sweep)
+
+Use this flow for publishable B1 vs B2 evidence where only replay concurrency is swept and pressure stays fixed.
+
+### 0.1) Baseline-only preflight row (B2, replay=1)
+
+```bash
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+BENCH_PHASE60_TS=$TS \
+BENCH_PHASE60_SWEEP_CONCURRENCIES="1" \
+BENCH_PHASE60_PRESSURE_POPULATE_CONCURRENCY=2 \
+BENCH_PHASE60_PRESSURE_THRASH_CONCURRENCY=2 \
+BENCH_PHASE60_BASELINE_REPLAY_CONCURRENCY=1 \
+BENCH_PHASE60_FORCE_NEW_SUMMARY=true \
+scripts/bench_phase60_rehydrate_minimal_sweep.sh
+```
+
+### 0.2) Minimal sweep [1,2,4] (B2 then B1 per point)
+
+```bash
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+BENCH_PHASE60_TS=$TS \
+BENCH_PHASE60_SWEEP_CONCURRENCIES="1 2 4" \
+BENCH_PHASE60_PRESSURE_POPULATE_CONCURRENCY=2 \
+BENCH_PHASE60_PRESSURE_THRASH_CONCURRENCY=2 \
+BENCH_PHASE60_BASELINE_REPLAY_CONCURRENCY=1 \
+BENCH_PHASE60_FORCE_NEW_SUMMARY=true \
+scripts/bench_phase60_rehydrate_minimal_sweep.sh
+```
+
+### 0.3) Resume from a point without re-running completed rows
+
+```bash
+BENCH_PHASE60_TS="$TS" \
+BENCH_PHASE60_SWEEP_CONCURRENCIES="4" \
+BENCH_PHASE60_PRESSURE_POPULATE_CONCURRENCY=2 \
+BENCH_PHASE60_PRESSURE_THRASH_CONCURRENCY=2 \
+BENCH_PHASE60_BASELINE_REPLAY_CONCURRENCY=1 \
+BENCH_PHASE60_RESUME_SKIP_COMPLETED=true \
+scripts/bench_phase60_rehydrate_minimal_sweep.sh
+```
+
+Primary artifacts for this flow:
+
+- `bench/results/phase60_rehydrate_concurrency_sweep_summary_minimal_<TS>.json`
+- `bench/results/phase60_matrix_stop_verdict_minimal_<TS>.json` (only on stop/fail)
+- `bench/results/phase60_sweep_b2c1_failure_diagnosis_<TS>.json`
+
+Notes:
+
+- Baseline/SLO are persisted as soon as baseline preflight succeeds (`baseline_b2_replay_p95_ms_at_concurrency1`, `slo_replay_p95_ms`).
+- `rows[]` includes `baseline_preflight` plus partial/ok/invalid checkpoints per sweep point.
+- The sweep is decision-grade only when B2 mechanism signals stay present (matched/onboard/read) and `error_rate` remains zero.
+
+The remaining sections are the low-level manual bring-up path for debugging and runtime forensics. For normal operation, prefer the scripted flow above.
 
 ## 1) Prepare Host Directories and Config
 

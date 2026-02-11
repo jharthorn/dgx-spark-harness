@@ -991,7 +991,7 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
         "request_identity": request_identity_summary,
         "fingerprint": fingerprint,
         "notes": [
-            "TTFT proxy is available only when --stream is enabled and the server emits stream chunks.",
+            "TTFT is a best-effort proxy from first-byte/first-token timing; --stream typically improves fidelity when chunk emission is available.",
             "Invalid runs are explicitly marked and excluded from aggregate conclusions.",
         ],
     }
@@ -2746,7 +2746,7 @@ def render_report_markdown(summary: dict[str, Any]) -> str:
         lines.append("- Offload/spill activity does not imply rehydrate readiness when matched tokens stay zero.")
     if isinstance(reuse_signal, dict) and reuse_signal.get("signal") == "no_prefix_reuse_signal":
         lines.append("- No prefix reuse signal: disk onboarding is gated behind cross-request matching.")
-    lines.append("- TTFT remains a proxy unless streaming chunk emission is available.")
+    lines.append("- TTFT remains a proxy metric; non-stream uses first-byte timing and stream uses first-chunk timing.")
     lines.append("- NVMe counters are supporting evidence; KVBM counters are primary for offload/onboard proof.")
 
     return "\n".join(lines).strip() + "\n"

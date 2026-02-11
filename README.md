@@ -82,6 +82,28 @@ BENCH_COMPARE_SKIP_READY=1 BENCH_KV_MODE_LIST="cpu_only cpu_disk" scripts/bench_
 scripts/bench_results_summary.sh
 ```
 
+9. Run a Phase58 progressive-thrash trial bundle (backend-agnostic wrapper, TRT-LLM default):
+
+```bash
+BENCH_BACKEND=trtllm \
+BENCH_PHASE58_PATTERN=progressive_thrash \
+BENCH_PHASE58_MAX_ATTEMPTS=1 \
+scripts/bench_phase58_eviction_thrash.sh
+```
+
+10. Run the Phase60 fixed-pressure minimal sweep (replay concurrency sweep with baseline + resume support):
+
+```bash
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+BENCH_PHASE60_TS=$TS \
+BENCH_PHASE60_SWEEP_CONCURRENCIES="1 2 4" \
+BENCH_PHASE60_PRESSURE_POPULATE_CONCURRENCY=2 \
+BENCH_PHASE60_PRESSURE_THRASH_CONCURRENCY=2 \
+BENCH_PHASE60_BASELINE_REPLAY_CONCURRENCY=1 \
+BENCH_PHASE60_FORCE_NEW_SUMMARY=true \
+scripts/bench_phase60_rehydrate_minimal_sweep.sh
+```
+
 Artifacts are written under `bench/results/<run_id>/`.
 
 ## Validated Bring-Up Notes (2026-02-08)
@@ -99,6 +121,7 @@ Artifacts are written under `bench/results/<run_id>/`.
   - KVBM metrics snapshots/deltas
   - phase delta artifacts for KVBM metrics + OS I/O (`phase_deltas/`)
   - `reuse_verify` scenario for identical-request prefix-reuse checks
+  - `rehydrate_replay` scenario for phase-structured populate/thrash/replay validation
   - `local_copilot_burst` workload with deterministic `request_manifest.jsonl` (`prefix_hash`, `session_id`)
   - request identity hashes (prompt bytes + generation params)
   - `--tier-mode {B0,B1,B2}` + `--kv-mode {off,cpu_only,cpu_disk}`
@@ -113,6 +136,7 @@ Artifacts are written under `bench/results/<run_id>/`.
 - `scripts/bench_*.sh`: operator wrappers for container lifecycle, health checks, smoke runs, and matrix execution.
 - `scripts/bench_start_nats.sh`, `scripts/bench_wait_nats_ready.sh`, `scripts/bench_stop_nats.sh`: NATS control-plane runbook helpers.
 - `scripts/bench_run_mode_compare.sh`: mode-controlled baseline vs offload runs.
+- `scripts/bench_phase60_rehydrate_minimal_sweep.sh`: fixed-pressure replay-concurrency sweep with baseline/SLO persistence and resume checkpoints.
 - `images/dyn/`: benchmark container Docker build context.
 - `kvbm/kvbm_llm_api_config.yaml`: tracked KVBM template used by `scripts/bench_prepare_host.sh`.
 
