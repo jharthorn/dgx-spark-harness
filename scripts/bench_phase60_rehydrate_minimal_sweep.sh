@@ -37,6 +37,10 @@ KVBM_CACHE_BASE_DIR="${BENCH_KVBM_CACHE_BASE_DIR:-/mnt/nvme/kvbm/phase60_minimal
 PRESSURE_POPULATE_CONC="${BENCH_PHASE60_PRESSURE_POPULATE_CONCURRENCY:-2}"
 PRESSURE_THRASH_CONC="${BENCH_PHASE60_PRESSURE_THRASH_CONCURRENCY:-2}"
 BASELINE_REPLAY_CONC="${BENCH_PHASE60_BASELINE_REPLAY_CONCURRENCY:-1}"
+IO_ATTRIB="${BENCH_PHASE60_IO_ATTRIB:-0}"
+IO_ATTRIB_INTERVAL_S="${BENCH_PHASE60_IO_ATTRIB_INTERVAL_S:-1}"
+IO_ATTRIB_CHECKER="${REPO_ROOT}/scripts/check_io_attrib_replay.py"
+INCLUDE_B0="${BENCH_PHASE60_INCLUDE_B0:-0}"
 
 # Preflight defaults inherit full-shape pressure so mechanism signals are comparable.
 PREFLIGHT_POP_SESSIONS="${BENCH_PHASE60_PREFLIGHT_POPULATE_SESSIONS:-${POP_SESSIONS}}"
@@ -51,6 +55,7 @@ FAILED_B2_C1_RUN="${BENCH_PHASE60_FAILED_B2_C1_RUN:-${RESULTS_ROOT}/phase60_rehy
 
 DIAG_JSON="${RESULTS_ROOT}/phase60_sweep_b2c1_failure_diagnosis_${TS}.json"
 SWEEP_SUMMARY_JSON="${RESULTS_ROOT}/phase60_rehydrate_concurrency_sweep_summary_minimal_${TS}.json"
+SWEEP_SUMMARY_CSV="${RESULTS_ROOT}/phase60_rehydrate_concurrency_sweep_summary_minimal_${TS}.csv"
 STOP_VERDICT_JSON="${RESULTS_ROOT}/phase60_matrix_stop_verdict_minimal_${TS}.json"
 RESUME_FROM="${BENCH_PHASE60_RESUME_FROM:-}"
 RESUME_SKIP_COMPLETED="${BENCH_PHASE60_RESUME_SKIP_COMPLETED:-true}"
@@ -139,7 +144,7 @@ obj["stop_detail"] = detail
 obj["stopped_at"] = {"mode": mode, "concurrency": conc}
 obj.setdefault("baseline_b2_replay_p95_ms_at_concurrency1", None)
 obj.setdefault("slo_replay_p95_ms", None)
-obj.setdefault("max_concurrency_meeting_slo", {"B1": None, "B2": None})
+obj.setdefault("max_concurrency_meeting_slo", {"B0": None, "B1": None, "B2": None})
 path.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
 PY
 }
@@ -150,6 +155,11 @@ is_truthy() {
     *) return 1 ;;
   esac
 }
+
+INCLUDE_B0_ENABLED="0"
+if is_truthy "${INCLUDE_B0}"; then
+  INCLUDE_B0_ENABLED="1"
+fi
 
 summary_upsert_row() {
   local row_json="$1"
@@ -255,7 +265,10 @@ replay_ttft = (phases.get("replay", {}) or {}).get("ttft_ms") or {}
 replay_lat = (phases.get("replay", {}) or {}).get("latency_ms") or {}
 
 def load_json(path):
-    return json.loads(path.read_text())
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
 
 replay_kv = load_json(run_dir / "phase_deltas/phase_replay_kvbm_metrics_delta.json")
 replay2_kv_path = run_dir / "phase_deltas/phase_replay_2_kvbm_metrics_delta.json"
@@ -263,6 +276,25 @@ replay2_kv = load_json(replay2_kv_path) if replay2_kv_path.exists() else {}
 replay_io = load_json(run_dir / "phase_deltas/phase_replay_os_io_delta.json")
 replay2_io_path = run_dir / "phase_deltas/phase_replay_2_os_io_delta.json"
 replay2_io = load_json(replay2_io_path) if replay2_io_path.exists() else {}
+
+kvbm_status = summary.get("kvbm_metrics_status")
+if not isinstance(kvbm_status, dict):
+    kvbm_status = ((summary.get("kvbm_metrics") or {}).get("kvbm_metrics_status")) if isinstance(summary.get("kvbm_metrics"), dict) else {}
+if not isinstance(kvbm_status, dict):
+    kvbm_status = {}
+kvbm_ok = str(kvbm_status.get("status") or "") == "ok"
+
+phase_io_gib = {}
+for phase_name, phase_payload in phases.items():
+    if not isinstance(phase_payload, dict):
+        continue
+    io = phase_payload.get("io_delta") or {}
+    read_mib = float(io.get("read_mib_delta") or 0.0)
+    write_mib = float(io.get("write_mib_delta") or 0.0)
+    phase_io_gib[str(phase_name)] = {
+        "read_gib": round(read_mib / 1024.0, 6),
+        "write_gib": round(write_mib / 1024.0, 6),
+    }
 
 rb = replay_io.get("block_device_delta", {})
 rb2 = replay2_io.get("block_device_delta", {})
@@ -283,6 +315,10 @@ def sha256(path: pathlib.Path) -> str:
     return h.hexdigest()
 
 payload = {
+    "mode": summary.get("mode") or summary.get("tier_mode") or ((config.get("tier_mode")) if isinstance(config, dict) else None),
+    "kvbm_enabled": bool(summary.get("kvbm_enabled")) if "kvbm_enabled" in summary else bool(((summary.get("kv_mode") or {}).get("kvbm_enabled"))),
+    "kvbm_metrics_available": bool(summary.get("kvbm_metrics_available")) if "kvbm_metrics_available" in summary else bool(((summary.get("kvbm_metrics") or {}).get("available"))),
+    "kvbm_metrics_status": kvbm_status,
     "run_path": str(run_dir),
     "error_rate": overall.get("error_rate"),
     "overall_ttft_ms": {
@@ -301,13 +337,22 @@ payload = {
         "p99": replay_lat.get("p99"),
     },
     "mechanism": {
-        "kvbm_matched_tokens_delta_replay_plus_replay2": (replay_kv.get("kvbm_matched_tokens_delta") or 0.0) + (replay2_kv.get("kvbm_matched_tokens_delta") or 0.0),
-        "kvbm_onboard_blocks_d2d_delta_replay_plus_replay2": (replay_kv.get("kvbm_onboard_blocks_d2d_delta") or 0.0) + (replay2_kv.get("kvbm_onboard_blocks_d2d_delta") or 0.0),
+        "kvbm_matched_tokens_delta_replay_plus_replay2": (
+            (replay_kv.get("kvbm_matched_tokens_delta") or 0.0) + (replay2_kv.get("kvbm_matched_tokens_delta") or 0.0)
+            if kvbm_ok
+            else None
+        ),
+        "kvbm_onboard_blocks_d2d_delta_replay_plus_replay2": (
+            (replay_kv.get("kvbm_onboard_blocks_d2d_delta") or 0.0) + (replay2_kv.get("kvbm_onboard_blocks_d2d_delta") or 0.0)
+            if kvbm_ok
+            else None
+        ),
         "block_read_bytes_delta_replay_plus_replay2": (rb.get("read_bytes_delta") or 0) + (rb2.get("read_bytes_delta") or 0),
         "block_write_bytes_delta_replay_plus_replay2": (rb.get("write_bytes_delta") or 0) + (rb2.get("write_bytes_delta") or 0),
         "cgroup_read_bytes_delta_replay_plus_replay2": (wb.get("cgroup_read_bytes_delta") or 0) + (wb2.get("cgroup_read_bytes_delta") or 0),
         "cgroup_write_bytes_delta_replay_plus_replay2": (wb.get("cgroup_write_bytes_delta") or 0) + (wb2.get("cgroup_write_bytes_delta") or 0),
     },
+    "phase_io_gib": phase_io_gib,
     "manifest_hashes": {
         "request_manifest_sha256": sha256(request_manifest),
         "prompts_manifest_sha256": sha256(prompts_manifest),
@@ -334,6 +379,9 @@ payload = {
         "diagnostic_disable_disk_offload_filter": ((config.get("args") or {}).get("diagnostic_disable_disk_offload_filter")),
     },
     "nvme_artifacts": {},
+    "device_metadata_post": None,
+    "io_attribution": None,
+    "io_attribution_verdict": None,
 }
 
 for name in ("nvme_identity.json", "nvme_smart_pre.json", "nvme_smart_post.json"):
@@ -345,6 +393,100 @@ for name in ("nvme_identity.json", "nvme_smart_pre.json", "nvme_smart_post.json"
             "payload_ok": d.get("payload_ok"),
             "format": d.get("format"),
         }
+
+device_metadata_post_path = run_dir / "device_metadata_post.json"
+if device_metadata_post_path.exists():
+    try:
+        dmp = json.loads(device_metadata_post_path.read_text())
+        dmp_summary = dmp.get("primary_storage_summary") or {}
+        dmp_targets = dmp.get("resolved_targets") or {}
+        payload["device_metadata_post"] = {
+            "available": True,
+            "capture_timestamp": dmp.get("capture_timestamp"),
+            "capture_error_count": len(dmp.get("capture_errors") or []),
+            "primary_nvme_device": dmp.get("primary_nvme_device") or dmp_targets.get("primary_nvme_device"),
+            "primary_nvme_namespace": dmp.get("primary_nvme_namespace") or dmp_targets.get("primary_nvme_namespace"),
+            "primary_nvme_model": dmp_summary.get("model"),
+            "primary_nvme_fw": dmp_summary.get("firmware_rev"),
+            "primary_nvme_serial": dmp_summary.get("serial"),
+            "primary_nvme_size": dmp_summary.get("size"),
+            "pcie_link": dmp_summary.get("pcie_link"),
+        }
+    except Exception as exc:
+        payload["device_metadata_post"] = {
+            "available": False,
+            "error": str(exc),
+        }
+else:
+    payload["device_metadata_post"] = {
+        "available": False,
+        "error": "missing_device_metadata_post",
+    }
+
+io_report_path = run_dir / "io" / "io_attribution_report.json"
+if io_report_path.exists():
+    io_rep = json.loads(io_report_path.read_text())
+    block_by_phase = io_rep.get("block_io_by_phase") or {}
+    proc_by_phase = io_rep.get("process_io_by_phase") or {}
+    replay_phase = None
+    for candidate in ("replay", "replay_A"):
+        if candidate in block_by_phase or candidate in proc_by_phase:
+            replay_phase = candidate
+            break
+    if replay_phase is None:
+        replay_like = sorted(
+            name
+            for name in set(block_by_phase.keys()) | set(proc_by_phase.keys())
+            if str(name).startswith("replay")
+        )
+        replay_phase = replay_like[0] if replay_like else None
+    replay_block = ((block_by_phase or {}).get(replay_phase) or {}) if replay_phase else {}
+    replay_proc = ((proc_by_phase or {}).get(replay_phase) or {}) if replay_phase else {}
+    payload["io_attribution"] = {
+        "available": io_rep.get("available"),
+        "capture_error_count": len(io_rep.get("capture_errors") or []),
+        "kvbm_disk_path": io_rep.get("kvbm_disk_path"),
+        "replay_phase": replay_phase,
+        "replay_block_read_bytes": replay_block.get("read_bytes"),
+        "replay_process_read_bytes": replay_proc.get("read_bytes"),
+    }
+
+io_verdict_path = run_dir / "io" / "io_attrib_verdict.json"
+if io_verdict_path.exists():
+    try:
+        verdict = json.loads(io_verdict_path.read_text())
+        checks = verdict.get("checks") if isinstance(verdict.get("checks"), list) else []
+        failed = [c for c in checks if isinstance(c, dict) and c.get("status") == "FAIL"]
+        warns = [c for c in checks if isinstance(c, dict) and c.get("status") == "WARN"]
+        payload["io_attribution_verdict"] = {
+            "available": True,
+            "pass": bool(verdict.get("pass")),
+            "mode": verdict.get("mode"),
+            "strict_replay_gate_required": bool(verdict.get("strict_replay_gate_required")),
+            "replay_phase": verdict.get("replay_phase"),
+            "replay_read_bytes_block": verdict.get("replay_read_bytes_block"),
+            "replay_read_bytes_process_total": verdict.get("replay_read_bytes_process_total"),
+            "top_pids_replay": list(verdict.get("top_pids_replay") or []),
+            "fail_count": len(failed),
+            "warn_count": len(warns),
+            "failed_checks": [str(c.get("name")) for c in failed if c.get("name")],
+            "warn_checks": [str(c.get("name")) for c in warns if c.get("name")],
+            "checks": checks,
+            "timestamp_utc": verdict.get("timestamp_utc"),
+            "verdict_path": str(io_verdict_path),
+        }
+    except Exception as exc:
+        payload["io_attribution_verdict"] = {
+            "available": False,
+            "error": f"failed_to_parse_io_attrib_verdict:{exc}",
+            "verdict_path": str(io_verdict_path),
+        }
+else:
+    payload["io_attribution_verdict"] = {
+        "available": False,
+        "error": "missing_io_attrib_verdict",
+        "verdict_path": str(io_verdict_path),
+    }
 
 print(json.dumps(payload, separators=(",", ":")))
 PY
@@ -365,7 +507,9 @@ run_probe() {
   local gen_tokens="${12}"
   local log_path="${LOG_DIR}/${bundle_id}.log"
 
-  mk_cache_dir "${cache_dir}"
+  if [[ "${mode}" != "B0" && -n "${cache_dir}" ]]; then
+    mk_cache_dir "${cache_dir}"
+  fi
   {
     echo "==== $(date -u +%Y-%m-%dT%H:%M:%SZ) run_probe start mode=${mode} bundle=${bundle_id} run=${run_id} replay_conc=${replay_conc} pressure_populate_conc=${PRESSURE_POPULATE_CONC} pressure_thrash_conc=${PRESSURE_THRASH_CONC} cache_dir=${cache_dir} disable_filter=${disable_filter} ===="
   } >> "${log_path}"
@@ -396,6 +540,8 @@ run_probe() {
   BENCH_PHASE56_METRICS_SYSTEM_PORT="8081" \
   BENCH_PHASE56_METRICS_KVBM_PORT="6880" \
   BENCH_PHASE56_DISABLE_DISK_OFFLOAD_FILTER="${disable_filter}" \
+  BENCH_PHASE56_IO_ATTRIB="${IO_ATTRIB}" \
+  BENCH_PHASE56_IO_ATTRIB_INTERVAL_S="${IO_ATTRIB_INTERVAL_S}" \
   DYN_KVBM_DISK_CACHE_DIR="${cache_dir}" \
   BENCH_CONTAINER_NAME="${CONTAINER_NAME}" \
   scripts/bench_phase56_like_probe_trtllm.sh >> "${log_path}" 2>&1
@@ -407,8 +553,30 @@ run_probe() {
     return "${rc}"
   fi
 
+  local run_dir="${RESULTS_ROOT}/${bundle_id}/${run_id}"
+  if is_truthy "${IO_ATTRIB}"; then
+    {
+      echo "==== $(date -u +%Y-%m-%dT%H:%M:%SZ) io_attrib_checker start mode=${mode} bundle=${bundle_id} ===="
+    } >> "${log_path}"
+    local io_check_rc=0
+    if [[ "${mode}" == "B0" ]]; then
+      echo "==== $(date -u +%Y-%m-%dT%H:%M:%SZ) io_attrib_checker skipped mode=${mode} (strict replay gate disabled for B0) ====" >> "${log_path}"
+    else
+      set +e
+      "${PYTHON_BIN}" "${IO_ATTRIB_CHECKER}" --run-dir "${run_dir}" --expect-report >> "${log_path}" 2>&1
+      io_check_rc=$?
+      set -e
+    fi
+    {
+      echo "==== $(date -u +%Y-%m-%dT%H:%M:%SZ) io_attrib_checker done mode=${mode} bundle=${bundle_id} rc=${io_check_rc} ===="
+    } >> "${log_path}"
+    if (( io_check_rc != 0 )); then
+      echo "io_attrib_checker_failed:${mode}:${bundle_id}:rc=${io_check_rc}" >&2
+    fi
+  fi
+
   echo "==== $(date -u +%Y-%m-%dT%H:%M:%SZ) run_probe success mode=${mode} bundle=${bundle_id} ====" >> "${log_path}"
-  echo "${RESULTS_ROOT}/${bundle_id}/${run_id}"
+  echo "${run_dir}"
 }
 
 mechanism_gate_any_positive() {
@@ -473,6 +641,39 @@ if errs:
     print("FAIL:" + ";".join(errs))
 else:
     print("OK")
+PY
+}
+
+validate_io_attrib_point() {
+  local mode="$1"
+  local metrics_json="$2"
+  if ! is_truthy "${IO_ATTRIB}"; then
+    echo "OK"
+    return 0
+  fi
+  if [[ "${mode}" == "B0" ]]; then
+    echo "OK"
+    return 0
+  fi
+  "${PYTHON_BIN}" - "${metrics_json}" <<'PY'
+import json
+import sys
+
+obj = json.loads(sys.argv[1])
+verdict = obj.get("io_attribution_verdict") if isinstance(obj.get("io_attribution_verdict"), dict) else {}
+if not verdict.get("available"):
+    reason = verdict.get("error") or "io_attrib_verdict_unavailable"
+    print(f"FAIL:{reason}")
+    raise SystemExit(0)
+if verdict.get("pass") is True:
+    print("OK")
+    raise SystemExit(0)
+
+failed_checks = list(verdict.get("failed_checks") or [])
+if failed_checks:
+    print("FAIL:" + ",".join(str(item) for item in failed_checks))
+else:
+    print("FAIL:io_attrib_replay_gate_failed")
 PY
 }
 
@@ -666,7 +867,7 @@ if baseline is None:
     obj["stop_detail"] = "Missing valid B2@c1 row"
     obj["baseline_b2_replay_p95_ms_at_concurrency1"] = None
     obj["slo_replay_p95_ms"] = None
-    obj["max_concurrency_meeting_slo"] = {"B1": None, "B2": None}
+    obj["max_concurrency_meeting_slo"] = {"B0": None, "B1": None, "B2": None}
     p.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
     raise SystemExit(0)
 
@@ -674,7 +875,7 @@ slo = float(baseline) * 1.10
 obj["baseline_b2_replay_p95_ms_at_concurrency1"] = baseline
 obj["slo_replay_p95_ms"] = slo
 
-mx = {"B1": 0, "B2": 0}
+mx = {"B0": 0, "B1": 0, "B2": 0}
 for r in obj.get("rows", []):
     if r.get("status") != "ok":
         r["pass_slo"] = None
@@ -694,7 +895,114 @@ p.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
 PY
 }
 
+emit_summary_csv() {
+  if [[ ! -f "${SWEEP_SUMMARY_JSON}" ]]; then
+    return 0
+  fi
+  "${PYTHON_BIN}" - "${SWEEP_SUMMARY_JSON}" "${SWEEP_SUMMARY_CSV}" <<'PY'
+import csv
+import json
+import pathlib
+import sys
+
+summary_path = pathlib.Path(sys.argv[1])
+csv_path = pathlib.Path(sys.argv[2])
+obj = json.loads(summary_path.read_text())
+rows = obj.get("rows") if isinstance(obj.get("rows"), list) else []
+
+fieldnames = [
+    "mode",
+    "concurrency",
+    "status",
+    "pass_slo",
+    "error_rate",
+    "overall_ttft_p95_ms",
+    "overall_ttft_p99_ms",
+    "replay_ttft_p95_ms",
+    "replay_ttft_p99_ms",
+    "populate_read_gib",
+    "populate_write_gib",
+    "thrash_read_gib",
+    "thrash_write_gib",
+    "replay_read_gib",
+    "replay_write_gib",
+    "replay_2_read_gib",
+    "replay_2_write_gib",
+    "kvbm_metrics_status",
+    "kvbm_enabled",
+    "kvbm_metrics_available",
+    "kvbm_matched_tokens_delta_replay_plus_replay2",
+    "kvbm_onboard_blocks_d2d_delta_replay_plus_replay2",
+    "run_path",
+]
+
+def phase_val(phase_io: dict, phase: str, key: str):
+    payload = phase_io.get(phase) if isinstance(phase_io, dict) else {}
+    if isinstance(payload, dict):
+        value = payload.get(key)
+        return "" if value is None else value
+    return ""
+
+with csv_path.open("w", encoding="utf-8", newline="") as fp:
+    writer = csv.DictWriter(fp, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        mode = str(row.get("mode") or "")
+        if mode not in {"B0", "B1", "B2"}:
+            continue
+        kvbm_status = row.get("kvbm_metrics_status") if isinstance(row.get("kvbm_metrics_status"), dict) else {}
+        status = str(kvbm_status.get("status") or "")
+        kvbm_enabled = bool(row.get("kvbm_enabled"))
+        kvbm_available = bool(row.get("kvbm_metrics_available"))
+        if not status:
+            if not kvbm_enabled:
+                status = "skipped"
+            elif kvbm_available:
+                status = "ok"
+            else:
+                status = "unavailable"
+        kvbm_ok = status == "ok"
+        mechanism = row.get("mechanism") if isinstance(row.get("mechanism"), dict) else {}
+        phase_io = row.get("phase_io_gib") if isinstance(row.get("phase_io_gib"), dict) else {}
+        writer.writerow(
+            {
+                "mode": mode,
+                "concurrency": row.get("concurrency"),
+                "status": row.get("status"),
+                "pass_slo": row.get("pass_slo"),
+                "error_rate": row.get("error_rate"),
+                "overall_ttft_p95_ms": ((row.get("overall_ttft_ms") or {}).get("p95")),
+                "overall_ttft_p99_ms": ((row.get("overall_ttft_ms") or {}).get("p99")),
+                "replay_ttft_p95_ms": ((row.get("replay_ttft_ms") or {}).get("p95")),
+                "replay_ttft_p99_ms": ((row.get("replay_ttft_ms") or {}).get("p99")),
+                "populate_read_gib": phase_val(phase_io, "populate", "read_gib"),
+                "populate_write_gib": phase_val(phase_io, "populate", "write_gib"),
+                "thrash_read_gib": phase_val(phase_io, "thrash", "read_gib"),
+                "thrash_write_gib": phase_val(phase_io, "thrash", "write_gib"),
+                "replay_read_gib": phase_val(phase_io, "replay", "read_gib"),
+                "replay_write_gib": phase_val(phase_io, "replay", "write_gib"),
+                "replay_2_read_gib": phase_val(phase_io, "replay_2", "read_gib"),
+                "replay_2_write_gib": phase_val(phase_io, "replay_2", "write_gib"),
+                "kvbm_metrics_status": status,
+                "kvbm_enabled": kvbm_enabled,
+                "kvbm_metrics_available": kvbm_available,
+                "kvbm_matched_tokens_delta_replay_plus_replay2": (
+                    mechanism.get("kvbm_matched_tokens_delta_replay_plus_replay2") if kvbm_ok else ""
+                ),
+                "kvbm_onboard_blocks_d2d_delta_replay_plus_replay2": (
+                    mechanism.get("kvbm_onboard_blocks_d2d_delta_replay_plus_replay2") if kvbm_ok else ""
+                ),
+                "run_path": row.get("run_path"),
+            }
+        )
+print(csv_path)
+PY
+}
+
 ensure_container
+trap 'emit_summary_csv >/dev/null 2>&1 || true' EXIT
 emit_diagnosis "${KNOWN_GOOD_B2_RUN}" "${FAILED_B2_C1_RUN}" "${DIAG_JSON}"
 
 KNOWN_METRICS_JSON="$(collect_run_metrics "${KNOWN_GOOD_B2_RUN}")"
@@ -710,13 +1018,20 @@ PY
 )"
 
 if [[ -f "${SWEEP_SUMMARY_JSON}" ]] && ! is_truthy "${FORCE_NEW_SUMMARY}"; then
-  "${PYTHON_BIN}" - "${SWEEP_SUMMARY_JSON}" "${TS}" "${DIAG_JSON}" "${KNOWN_GOOD_B2_RUN}" "${CONC_LIST}" "${PRESSURE_POPULATE_CONC}" "${PRESSURE_THRASH_CONC}" "${BASELINE_REPLAY_CONC}" "${RESUME_FROM}" <<'PY'
+  "${PYTHON_BIN}" - "${SWEEP_SUMMARY_JSON}" "${TS}" "${DIAG_JSON}" "${KNOWN_GOOD_B2_RUN}" "${CONC_LIST}" "${PRESSURE_POPULATE_CONC}" "${PRESSURE_THRASH_CONC}" "${BASELINE_REPLAY_CONC}" "${RESUME_FROM}" "${IO_ATTRIB}" "${IO_ATTRIB_INTERVAL_S}" "${INCLUDE_B0_ENABLED}" <<'PY'
 import json
 import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
 sweep_concs = [int(x) for x in str(sys.argv[5]).split() if x.strip()]
+
+def to_bool(raw: str) -> bool:
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+include_b0 = to_bool(sys.argv[12])
+run_order = ["B2", "B1"] + (["B0"] if include_b0 else [])
+
 obj = json.loads(path.read_text())
 meta = obj.setdefault("meta", {})
 meta.update(
@@ -730,6 +1045,10 @@ meta.update(
         "baseline_replay_concurrency": int(sys.argv[8]),
         "pressure_populate_concurrency": int(sys.argv[6]),
         "pressure_thrash_concurrency": int(sys.argv[7]),
+        "io_attrib_enabled": to_bool(sys.argv[10]),
+        "io_attrib_interval_s": float(sys.argv[11]),
+        "include_b0": include_b0,
+        "run_order_per_concurrency": run_order,
         "slo_definition": "replay_p95_ms <= (baseline_B2_replay_p95_ms_at_concurrency1 * 1.10)",
         "diagnosis_json": sys.argv[3],
         "known_good_b2_run": sys.argv[4],
@@ -744,16 +1063,23 @@ obj["stopped_at"] = None
 obj.setdefault("rows", [])
 obj.setdefault("baseline_b2_replay_p95_ms_at_concurrency1", None)
 obj.setdefault("slo_replay_p95_ms", None)
-obj.setdefault("max_concurrency_meeting_slo", {"B1": None, "B2": None})
+obj.setdefault("max_concurrency_meeting_slo", {"B0": None, "B1": None, "B2": None})
 path.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
 PY
 else
-  "${PYTHON_BIN}" - "${SWEEP_SUMMARY_JSON}" "${TS}" "${DIAG_JSON}" "${KNOWN_GOOD_B2_RUN}" "${CONC_LIST}" "${PRESSURE_POPULATE_CONC}" "${PRESSURE_THRASH_CONC}" "${BASELINE_REPLAY_CONC}" "${RESUME_FROM}" <<'PY'
+  "${PYTHON_BIN}" - "${SWEEP_SUMMARY_JSON}" "${TS}" "${DIAG_JSON}" "${KNOWN_GOOD_B2_RUN}" "${CONC_LIST}" "${PRESSURE_POPULATE_CONC}" "${PRESSURE_THRASH_CONC}" "${BASELINE_REPLAY_CONC}" "${RESUME_FROM}" "${IO_ATTRIB}" "${IO_ATTRIB_INTERVAL_S}" "${INCLUDE_B0_ENABLED}" <<'PY'
 import json
 import pathlib
 import sys
 path = pathlib.Path(sys.argv[1])
 sweep_concs = [int(x) for x in str(sys.argv[5]).split() if x.strip()]
+
+def to_bool(raw: str) -> bool:
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+include_b0 = to_bool(sys.argv[12])
+run_order = ["B2", "B1"] + (["B0"] if include_b0 else [])
+
 payload = {
     "meta": {
         "created_utc": sys.argv[2],
@@ -765,6 +1091,10 @@ payload = {
         "baseline_replay_concurrency": int(sys.argv[8]),
         "pressure_populate_concurrency": int(sys.argv[6]),
         "pressure_thrash_concurrency": int(sys.argv[7]),
+        "io_attrib_enabled": to_bool(sys.argv[10]),
+        "io_attrib_interval_s": float(sys.argv[11]),
+        "include_b0": include_b0,
+        "run_order_per_concurrency": run_order,
         "slo_definition": "replay_p95_ms <= (baseline_B2_replay_p95_ms_at_concurrency1 * 1.10)",
         "diagnosis_json": sys.argv[3],
         "known_good_b2_run": sys.argv[4],
@@ -775,7 +1105,7 @@ payload = {
     "decision_grade": None,
     "baseline_b2_replay_p95_ms_at_concurrency1": None,
     "slo_replay_p95_ms": None,
-    "max_concurrency_meeting_slo": {"B1": None, "B2": None},
+    "max_concurrency_meeting_slo": {"B0": None, "B1": None, "B2": None},
 }
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
@@ -784,11 +1114,11 @@ fi
 RESUME_FROM_NORMALIZED=""
 resume_gate_open="true"
 if [[ -n "${RESUME_FROM}" ]]; then
-  if [[ "${RESUME_FROM}" =~ ^([Bb][12])_[Cc]([0-9]+)$ ]]; then
+  if [[ "${RESUME_FROM}" =~ ^([Bb][012])_[Cc]([0-9]+)$ ]]; then
     RESUME_FROM_NORMALIZED="${BASH_REMATCH[1]^^}_c${BASH_REMATCH[2]}"
     resume_gate_open="false"
   else
-    echo "Invalid BENCH_PHASE60_RESUME_FROM='${RESUME_FROM}'. Expected like B2_c2." >&2
+    echo "Invalid BENCH_PHASE60_RESUME_FROM='${RESUME_FROM}'. Expected like B2_c2 or B0_c2." >&2
     exit 2
   fi
 fi
@@ -821,6 +1151,27 @@ if ! summary_has_baseline; then
     exit 2
   }
   pre_metrics_json="$(collect_run_metrics "${pre_run_dir}")"
+pre_io_valid="$(validate_io_attrib_point "B2" "${pre_metrics_json}")"
+  if [[ "${pre_io_valid}" != "OK" ]]; then
+    pre_io_row="$("${PYTHON_BIN}" - "${pre_metrics_json}" "${BASELINE_REPLAY_CONC}" "${pre_cache}" "${pre_io_valid}" <<'PY'
+import json,sys
+m=json.loads(sys.argv[1])
+m["mode"]="B2"
+m["concurrency"]=int(sys.argv[2])
+m["replay_concurrency"]=int(sys.argv[2])
+m["status"]="invalid_io_attrib"
+m["phase"]="baseline_preflight"
+m["validation"]=sys.argv[4]
+m["disk_offload_filter_disabled"]=False
+m["kvbm_cache_dir"]=sys.argv[3]
+print(json.dumps(m,separators=(",",":")))
+PY
+)"
+    summary_upsert_row "${pre_io_row}" "baseline_preflight_B2_c${BASELINE_REPLAY_CONC}"
+    update_summary_stop "io_attrib_replay_gate_failed" "${pre_io_valid}" "B2" "${BASELINE_REPLAY_CONC}"
+    emit_stop_verdict "io_attrib_replay_gate_failed" "${pre_io_valid}" "B2" "${BASELINE_REPLAY_CONC}"
+    exit 2
+  fi
   pre_ok="$(mechanism_gate_any_positive "${pre_metrics_json}")"
   if [[ "${pre_ok}" != "1" ]]; then
     pre_row="$("${PYTHON_BIN}" - "${pre_metrics_json}" "${BASELINE_REPLAY_CONC}" "${pre_cache}" <<'PY'
@@ -893,6 +1244,28 @@ print(json.dumps(m,separators=(",",":")))
 PY
 )"
     summary_upsert_row "${b2_partial_row}" "${point_key_b2}"
+
+    b2_io_valid="$(validate_io_attrib_point "B2" "${b2_metrics_json}")"
+    if [[ "${b2_io_valid}" != "OK" ]]; then
+      b2_invalid_io_row="$("${PYTHON_BIN}" - "${b2_metrics_json}" "${conc}" "${b2_cache}" "${b2_io_valid}" <<'PY'
+import json,sys
+m=json.loads(sys.argv[1])
+m["mode"]="B2"
+m["concurrency"]=int(sys.argv[2])
+m["replay_concurrency"]=int(sys.argv[2])
+m["status"]="invalid_io_attrib"
+m["phase"]="sweep_point"
+m["validation"]=sys.argv[4]
+m["disk_offload_filter_disabled"]=False
+m["kvbm_cache_dir"]=sys.argv[3]
+print(json.dumps(m,separators=(",",":")))
+PY
+)"
+      summary_upsert_row "${b2_invalid_io_row}" "${point_key_b2}"
+      update_summary_stop "io_attrib_replay_gate_failed" "${b2_io_valid}" "B2" "${conc}"
+      emit_stop_verdict "io_attrib_replay_gate_failed" "${b2_io_valid}" "B2" "${conc}"
+      exit 2
+    fi
 
     b2_valid="$(validate_full_point "B2" "${b2_metrics_json}")"
     if [[ "${b2_valid}" != "OK" ]]; then
@@ -994,6 +1367,28 @@ PY
 )"
     summary_upsert_row "${b1_partial_row}" "${point_key_b1}"
 
+    b1_io_valid="$(validate_io_attrib_point "B1" "${b1_metrics_json}")"
+    if [[ "${b1_io_valid}" != "OK" ]]; then
+      b1_invalid_io_row="$("${PYTHON_BIN}" - "${b1_metrics_json}" "${conc}" "${b1_cache}" "${b1_io_valid}" <<'PY'
+import json,sys
+m=json.loads(sys.argv[1])
+m["mode"]="B1"
+m["concurrency"]=int(sys.argv[2])
+m["replay_concurrency"]=int(sys.argv[2])
+m["status"]="invalid_io_attrib"
+m["phase"]="sweep_point"
+m["validation"]=sys.argv[4]
+m["disk_offload_filter_disabled"]=False
+m["kvbm_cache_dir"]=sys.argv[3]
+print(json.dumps(m,separators=(",",":")))
+PY
+)"
+      summary_upsert_row "${b1_invalid_io_row}" "${point_key_b1}"
+      update_summary_stop "io_attrib_replay_gate_failed" "${b1_io_valid}" "B1" "${conc}"
+      emit_stop_verdict "io_attrib_replay_gate_failed" "${b1_io_valid}" "B1" "${conc}"
+      exit 2
+    fi
+
     b1_valid="$(validate_full_point "B1" "${b1_metrics_json}")"
     if [[ "${b1_valid}" != "OK" ]]; then
       b1_invalid_row="$("${PYTHON_BIN}" - "${b1_metrics_json}" "${conc}" "${b1_cache}" "${b1_valid}" <<'PY'
@@ -1031,11 +1426,101 @@ PY
 )"
     summary_upsert_row "${b1_ok_row}" "${point_key_b1}"
   fi
+
+  if [[ "${INCLUDE_B0_ENABLED}" == "1" ]]; then
+    point_key_b0="B0_c${conc}"
+    if should_run_point "B0" "${conc}"; then
+      b0_bundle="phase60_rehydrate_minimal_sweep_B0_c${conc}_${TS}"
+      b0_run="run_B0_c${conc}_${TS}"
+      b0_cache=""
+      b0_run_dir="$(run_probe "B0" "${b0_bundle}" "${b0_run}" "${conc}" "${b0_cache}" "false" "${POP_SESSIONS}" "${THRASH_SESSIONS}" "${TURNS}" "${PREFIX_TOKENS}" "${REPLAY_REPEATS}" "${REHYDRATE_GEN_TOKENS}")" || {
+        update_summary_stop "probe_failed" "B0 full point failed to execute" "B0" "${conc}"
+        emit_stop_verdict "probe_failed" "B0 full point failed to execute" "B0" "${conc}"
+        exit 2
+      }
+      b0_metrics_json="$(collect_run_metrics "${b0_run_dir}")"
+      b0_partial_row="$("${PYTHON_BIN}" - "${b0_metrics_json}" "${conc}" "${b0_cache}" <<'PY'
+import json,sys
+m=json.loads(sys.argv[1])
+m["mode"]="B0"
+m["concurrency"]=int(sys.argv[2])
+m["replay_concurrency"]=int(sys.argv[2])
+m["status"]="partial"
+m["phase"]="sweep_point"
+m["disk_offload_filter_disabled"]=False
+m["kvbm_cache_dir"]=sys.argv[3]
+print(json.dumps(m,separators=(",",":")))
+PY
+)"
+      summary_upsert_row "${b0_partial_row}" "${point_key_b0}"
+
+      b0_io_valid="$(validate_io_attrib_point "B0" "${b0_metrics_json}")"
+      if [[ "${b0_io_valid}" != "OK" ]]; then
+        b0_invalid_io_row="$("${PYTHON_BIN}" - "${b0_metrics_json}" "${conc}" "${b0_cache}" "${b0_io_valid}" <<'PY'
+import json,sys
+m=json.loads(sys.argv[1])
+m["mode"]="B0"
+m["concurrency"]=int(sys.argv[2])
+m["replay_concurrency"]=int(sys.argv[2])
+m["status"]="invalid_io_attrib"
+m["phase"]="sweep_point"
+m["validation"]=sys.argv[4]
+m["disk_offload_filter_disabled"]=False
+m["kvbm_cache_dir"]=sys.argv[3]
+print(json.dumps(m,separators=(",",":")))
+PY
+)"
+        summary_upsert_row "${b0_invalid_io_row}" "${point_key_b0}"
+        update_summary_stop "io_attrib_replay_gate_failed" "${b0_io_valid}" "B0" "${conc}"
+        emit_stop_verdict "io_attrib_replay_gate_failed" "${b0_io_valid}" "B0" "${conc}"
+        exit 2
+      fi
+
+      b0_valid="$(validate_full_point "B0" "${b0_metrics_json}")"
+      if [[ "${b0_valid}" != "OK" ]]; then
+        b0_invalid_row="$("${PYTHON_BIN}" - "${b0_metrics_json}" "${conc}" "${b0_cache}" "${b0_valid}" <<'PY'
+import json,sys
+m=json.loads(sys.argv[1])
+m["mode"]="B0"
+m["concurrency"]=int(sys.argv[2])
+m["replay_concurrency"]=int(sys.argv[2])
+m["status"]="invalid_full"
+m["phase"]="sweep_point"
+m["validation"]=sys.argv[4]
+m["disk_offload_filter_disabled"]=False
+m["kvbm_cache_dir"]=sys.argv[3]
+print(json.dumps(m,separators=(",",":")))
+PY
+)"
+        summary_upsert_row "${b0_invalid_row}" "${point_key_b0}"
+        update_summary_stop "point_invalid" "${b0_valid}" "B0" "${conc}"
+        emit_stop_verdict "point_invalid" "${b0_valid}" "B0" "${conc}"
+        exit 2
+      fi
+
+      b0_ok_row="$("${PYTHON_BIN}" - "${b0_metrics_json}" "${conc}" "${b0_cache}" <<'PY'
+import json,sys
+m=json.loads(sys.argv[1])
+m["mode"]="B0"
+m["concurrency"]=int(sys.argv[2])
+m["replay_concurrency"]=int(sys.argv[2])
+m["status"]="ok"
+m["phase"]="sweep_point"
+m["disk_offload_filter_disabled"]=False
+m["kvbm_cache_dir"]=sys.argv[3]
+print(json.dumps(m,separators=(",",":")))
+PY
+)"
+      summary_upsert_row "${b0_ok_row}" "${point_key_b0}"
+    fi
+  fi
 done
 
 finalize_sweep_success
+emit_summary_csv >/dev/null
 
 echo "DIAGNOSIS_JSON=${DIAG_JSON}"
 echo "SWEEP_SUMMARY_JSON=${SWEEP_SUMMARY_JSON}"
+echo "SWEEP_SUMMARY_CSV=${SWEEP_SUMMARY_CSV}"
 echo "STOP_VERDICT_JSON=${STOP_VERDICT_JSON}"
 echo "LOG_DIR=${LOG_DIR}"

@@ -41,11 +41,29 @@ VOLUME_ARGS=(
   -v /run/udev:/run/udev:ro
   -v /dev/disk:/dev/disk:ro
 )
-if [[ -f "${KVBM_CONFIG_HOST}" ]]; then
+if [[ "${BENCH_TIER_MODE_RESOLVED}" != "B0" && -f "${KVBM_CONFIG_HOST}" ]]; then
   VOLUME_ARGS+=(-v "${KVBM_CONFIG_HOST}:/tmp/kvbm_llm_api_config.yaml:ro")
 fi
 
 docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+
+ENV_ARGS=(
+  -e BENCH_MODEL_PROFILE="${MODEL_PROFILE}"
+  -e BENCH_TIER_MODE="${BENCH_TIER_MODE_RESOLVED}"
+  -e MODEL_HANDLE="${MODEL_HANDLE}"
+  -e MODEL_NAME="${MODEL_NAME}"
+  -e DYN_SYSTEM_PORT="${DYN_SYSTEM_PORT}"
+  -e CUFILE_ENV_PATH_JSON="${CUFILE_ENV_PATH_JSON:-/etc/cufile/cufile.json}"
+)
+if [[ "${BENCH_TIER_MODE_RESOLVED}" != "B0" ]]; then
+  ENV_ARGS+=(
+    -e DYN_KVBM_CPU_CACHE_GB="${DYN_KVBM_CPU_CACHE_GB}"
+    -e DYN_KVBM_DISK_CACHE_GB="${DYN_KVBM_DISK_CACHE_GB}"
+    -e DYN_KVBM_DISK_CACHE_DIR="${DYN_KVBM_DISK_CACHE_DIR}"
+    -e DYN_KVBM_METRICS="${DYN_KVBM_METRICS}"
+    -e DYN_KVBM_METRICS_PORT="${DYN_KVBM_METRICS_PORT}"
+  )
+fi
 
 docker run -d --name "${CONTAINER_NAME}" \
   --gpus all \
@@ -59,17 +77,7 @@ docker run -d --name "${CONTAINER_NAME}" \
   --cap-add SYS_ADMIN \
   --security-opt seccomp=unconfined \
   --security-opt apparmor=unconfined \
-  -e BENCH_MODEL_PROFILE="${MODEL_PROFILE}" \
-  -e BENCH_TIER_MODE="${BENCH_TIER_MODE_RESOLVED}" \
-  -e MODEL_HANDLE="${MODEL_HANDLE}" \
-  -e MODEL_NAME="${MODEL_NAME}" \
-  -e DYN_KVBM_CPU_CACHE_GB="${DYN_KVBM_CPU_CACHE_GB}" \
-  -e DYN_KVBM_DISK_CACHE_GB="${DYN_KVBM_DISK_CACHE_GB}" \
-  -e DYN_KVBM_DISK_CACHE_DIR="${DYN_KVBM_DISK_CACHE_DIR}" \
-  -e DYN_KVBM_METRICS="${DYN_KVBM_METRICS}" \
-  -e DYN_KVBM_METRICS_PORT="${DYN_KVBM_METRICS_PORT}" \
-  -e DYN_SYSTEM_PORT="${DYN_SYSTEM_PORT}" \
-  -e CUFILE_ENV_PATH_JSON="${CUFILE_ENV_PATH_JSON:-/etc/cufile/cufile.json}" \
+  "${ENV_ARGS[@]}" \
   "${VOLUME_ARGS[@]}" \
   "${IMAGE}" \
   bash -lc "sleep infinity"
@@ -77,4 +85,8 @@ docker run -d --name "${CONTAINER_NAME}" \
 echo "Container started: ${CONTAINER_NAME}"
 echo "Resolved tier/model: tier_mode=${BENCH_TIER_MODE_RESOLVED} model_profile=${MODEL_PROFILE} model_handle=${MODEL_HANDLE}"
 docker ps --filter "name=${CONTAINER_NAME}"
-docker exec "${CONTAINER_NAME}" bash -lc "findmnt -T ${DYN_KVBM_DISK_CACHE_DIR} -o TARGET,SOURCE,FSTYPE,OPTIONS"
+if [[ "${BENCH_TIER_MODE_RESOLVED}" == "B0" ]]; then
+  echo "B0 mode: KVBM cache mount/config check skipped."
+else
+  docker exec "${CONTAINER_NAME}" bash -lc "findmnt -T ${DYN_KVBM_DISK_CACHE_DIR} -o TARGET,SOURCE,FSTYPE,OPTIONS"
+fi

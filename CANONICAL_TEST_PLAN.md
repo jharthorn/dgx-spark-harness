@@ -514,10 +514,14 @@ This gives:
 
 ## Canonical claims we want the data to support
 
-1. Mechanism: KVBM offload/onboard/hit metrics increase in the expected phases. ([NVIDIA Docs][4])
-2. Storage involvement: NVMe reads/writes correlate with those phases.
-3. User experience: TTFT tail improves or max concurrency improves at a fixed SLO.
+1. Mechanism claim (strong): disk-backed replay is verified by A2 PASS rate plus replay NVMe reads in the expected phases. ([NVIDIA Docs][4])
+2. Performance claim (precise): replay latency impact is reported explicitly on TTFC/TTFT p95/p99 with paired deltas and descriptive spread.
+3. Scope claim: effect size is workload-dependent; report where SSD is neutral/hurts/helps and why.
 4. Tradeoffs: identify regimes where SSD hurts (e.g., extra I/O overhead) vs helps.
+
+Reporting note:
+
+* CI95 is an approximate descriptive band computed from pair deltas (not a formal hypothesis test).
 
 ## Canonical charts (repeatable templates)
 

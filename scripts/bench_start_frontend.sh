@@ -31,7 +31,11 @@ if [[ -z "${MODEL_SNAPSHOT}" ]]; then
 fi
 
 case "${KV_MODE}" in
-  off|cpu_only|cpu_disk)
+  off)
+    # B0 must not touch etcd; file-backed store keeps discovery local and shared with worker.
+    STORE_KV_ARG="--store-kv file"
+    ;;
+  cpu_only|cpu_disk)
     STORE_KV_ARG="--store-kv file"
     ;;
   *)

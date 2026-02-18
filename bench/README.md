@@ -11,12 +11,71 @@ This package adds a focused benchmark harness for DGX Spark Dynamo + TRT-LLM + K
   - Includes canonical mode mapping `--tier-mode {B0,B1,B2}` plus `--kv-mode {off,cpu_only,cpu_disk}` metadata.
   - Emits per-phase delta artifacts for KVBM metrics and OS I/O (block device + container/worker IO deltas).
   - Captures NVMe identity + SMART pre/post snapshots into every run bundle.
+  - Optional `--io-attrib` mode writes replay-phase attribution artifacts under `io/`.
   - Enforces prompt preflight guardrails against engine token limits.
   - Marks invalid runs explicitly and emits `report.md`.
 - `bench/prompts.py`: deterministic short/long/mixed and replay prompt generation.
 - `bench/openai_compat.py`: async OpenAI-compatible client (`/v1/models`, `/v1/completions`).
 - `bench/telemetry.py`: Python wrappers around shell collectors.
 - `bench/scripts/*.sh`: iostat/pidstat/GPU/cufile/docker/cache-dir collection scripts.
+
+## Methodology Glossary
+
+- `B0`: KVBM fully disabled (`kv_mode=off`), no KVBM integration in serving stack.
+- `B1`: KVBM enabled with CPU tier only (`kv_mode=cpu_only`).
+- `B2`: KVBM enabled with CPU + SSD tier (`kv_mode=cpu_disk`).
+- `TTFT`: legacy time-to-first-token proxy retained for compatibility.
+- `TTFC`: streaming time to first non-empty streamed chunk/event (primary user-latency metric).
+- `TTFB`: optional time to first response byte/header.
+- `A1`: storage/device metadata capture (`device_metadata_pre.json`, `device_metadata_post.json`).
+- `A2`: replay I/O attribution gate (`io/io_attribution_report.json` + `io/io_attrib_verdict.json`).
+- `pair-local blocked design`: each pair is a local block where both modes run adjacently.
+- `AB/BA counterbalancing`: alternating pair order (`B1_B2`, `B2_B1`) to mitigate order effects.
+- `process_evidence_method`: process attribution source used by A2 verdict (`pid`, `cgroup`, `none`).
+  In containerized setups, `cgroup` is expected and acceptable when per-PID `/proc/<pid>/io` deltas are zero.
+
+## Naming Conventions
+
+- UTC timestamp token: `<ts>=YYYYMMDDTHHMMSSZ`.
+- Phase60 sweep run directories:
+  - `phase60_rehydrate_minimal_sweep_<mode>_c<replay_concurrency>_<ts>`
+  - `phase60_rehydrate_minimal_preflight_B2_c1_<ts>`
+- Phase70 pair leg run directories:
+  - `phase70_rehydrate_pair_<mode>_p<pair_id>_l<pair_leg>_<ts>`
+  - Example: `phase70_rehydrate_pair_B2_p04_l1_<ts>`
+- Phase70 aggregate artifacts:
+  - `phase70_rehydrate_pair_repeats_manifest_<ts>.json`
+  - `phase70_rehydrate_pair_repeats_summary_<ts>.csv`
+  - `phase70_rehydrate_pair_repeats_deltas_<ts>.csv`
+  - `phase70_rehydrate_pair_repeats_order_check_<ts>.json`
+- Delta fields are always `mode_b - mode_a` and encoded as `delta_*`.
+
+## Workload Mapping
+
+- `scripts/bench_phase56_like_probe_trtllm.sh`:
+  mechanism/debug probe, not publishability-grade evidence.
+- `scripts/bench_phase60_rehydrate_minimal_sweep.sh`:
+  baseline/sweep methodology run (B0/B1/B2, replay concurrency sweep).
+- `scripts/bench_phase70_rehydrate_c1_pair_repeats.sh`:
+  publishability repeatability run (pair-local AB/BA, order-check output).
+
+## Results Hygiene
+
+- Keep `bench/results/` root high-signal for current methodology (modern Phase60/Phase70 artifacts).
+- Archive older or trial artifacts with:
+
+```bash
+scripts/bench_results_hygiene.py --results-root bench/results
+scripts/bench_results_hygiene.py --results-root bench/results --execute
+```
+
+- Defaults:
+  - dry-run first,
+  - keeps only latest modern timestamp group (`--keep-latest-ts=1`),
+  - supports pinned keep timestamps via repeated `--keep-modern-ts <ts>`.
+- Moved artifacts are separated into:
+  - `bench/results/archive/<archive_tag>/` (legacy/non-modern),
+  - `bench/results/trials/<archive_tag>/` (trial/debug/smoke-like artifacts).
 
 ## Benchmark Driver Usage
 
@@ -101,6 +160,54 @@ This writes:
 - `metrics_kvbm_pressure.prom`, `metrics_kvbm_replay.prom`
 - `kvbm_metric_inventory.txt`, `kvbm_metric_inventory_expanded.txt`, `kvbm_metric_inventory_from_6880.txt`
 
+### 3b) I/O Attribution Mode (Optional)
+
+```bash
+python3 -m bench.run_bench \
+  --base-url http://127.0.0.1:8000 \
+  --scenario rehydrate_replay \
+  --kv-mode cpu_disk \
+  --io-attrib \
+  --io-attrib-interval-s 1 \
+  --kvbm-cache-dir /mnt/nvme/kvbm \
+  --container-name dyn
+```
+
+Optional dependencies:
+
+- `sysstat` for host tools like `iostat` and `pidstat` (collector degrades to `/proc`-based sampling when unavailable).
+- `lsof` for file-level open-file attribution fallback under the KVBM disk path.
+- `bpftrace` for privileged syscall tracing (collector probes availability and degrades gracefully without it).
+
+Install example (Ubuntu):
+
+```bash
+sudo apt-get update
+sudo apt-get install -y sysstat lsof bpftrace
+```
+
+### 3c) Replay Attribution Gate Checker (A2)
+
+Validate replay attribution evidence for a completed run bundle:
+
+```bash
+python3 scripts/check_io_attrib_replay.py \
+  --run-dir bench/results/<bundle>/<run_id> \
+  --expect-report
+```
+
+Behavior:
+
+- Writes `io/io_attrib_verdict.json` inside the run bundle.
+- Prints one-line `PASS`/`FAIL` summary.
+- Exit code `0` for pass (including warn-only checks), `2` for hard fail.
+- Strict replay checks apply only to B2 + disk-tier-enabled runs.
+- In strict B2 runs, replay process evidence accepts either `process_io_by_phase.<replay>.read_bytes` (PID aggregate) or `process_io_by_phase.<replay>.cgroup_read_bytes` (cgroup fallback).
+- Verdicts include `process_evidence_method` (`pid`, `cgroup`, `none`) plus per-PID availability/nonzero flags so cgroup-backed passes are explicit.
+- Reviewer note: in containerized runs, `process_evidence_method=cgroup` is often expected and is treated as valid process attribution.
+
+`scripts/bench_phase60_rehydrate_minimal_sweep.sh` automatically runs this checker when `BENCH_PHASE60_IO_ATTRIB=1`, and records verdict details in each sweep row under `io_attribution_verdict`.
+
 ### 4) Reuse verification scenario (identical request replay)
 
 ```bash
@@ -122,7 +229,7 @@ Inspect:
 - `.overall_summary.reuse_verify_signal_kvbm`
 - `.request_identity.reuse_verify_identity`
 
-### 5) TTFT collection modes (best effort)
+### 5) Streaming TTFC / optional TTFB collection
 
 ```bash
 python3 -m bench.run_bench \
@@ -131,10 +238,18 @@ python3 -m bench.run_bench \
   --prompt-set short \
   --requests 32 \
   --concurrency 2 \
-  --stream
+  --stream \
+  --stream-timeout-s 120 \
+  --stream-record-ttfb
 ```
 
-Without `--stream`, the client still records a first-byte TTFT proxy for non-stream completions. With `--stream`, TTFT uses first chunk arrival and is typically a higher-fidelity proxy.
+Behavior:
+
+- `--stream` (or alias `--stream-metrics`) enables streamed requests.
+- `ttfc_ms` is measured from request start to first non-empty streamed SSE `data:` payload (fallback: first non-empty stream chunk).
+- `ttfb_ms` is optional and emitted only when `--stream-record-ttfb` is set.
+- `ttft_ms` is retained for backward compatibility; for stream runs it mirrors TTFC.
+- Without `--stream`, TTFT remains a first-byte proxy and TTFC is absent.
 
 ### 6) Phase60 fixed-pressure minimal sweep wrapper
 
@@ -147,9 +262,60 @@ BENCH_PHASE60_SWEEP_CONCURRENCIES="1 2 4" \
 BENCH_PHASE60_PRESSURE_POPULATE_CONCURRENCY=2 \
 BENCH_PHASE60_PRESSURE_THRASH_CONCURRENCY=2 \
 BENCH_PHASE60_BASELINE_REPLAY_CONCURRENCY=1 \
+BENCH_PHASE60_INCLUDE_B0=1 \
 BENCH_PHASE60_FORCE_NEW_SUMMARY=true \
 scripts/bench_phase60_rehydrate_minimal_sweep.sh
 ```
+
+When `BENCH_PHASE60_INCLUDE_B0=1`, each replay-concurrency point runs in a consistent order `B2 -> B1 -> B0` and emits a combined JSON + CSV summary (KVBM counters are blank in CSV for B0 rows).
+
+### 6a) Phase70 c=1 paired repeats (pair-local AB/BA counterbalanced)
+
+```bash
+BENCH_PHASE70_PAIRS=6 \
+BENCH_PHASE70_REPLAY_CONCURRENCY=1 \
+BENCH_PHASE70_IO_ATTRIB=1 \
+BENCH_PHASE70_STREAM_METRICS=1 \
+BENCH_PHASE70_STREAM_TIMEOUT_S=120 \
+BENCH_PHASE70_STREAM_RECORD_TTFB=1 \
+scripts/bench_phase70_rehydrate_c1_pair_repeats.sh
+```
+
+Behavior:
+
+- Pair-local blocked design: each pair runs back-to-back in one block (`pair_id`).
+- Counterbalanced order: default `BENCH_PHASE70_ORDER_STRATEGY=alternating` gives AB/BA by pair.
+- Optional randomized balanced order: `BENCH_PHASE70_ORDER_STRATEGY=random` with `BENCH_PHASE70_ORDER_SEED=<seed>`.
+- Delta definition is fixed as `(mode_b - mode_a)`; defaults are `mode_a=B1`, `mode_b=B2`.
+- Optional pair washout between legs: `BENCH_PHASE70_PAIR_WASHOUT_S=0` by default.
+  - Set `BENCH_PHASE70_PAIR_WASHOUT_S=10` or `30` when debugging order effects.
+  - Optional guarded extras: `BENCH_PHASE70_PAIR_WASHOUT_SYNC=1` and `BENCH_PHASE70_PAIR_WASHOUT_DROP_CACHES=1` (drop-caches runs only if root and writable; otherwise skipped).
+- Recommended pair counts are even (`N=6` or `N=8`) for exact AB/BA balance.
+
+Artifacts written by the runner:
+
+- `bench/results/phase70_rehydrate_pair_repeats_manifest_<ts>.json`
+- `bench/results/phase70_rehydrate_pair_repeats_summary_<ts>.json`
+- `bench/results/phase70_rehydrate_pair_repeats_summary_<ts>.csv` (per-run)
+- `bench/results/phase70_rehydrate_pair_repeats_deltas_<ts>.csv` (per-pair deltas)
+- `bench/results/phase70_rehydrate_pair_repeats_order_check_<ts>.json` (descriptive order-effect check with AB/BA min/max and approximate 95% bands)
+
+### 6b) Phase70 brief-ready results pack (single command)
+
+Generate a publish folder that can be dropped into a whitepaper/brief repo:
+
+```bash
+python3 scripts/make_phase70_results_pack.py \
+  --results-root bench/results \
+  --ts <ts>
+```
+
+Output folder:
+
+- `bench/results/publish/phase70_pairs<N>_<ts>/`
+- includes: `summary.csv`, `summary.json`, `deltas.csv`, `order_check.json`, `methodology.md`
+- includes: `tables/table_main_latency.csv`, `tables/table_mechanism.csv`, `tables/table_order_effect.csv`
+- includes: `figures/` (PNG files when matplotlib is installed; otherwise a README note)
 
 ## Operator Scripts
 
@@ -171,6 +337,9 @@ For the scripted workflow around this harness, use:
 - `scripts/bench_phase56_like_probe_trtllm.sh`
 - `scripts/bench_phase58_eviction_thrash.sh`
 - `scripts/bench_phase60_rehydrate_minimal_sweep.sh`
+- `scripts/bench_phase70_rehydrate_c1_pair_repeats.sh`
+- `scripts/analyze_phase70_pairs.py`
+- `scripts/make_phase70_results_pack.py`
 - `scripts/bench_workload_local_copilot_burst.sh`
   - For current Spark stability: `BENCH_COMPARE_SKIP_READY=1 BENCH_KV_MODE_LIST="cpu_only cpu_disk" scripts/bench_run_mode_compare.sh`
 
@@ -202,11 +371,25 @@ Each run writes to `bench/results/<run_id>/`:
 - `prompts_manifest.jsonl`: prompt IDs + token targets/estimates + hashes.
 - `request_manifest.jsonl`: deterministic per-request schedule including `prefix_hash`/`session_id` where available.
 - `requests.jsonl`: per-request raw records:
-  `start_ts`, `end_ts`, `latency_ms`, `status_code`, `prompt_id`, `prompt_tokens_est`, `output_len_chars`, `error`, `request_id`, `ttft_ms`.
+  `start_ts`, `end_ts`, `latency_ms`, `status_code`, `http_status`, `prompt_id`, `prompt_tokens_est`, `output_len_chars`, `error`, `request_id`, `ttft_ms`, `ttfc_ms` (stream mode), `ttfb_ms` (optional), `stream_first_event_type`, `stream_error`.
 - `kvbm_metrics_snapshots.jsonl`: raw `/metrics` snapshots at phase boundaries.
-- `summary.json`: includes run validity, per-phase + overall metrics, KVBM deltas, eviction replay signals.
+- `summary.json`: includes run validity, per-phase + overall metrics (latency + TTFT + TTFC/TTFB when present), KVBM deltas, eviction replay signals.
+- `summary.json` also includes top-level `mode`, `kvbm_enabled`, `kvbm_metrics_available`, and `kvbm_metrics_status`.
 - `phase_deltas/`: `phase_<name>_kvbm_metrics_{start,end,delta}.json` and `phase_<name>_os_io_{start,end,delta}.json`.
-- `nvme_identity.json`, `nvme_smart_pre.json`, `nvme_smart_post.json`: NVMe identity + health snapshots.
+- `nvme_identity.json`, `nvme_smart_pre.json`, `nvme_smart_post.json`: legacy NVMe identity + SMART snapshots.
+- `device_metadata_pre.json`, `device_metadata_post.json`: standardized storage metadata snapshots
+  (NVMe identity/SMART, PCIe link state, block/filesystem mapping, kernel/OS info, and capture errors).
+- `io/`: optional I/O attribution bundle (enabled with `--io-attrib`):
+  - `io/block_stat_timeline.csv` (canonical procfs block timeline)
+  - `io/proc_io_timeline.csv` (canonical procfs per-process timeline)
+  - `io/iostat.csv` (legacy compatibility copy of `block_stat_timeline.csv`)
+  - `io/pidstat.csv` (legacy compatibility copy of `proc_io_timeline.csv`)
+  - `io/iostat.raw.log` (tool output when `iostat` is installed)
+  - `io/pidstat.raw.log` (tool output when `pidstat` is installed)
+  - `io/meminfo_snapshots.jsonl`
+  - `io/vmstat_snapshots.jsonl`
+  - `io/io_attribution_report.json`
+  - `io/io_attrib_verdict.json` (A2 replay gate verdict from checker)
 - `report.md`: human-readable run report (brief-ready).
 - `telemetry/`: iostat, pidstat, nvidia-smi, KVBM cache snapshots, docker logs, cuFile logs.
 - `responses/` (optional with `--store-responses`): raw text outputs.
@@ -247,7 +430,7 @@ Signals of pressure/eviction:
 
 Known limitations:
 
-- TTFT is a proxy metric (non-stream uses first-byte timing, stream uses first chunk timing).
+- TTFC is preferred for streamed latency; TTFT remains for backward compatibility and is a proxy in non-stream mode.
 - If replay reads do not appear and `kvbm_matched_tokens_delta` is zero, disk rehydrate is gated because no cross-request reuse path activated.
 
 ## Interactive Validation Notes (2026-02-08)

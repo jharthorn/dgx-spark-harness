@@ -59,11 +59,20 @@ REHYDRATE_THRASH_CONC="${BENCH_PHASE56_REHYDRATE_THRASH_CONC:-${B_CONC}}"
 REHYDRATE_REPLAY_CONC="${BENCH_PHASE56_REHYDRATE_REPLAY_CONC:-${A_CONC}}"
 REHYDRATE_REPLAY_REPEATS="${BENCH_PHASE56_REHYDRATE_REPLAY_REPEATS:-1}"
 REHYDRATE_GEN_TOKENS="${BENCH_PHASE56_REHYDRATE_GEN_TOKENS:-${MAX_TOKENS}}"
+IO_ATTRIB="$(normalize_bool "${BENCH_PHASE56_IO_ATTRIB:-0}")"
+IO_ATTRIB_INTERVAL_S="${BENCH_PHASE56_IO_ATTRIB_INTERVAL_S:-1}"
+STREAM_METRICS="$(normalize_bool "${BENCH_PHASE56_STREAM_METRICS:-0}")"
+STREAM_TIMEOUT_S="${BENCH_PHASE56_STREAM_TIMEOUT_S:-}"
+STREAM_RECORD_TTFB="$(normalize_bool "${BENCH_PHASE56_STREAM_RECORD_TTFB:-0}")"
 
 METRICS_SYSTEM_PORT="${BENCH_PHASE56_METRICS_SYSTEM_PORT:-${DYN_SYSTEM_PORT:-8081}}"
 METRICS_KVBM_PORT="${BENCH_PHASE56_METRICS_KVBM_PORT:-${DYN_KVBM_METRICS_PORT:-6880}}"
 METRICS_SYSTEM_URL="${BENCH_PHASE56_METRICS_SYSTEM_URL:-http://127.0.0.1:${METRICS_SYSTEM_PORT}/metrics}"
 METRICS_KVBM_URL="${BENCH_PHASE56_METRICS_KVBM_URL:-http://127.0.0.1:${METRICS_KVBM_PORT}/metrics}"
+KVBM_CACHE_DIR_RUN="${DYN_KVBM_DISK_CACHE_DIR:-/mnt/nvme/kvbm}"
+if [[ "${TIER_MODE}" == "B0" ]]; then
+  KVBM_CACHE_DIR_RUN=""
+fi
 PYTHON_BIN="${BENCH_PHASE56_PYTHON_BIN:-python3}"
 KVBM_INVENTORY_FROM_6880="${ANALYSIS_DIR}/kvbm_metric_inventory_from_6880.txt"
 
@@ -135,7 +144,7 @@ BENCH_ARGS=(
   --nvme-device "${BENCH_NVME_DEVICE:-/dev/nvme0}"
   --stop "<|eot_id|>"
   --container-name "${CONTAINER_NAME}"
-  --kvbm-cache-dir "${DYN_KVBM_DISK_CACHE_DIR:-/mnt/nvme/kvbm}"
+  --kvbm-cache-dir "${KVBM_CACHE_DIR_RUN}"
   --allow-missing-kvbm-metrics
   --capture-metrics-snapshot
   --metrics-snapshot-dir "${ANALYSIS_DIR}"
@@ -145,6 +154,18 @@ BENCH_ARGS=(
 )
 if [[ "${COLLECT_TELEMETRY}" == "1" ]]; then
   BENCH_ARGS+=(--collect-telemetry)
+fi
+if [[ "${IO_ATTRIB}" == "1" ]]; then
+  BENCH_ARGS+=(--io-attrib --io-attrib-interval-s "${IO_ATTRIB_INTERVAL_S}")
+fi
+if [[ "${STREAM_METRICS}" == "1" ]]; then
+  BENCH_ARGS+=(--stream-metrics)
+  if [[ -n "${STREAM_TIMEOUT_S}" ]]; then
+    BENCH_ARGS+=(--stream-timeout-s "${STREAM_TIMEOUT_S}")
+  fi
+  if [[ "${STREAM_RECORD_TTFB}" == "1" ]]; then
+    BENCH_ARGS+=(--stream-record-ttfb)
+  fi
 fi
 
 set +e
@@ -364,13 +385,61 @@ kvbm_metrics_top_names_json="$(jq '.kvbm_metrics_top_names' <<< "${metrics_scan_
 from_6880_metric_count="${kvbm_metrics_keyword_match_count}"
 
 kvbm_metrics_classification="kvbm_metrics_endpoint_missing"
-if [[ "${kvbm_pressure_ok}" == "1" || "${kvbm_replay_ok}" == "1" ]]; then
+if [[ "${TIER_MODE}" == "B0" ]]; then
+  kvbm_metrics_classification="kvbm_disabled"
+elif [[ "${kvbm_pressure_ok}" == "1" || "${kvbm_replay_ok}" == "1" ]]; then
   if [[ "${kvbm_metrics_keyword_match_count}" -gt 0 ]]; then
     kvbm_metrics_classification="kvbm_metrics_keywords_found"
   else
     kvbm_metrics_classification="kvbm_metrics_endpoint_reachable_but_no_matching_counters"
   fi
 fi
+
+sanitize_argjson_var() {
+  local var_name="$1"
+  local value="${!var_name-}"
+  if [[ -z "${value}" ]] || ! jq -e . <<<"${value}" >/dev/null 2>&1; then
+    printf -v "${var_name}" 'null'
+  fi
+}
+
+ARGJSON_FIELDS=(
+  run_valid
+  overall_p50
+  overall_p95
+  overall_p99
+  overall_error_rate
+  overall_ttft_p50
+  overall_ttft_p95
+  overall_ttft_p99
+  warm_p50
+  warm_p95
+  pressure_p50
+  pressure_p95
+  replay_p50
+  replay_p95
+  replay_ttft_p50
+  replay_ttft_p95
+  replay_ttft_p99
+  populate_p50
+  populate_p95
+  thrash_p50
+  thrash_p95
+  system_pressure_ok
+  system_replay_ok
+  kvbm_pressure_ok
+  kvbm_replay_ok
+  system_metrics_trtllm_prefix_count
+  system_metrics_dynamo_component_prefix_count
+  kvbm_metrics_keyword_match_count
+  kvbm_metrics_top_names_json
+  expanded_metric_count
+  from_6880_metric_count
+  BENCH_RC
+)
+for field in "${ARGJSON_FIELDS[@]}"; do
+  sanitize_argjson_var "${field}"
+done
 
 jq -n \
   --arg backend "trtllm" \
@@ -387,6 +456,9 @@ jq -n \
   --arg nvme_identity_path "${RUN_DIR}/nvme_identity.json" \
   --arg nvme_smart_pre_path "${RUN_DIR}/nvme_smart_pre.json" \
   --arg nvme_smart_post_path "${RUN_DIR}/nvme_smart_post.json" \
+  --arg device_metadata_pre_path "${RUN_DIR}/device_metadata_pre.json" \
+  --arg device_metadata_post_path "${RUN_DIR}/device_metadata_post.json" \
+  --arg io_attribution_report_path "${RUN_DIR}/io/io_attribution_report.json" \
   --arg metrics_system_pressure "${ANALYSIS_DIR}/metrics_system_pressure.prom" \
   --arg metrics_system_replay "${ANALYSIS_DIR}/metrics_system_replay.prom" \
   --arg metrics_kvbm_pressure "${ANALYSIS_DIR}/metrics_kvbm_pressure.prom" \
@@ -480,6 +552,9 @@ jq -n \
       nvme_identity: $nvme_identity_path,
       nvme_smart_pre: $nvme_smart_pre_path,
       nvme_smart_post: $nvme_smart_post_path,
+      device_metadata_pre: $device_metadata_pre_path,
+      device_metadata_post: $device_metadata_post_path,
+      io_attribution_report: $io_attribution_report_path,
       metrics_system_pressure: $metrics_system_pressure,
       metrics_system_replay: $metrics_system_replay,
       metrics_kvbm_pressure: $metrics_kvbm_pressure,

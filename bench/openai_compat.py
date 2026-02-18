@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
@@ -21,6 +22,10 @@ class CompletionResponse:
     text: str
     error: Optional[str]
     ttft_ms: Optional[float]
+    ttfc_ms: Optional[float]
+    ttfb_ms: Optional[float]
+    stream_first_event_type: Optional[str]
+    stream_error: Optional[str]
     response_id: Optional[str]
     response_headers: dict[str, str]
 
@@ -77,6 +82,8 @@ class OpenAICompatClient:
         stop: Optional[Sequence[str]] = None,
         stream: bool = False,
         seed: Optional[int] = None,
+        stream_timeout_s: Optional[float] = None,
+        stream_record_ttfb: bool = False,
     ) -> CompletionResponse:
         payload: dict[str, Any] = {
             "model": model,
@@ -92,15 +99,22 @@ class OpenAICompatClient:
             payload["seed"] = int(seed)
 
         if stream:
-            return await self._create_completion_streaming(payload)
-        return await self._create_completion_json(payload)
+            return await self._create_completion_streaming(
+                payload,
+                stream_timeout_s=stream_timeout_s,
+                stream_record_ttfb=stream_record_ttfb,
+            )
+        return await self._create_completion_json(payload, stream_record_ttfb=stream_record_ttfb)
 
-    async def _create_completion_json(self, payload: dict[str, Any]) -> CompletionResponse:
+    async def _create_completion_json(
+        self, payload: dict[str, Any], *, stream_record_ttfb: bool
+    ) -> CompletionResponse:
         start = time.perf_counter()
         status_code = 0
         request_id: Optional[str] = None
         response_headers: dict[str, str] = {}
         ttft_ms: Optional[float] = None
+        ttfb_ms: Optional[float] = None
         response_id: Optional[str] = None
         text = ""
         error: Optional[str] = None
@@ -112,6 +126,8 @@ class OpenAICompatClient:
                 response_headers = _extract_response_header_hints(resp.headers)
                 # For non-stream responses this is a first-byte proxy for TTFT.
                 header_ms = (time.perf_counter() - start) * 1000.0
+                if stream_record_ttfb:
+                    ttfb_ms = header_ms
                 chunks: list[bytes] = []
                 async for chunk in resp.aiter_bytes():
                     if chunk:
@@ -139,6 +155,10 @@ class OpenAICompatClient:
                 text=text,
                 error=error,
                 ttft_ms=ttft_ms,
+                ttfc_ms=None,
+                ttfb_ms=ttfb_ms,
+                stream_first_event_type=None,
+                stream_error=None,
                 response_id=response_id,
                 response_headers=response_headers,
             )
@@ -153,56 +173,128 @@ class OpenAICompatClient:
                 text=text,
                 error=str(exc),
                 ttft_ms=ttft_ms,
+                ttfc_ms=None,
+                ttfb_ms=ttfb_ms,
+                stream_first_event_type=None,
+                stream_error=None,
                 response_id=response_id,
                 response_headers=response_headers,
             )
 
-    async def _create_completion_streaming(self, payload: dict[str, Any]) -> CompletionResponse:
+    async def _create_completion_streaming(
+        self,
+        payload: dict[str, Any],
+        *,
+        stream_timeout_s: Optional[float],
+        stream_record_ttfb: bool,
+    ) -> CompletionResponse:
         start = time.perf_counter()
-        chunks: list[str] = []
+        raw_chunks: list[str] = []
+        event_payloads: list[str] = []
         first_chunk_ms: Optional[float] = None
+        first_event_ms: Optional[float] = None
+        stream_first_event_type: Optional[str] = None
+        stream_error: Optional[str] = None
+        ttfb_ms: Optional[float] = None
         request_id: Optional[str] = None
         response_id: Optional[str] = None
         status_code = 0
         response_headers: dict[str, str] = {}
+        sse_pending = ""
         try:
-            async with self._client.stream("POST", "/v1/completions", json=payload) as resp:
+            timeout = float(stream_timeout_s) if stream_timeout_s is not None else None
+            async with self._client.stream("POST", "/v1/completions", json=payload, timeout=timeout) as resp:
                 status_code = resp.status_code
                 request_id = resp.headers.get("x-request-id")
                 response_headers = _extract_response_header_hints(resp.headers)
+                header_ms = (time.perf_counter() - start) * 1000.0
+                if stream_record_ttfb:
+                    ttfb_ms = header_ms
                 async for chunk in resp.aiter_text():
                     if chunk:
+                        raw_chunks.append(chunk)
                         if first_chunk_ms is None:
                             first_chunk_ms = (time.perf_counter() - start) * 1000.0
-                        chunks.append(chunk)
+                        events, sse_pending = _consume_sse_events(sse_pending, chunk)
+                        for event in events:
+                            payload_text = str(event.get("data") or "")
+                            payload_trimmed = payload_text.strip()
+                            if not payload_trimmed:
+                                continue
+                            if first_event_ms is None:
+                                first_event_ms = (time.perf_counter() - start) * 1000.0
+                                stream_first_event_type = _infer_stream_event_type(payload_trimmed, event.get("event"))
+                            if payload_trimmed == "[DONE]":
+                                continue
+                            event_payloads.append(payload_trimmed)
+                            stream_error = stream_error or _extract_stream_payload_error(payload_trimmed)
+                for event in _flush_sse_events(sse_pending):
+                    payload_text = str(event.get("data") or "")
+                    payload_trimmed = payload_text.strip()
+                    if not payload_trimmed:
+                        continue
+                    if first_event_ms is None:
+                        first_event_ms = (time.perf_counter() - start) * 1000.0
+                        stream_first_event_type = _infer_stream_event_type(payload_trimmed, event.get("event"))
+                    if payload_trimmed == "[DONE]":
+                        continue
+                    event_payloads.append(payload_trimmed)
+                    stream_error = stream_error or _extract_stream_payload_error(payload_trimmed)
             latency_ms = (time.perf_counter() - start) * 1000.0
-            raw = "".join(chunks)
-            text = _extract_stream_text(raw)
-            parsed_response_id = _extract_stream_response_id(raw)
+            raw = "".join(raw_chunks)
+            parse_source = "\n".join(event_payloads) if event_payloads else raw
+            text = _extract_stream_text(parse_source)
+            parsed_response_id = _extract_stream_response_id(parse_source)
             if parsed_response_id:
                 response_id = parsed_response_id
-            error = None
+            elif raw:
+                parsed_response_id = _extract_stream_response_id(raw)
+                if parsed_response_id:
+                    response_id = parsed_response_id
+            ttfc_ms = first_event_ms or first_chunk_ms
+            if ttfc_ms is None and ttfb_ms is not None:
+                ttfc_ms = ttfb_ms
+                if stream_first_event_type is None:
+                    stream_first_event_type = "headers"
+            if ttfc_ms is None:
+                ttfc_ms = latency_ms
+                if stream_first_event_type is None:
+                    stream_first_event_type = "response_end"
+            if stream_first_event_type is None and first_chunk_ms is not None:
+                stream_first_event_type = "chunk"
+            error = stream_error
             if status_code >= 400:
-                error = f"HTTP {status_code}: {raw[:400]}"
+                error = error or f"HTTP {status_code}: {raw[:400]}"
             return CompletionResponse(
                 status_code=status_code,
                 latency_ms=latency_ms,
                 request_id=request_id,
                 text=text,
                 error=error,
-                ttft_ms=first_chunk_ms,
+                ttft_ms=ttfc_ms,
+                ttfc_ms=ttfc_ms,
+                ttfb_ms=ttfb_ms,
+                stream_first_event_type=stream_first_event_type,
+                stream_error=stream_error,
                 response_id=response_id,
                 response_headers=response_headers,
             )
         except Exception as exc:
             latency_ms = (time.perf_counter() - start) * 1000.0
+            ttfc_ms = first_event_ms or first_chunk_ms
+            if ttfc_ms is None and ttfb_ms is not None:
+                ttfc_ms = ttfb_ms
             return CompletionResponse(
                 status_code=status_code,
                 latency_ms=latency_ms,
                 request_id=request_id,
                 text="",
                 error=str(exc),
-                ttft_ms=first_chunk_ms,
+                ttft_ms=ttfc_ms,
+                ttfc_ms=ttfc_ms,
+                ttfb_ms=ttfb_ms,
+                stream_first_event_type=stream_first_event_type,
+                stream_error=(stream_error or str(exc)),
                 response_id=response_id,
                 response_headers=response_headers,
             )
@@ -289,6 +381,101 @@ def _extract_stream_response_id(raw: str) -> Optional[str]:
             if isinstance(response_id, str):
                 return response_id
     return None
+
+
+def _extract_stream_payload_error(payload: str) -> Optional[str]:
+    try:
+        obj = json.loads(payload)
+    except Exception:
+        return None
+    return _extract_error(obj)
+
+
+def _infer_stream_event_type(payload: str, event_name: Optional[str]) -> str:
+    explicit = str(event_name or "").strip().lower()
+    if explicit:
+        return explicit
+    try:
+        obj = json.loads(payload)
+    except Exception:
+        return "data"
+    if not isinstance(obj, dict):
+        return "data"
+    if obj.get("error") is not None:
+        return "error"
+    choices = obj.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            delta = first.get("delta")
+            if isinstance(delta, dict):
+                if isinstance(delta.get("content"), str) and delta.get("content"):
+                    return "delta_content"
+                return "delta"
+            if isinstance(first.get("text"), str):
+                return "token"
+            if first.get("finish_reason") is not None:
+                return "finish"
+    obj_type = obj.get("object")
+    if isinstance(obj_type, str) and obj_type:
+        return obj_type
+    return "data"
+
+
+def _consume_sse_events(pending: str, chunk: str) -> tuple[list[dict[str, Optional[str]]], str]:
+    buf = f"{pending}{chunk}"
+    events: list[dict[str, Optional[str]]] = []
+    while True:
+        match = re.search(r"\r?\n\r?\n", buf)
+        if not match:
+            break
+        raw_event = buf[: match.start()]
+        buf = buf[match.end() :]
+        parsed = _parse_sse_event(raw_event)
+        if parsed is not None:
+            events.append(parsed)
+    return events, buf
+
+
+def _flush_sse_events(pending: str) -> list[dict[str, Optional[str]]]:
+    parsed = _parse_sse_event(pending)
+    return [parsed] if parsed is not None else []
+
+
+def _parse_sse_event(raw_event: str) -> Optional[dict[str, Optional[str]]]:
+    if not raw_event:
+        return None
+    event_name: Optional[str] = None
+    data_lines: list[str] = []
+    for raw_line in raw_event.splitlines():
+        line = raw_line.strip("\r")
+        if not line:
+            continue
+        if line.startswith(":"):
+            continue
+        if ":" in line:
+            field, value = line.split(":", 1)
+            value = value.lstrip(" ")
+        else:
+            field, value = line, ""
+        field = field.strip().lower()
+        if field == "event":
+            event_name = value.strip() or None
+        elif field == "data":
+            data_lines.append(value)
+    if not data_lines:
+        return None
+    return {"event": event_name, "data": "\n".join(data_lines)}
+
+
+def _collect_sse_events_from_fragments(fragments: Sequence[str]) -> list[dict[str, Optional[str]]]:
+    pending = ""
+    out: list[dict[str, Optional[str]]] = []
+    for fragment in fragments:
+        events, pending = _consume_sse_events(pending, fragment)
+        out.extend(events)
+    out.extend(_flush_sse_events(pending))
+    return out
 
 
 def _extract_response_header_hints(headers: Any) -> dict[str, str]:
