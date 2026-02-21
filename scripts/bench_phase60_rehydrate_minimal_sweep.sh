@@ -24,6 +24,11 @@ REQUEST_SEED="${BENCH_PHASE60_REQUEST_SEED:-20260210}"
 SCENARIO="${BENCH_PHASE60_SCENARIO:-rehydrate_replay}"
 CPU_CACHE_GB="${BENCH_PHASE60_CPU_CACHE_GB:-2}"
 DISK_CACHE_GB="${BENCH_PHASE60_DISK_CACHE_GB:-32}"
+B1_DISK_CACHE_GB="${BENCH_PHASE60_B1_DISK_CACHE_GB:-0}"
+B1_KVBM_CACHE_DIR="${BENCH_PHASE60_B1_KVBM_CACHE_DIR:-/tmp/phase60_b1_disk_tier_disabled_${TS}}"
+B1_DISK_TIER_READ_BYTES_THRESHOLD="${BENCH_PHASE60_B1_DISK_TIER_READ_BYTES_THRESHOLD:-1048576}"
+B1_DISK_TIER_HIT_RATE_THRESHOLD="${BENCH_PHASE60_B1_DISK_TIER_HIT_RATE_THRESHOLD:-0.000001}"
+ENFORCE_B1_DISK_TIER_OFF="${BENCH_PHASE60_ENFORCE_B1_DISK_TIER_OFF:-1}"
 MAX_TOKENS="${BENCH_PHASE60_MAX_TOKENS:-128}"
 TEMPERATURE="${BENCH_PHASE60_TEMPERATURE:-0.2}"
 POP_SESSIONS="${BENCH_PHASE60_REHYDRATE_POPULATE_SESSIONS:-16}"
@@ -41,6 +46,8 @@ IO_ATTRIB="${BENCH_PHASE60_IO_ATTRIB:-0}"
 IO_ATTRIB_INTERVAL_S="${BENCH_PHASE60_IO_ATTRIB_INTERVAL_S:-1}"
 IO_ATTRIB_CHECKER="${REPO_ROOT}/scripts/check_io_attrib_replay.py"
 INCLUDE_B0="${BENCH_PHASE60_INCLUDE_B0:-0}"
+STRICT_BASELINE_HASH="${BENCH_PHASE60_STRICT_BASELINE_HASH:-0}"
+ACCEPT_NEW_BASELINE_MANIFEST="${BENCH_PHASE60_ACCEPT_NEW_BASELINE_MANIFEST:-0}"
 
 # Preflight defaults inherit full-shape pressure so mechanism signals are comparable.
 PREFLIGHT_POP_SESSIONS="${BENCH_PHASE60_PREFLIGHT_POPULATE_SESSIONS:-${POP_SESSIONS}}"
@@ -52,6 +59,9 @@ PREFLIGHT_GEN_TOKENS="${BENCH_PHASE60_PREFLIGHT_GEN_TOKENS:-${REHYDRATE_GEN_TOKE
 
 KNOWN_GOOD_B2_RUN="${BENCH_PHASE60_KNOWN_GOOD_B2_RUN:-${RESULTS_ROOT}/phase60_rehydrate_B2_r05_20260210T230915Z/run_B2_r05_20260210T230915Z}"
 FAILED_B2_C1_RUN="${BENCH_PHASE60_FAILED_B2_C1_RUN:-${RESULTS_ROOT}/phase60_rehydrate_sweep_B2_c1_20260211T000318Z/run_B2_c1_20260211T000318Z}"
+BASELINE_SEMANTIC_HASH_FILE="${BENCH_PHASE60_BASELINE_SEMANTIC_HASH_FILE:-${RESULTS_ROOT}/phase60_known_good_baseline_manifest_semantic_hash.json}"
+BASELINE_SEMANTIC_AUDIT_JSONL="${BENCH_PHASE60_BASELINE_MANIFEST_AUDIT_JSONL:-${RESULTS_ROOT}/phase60_baseline_manifest_audit.jsonl}"
+PHASE60_SEMANTIC_HASH_HELPER="${REPO_ROOT}/scripts/phase60_baseline_manifest_semantic.py"
 
 DIAG_JSON="${RESULTS_ROOT}/phase60_sweep_b2c1_failure_diagnosis_${TS}.json"
 SWEEP_SUMMARY_JSON="${RESULTS_ROOT}/phase60_rehydrate_concurrency_sweep_summary_minimal_${TS}.json"
@@ -78,7 +88,8 @@ emit_stop_verdict() {
   local detail="$2"
   local mode="${3:-}"
   local conc="${4:-}"
-  "${PYTHON_BIN}" - "${STOP_VERDICT_JSON}" "${reason}" "${detail}" "${mode}" "${conc}" "${SWEEP_SUMMARY_JSON}" <<'PY'
+  local diagnostics_json="${5:-}"
+  "${PYTHON_BIN}" - "${STOP_VERDICT_JSON}" "${reason}" "${detail}" "${mode}" "${conc}" "${SWEEP_SUMMARY_JSON}" "${diagnostics_json}" <<'PY'
 import json
 import pathlib
 import sys
@@ -90,6 +101,7 @@ detail = sys.argv[3]
 mode = sys.argv[4] or None
 conc_raw = sys.argv[5]
 summary_path = sys.argv[6]
+diagnostics_raw = sys.argv[7] if len(sys.argv) > 7 else ""
 conc = int(conc_raw) if conc_raw else None
 payload = {
     "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -101,6 +113,11 @@ payload = {
     "stopped_at_concurrency": conc,
     "sweep_summary_path": summary_path,
 }
+if diagnostics_raw:
+    try:
+        payload["diagnostics"] = json.loads(diagnostics_raw)
+    except Exception:
+        payload["diagnostics_raw"] = diagnostics_raw
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 print(path)
 PY
@@ -126,7 +143,8 @@ update_summary_stop() {
   local detail="$2"
   local mode="${3:-}"
   local conc="${4:-}"
-  "${PYTHON_BIN}" - "${SWEEP_SUMMARY_JSON}" "${reason}" "${detail}" "${mode}" "${conc}" <<'PY'
+  local diagnostics_json="${5:-}"
+  "${PYTHON_BIN}" - "${SWEEP_SUMMARY_JSON}" "${reason}" "${detail}" "${mode}" "${conc}" "${diagnostics_json}" <<'PY'
 import json
 import pathlib
 import sys
@@ -136,15 +154,51 @@ reason = sys.argv[2]
 detail = sys.argv[3]
 mode = sys.argv[4] or None
 conc = int(sys.argv[5]) if sys.argv[5] else None
+diagnostics_raw = sys.argv[6] if len(sys.argv) > 6 else ""
 obj = json.loads(path.read_text())
 obj["status"] = "stopped"
 obj["decision_grade"] = False
 obj["stop_reason"] = reason
 obj["stop_detail"] = detail
 obj["stopped_at"] = {"mode": mode, "concurrency": conc}
+if diagnostics_raw:
+    try:
+        obj["stop_diagnostics"] = json.loads(diagnostics_raw)
+    except Exception:
+        obj["stop_diagnostics_raw"] = diagnostics_raw
 obj.setdefault("baseline_b2_replay_p95_ms_at_concurrency1", None)
 obj.setdefault("slo_replay_p95_ms", None)
 obj.setdefault("max_concurrency_meeting_slo", {"B0": None, "B1": None, "B2": None})
+metric_counts = {"ttfc_ms": 0, "ttft_ms": 0, "missing": 0}
+for row in obj.get("rows", []):
+    if not isinstance(row, dict):
+        continue
+    metric_used = row.get("metric_used") if isinstance(row.get("metric_used"), dict) else {}
+    replay_p95_used = metric_used.get("replay_p95")
+    if replay_p95_used in metric_counts:
+        metric_counts[replay_p95_used] += 1
+        continue
+    replay_ttfc = ((row.get("replay_ttfc_ms") or {}).get("p95"))
+    replay_ttft = ((row.get("replay_ttft_ms") or {}).get("p95"))
+    if replay_ttfc is not None:
+        metric_counts["ttfc_ms"] += 1
+    elif replay_ttft is not None:
+        metric_counts["ttft_ms"] += 1
+    else:
+        metric_counts["missing"] += 1
+dominant_metric = "mixed"
+non_zero = [name for name, count in metric_counts.items() if count > 0]
+if len(non_zero) == 1:
+    dominant_metric = non_zero[0]
+elif not non_zero:
+    dominant_metric = "missing"
+meta = obj.setdefault("meta", {})
+meta["metric_policy"] = {
+    "preferred": "ttfc_ms",
+    "fallback": "ttft_ms",
+    "used_replay_p95": dominant_metric,
+    "used_replay_p95_counts": metric_counts,
+}
 path.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
 PY
 }
@@ -160,6 +214,93 @@ INCLUDE_B0_ENABLED="0"
 if is_truthy "${INCLUDE_B0}"; then
   INCLUDE_B0_ENABLED="1"
 fi
+
+STRICT_BASELINE_HASH_ENABLED="0"
+if is_truthy "${STRICT_BASELINE_HASH}"; then
+  STRICT_BASELINE_HASH_ENABLED="1"
+fi
+
+ACCEPT_NEW_BASELINE_MANIFEST_ENABLED="0"
+if is_truthy "${ACCEPT_NEW_BASELINE_MANIFEST}"; then
+  ACCEPT_NEW_BASELINE_MANIFEST_ENABLED="1"
+fi
+
+ENFORCE_B1_DISK_TIER_OFF_ENABLED="0"
+if is_truthy "${ENFORCE_B1_DISK_TIER_OFF}"; then
+  ENFORCE_B1_DISK_TIER_OFF_ENABLED="1"
+fi
+
+summary_append_warning() {
+  local code="$1"
+  local detail="$2"
+  local mode="${3:-}"
+  local conc="${4:-}"
+  local diagnostics_json="${5:-}"
+  "${PYTHON_BIN}" - "${SWEEP_SUMMARY_JSON}" "${code}" "${detail}" "${mode}" "${conc}" "${diagnostics_json}" <<'PY'
+import json
+import pathlib
+import sys
+from datetime import datetime, timezone
+
+path = pathlib.Path(sys.argv[1])
+code = sys.argv[2]
+detail = sys.argv[3]
+mode = sys.argv[4] or None
+conc = int(sys.argv[5]) if sys.argv[5] else None
+diagnostics_raw = sys.argv[6] if len(sys.argv) > 6 else ""
+
+obj = json.loads(path.read_text())
+warnings = obj.setdefault("warnings", [])
+entry = {
+    "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    "status": "warning",
+    "code": code,
+    "detail": detail,
+    "mode": mode,
+    "concurrency": conc,
+}
+if diagnostics_raw:
+    try:
+        entry["diagnostics"] = json.loads(diagnostics_raw)
+    except Exception:
+        entry["diagnostics_raw"] = diagnostics_raw
+warnings.append(entry)
+path.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+summary_set_baseline_policy_meta() {
+  local known_hash="$1"
+  local known_source="$2"
+  "${PYTHON_BIN}" - "${SWEEP_SUMMARY_JSON}" "${STRICT_BASELINE_HASH_ENABLED}" "${ACCEPT_NEW_BASELINE_MANIFEST_ENABLED}" "${BASELINE_SEMANTIC_HASH_FILE}" "${BASELINE_SEMANTIC_AUDIT_JSONL}" "${known_hash}" "${known_source}" "${KNOWN_GOOD_B2_RUN}" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+strict_mode = bool(int(sys.argv[2]))
+accept_new = bool(int(sys.argv[3]))
+baseline_file = sys.argv[4]
+audit_jsonl = sys.argv[5]
+known_hash = sys.argv[6] or None
+known_source = sys.argv[7] or None
+known_good_b2_run = sys.argv[8] or None
+
+obj = json.loads(path.read_text())
+meta = obj.setdefault("meta", {})
+meta["baseline_manifest_hash_policy"] = {
+    "strict_mode": strict_mode,
+    "accept_new_baseline_manifest": accept_new,
+    "baseline_semantic_hash_file": baseline_file,
+    "baseline_semantic_audit_jsonl": audit_jsonl,
+    "known_good_run_fallback": known_good_b2_run,
+    "known_semantic_hash": known_hash,
+    "known_semantic_source": known_source,
+}
+obj.setdefault("warnings", [])
+path.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
+PY
+}
 
 summary_upsert_row() {
   local row_json="$1"
@@ -247,21 +388,53 @@ PY
 
 collect_run_metrics() {
   local run_dir="$1"
-  "${PYTHON_BIN}" - "${run_dir}" <<'PY'
+  "${PYTHON_BIN}" - "${run_dir}" "${B1_DISK_TIER_READ_BYTES_THRESHOLD}" "${B1_DISK_TIER_HIT_RATE_THRESHOLD}" "${ENFORCE_B1_DISK_TIER_OFF_ENABLED}" <<'PY'
 import hashlib
 import json
 import pathlib
 import sys
 
 run_dir = pathlib.Path(sys.argv[1])
+b1_read_bytes_threshold_raw = sys.argv[2]
+b1_disk_hit_rate_threshold_raw = sys.argv[3]
+enforce_b1_disk_tier_off_raw = sys.argv[4]
+
+def parse_float(value):
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+def parse_bool(value):
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+def first_float(*values):
+    for value in values:
+        parsed = parse_float(value)
+        if parsed is not None:
+            return parsed
+    return None
+
 summary = json.loads((run_dir / "summary.json").read_text())
 config = json.loads((run_dir / "config.json").read_text())
 manifest = json.loads((run_dir / "manifest.json").read_text())
+runtime_manifest = {}
+runtime_manifest_path = run_dir.parent / "analysis" / "worker_runtime_manifest.json"
+if runtime_manifest_path.exists():
+    try:
+        runtime_manifest = json.loads(runtime_manifest_path.read_text())
+    except Exception:
+        runtime_manifest = {}
+runtime_env = runtime_manifest.get("env") if isinstance(runtime_manifest.get("env"), dict) else {}
 
 phases = {p.get("phase"): p for p in summary.get("phase_summaries", []) if p.get("phase")}
 overall = summary.get("overall_summary", {})
 ttft = overall.get("ttft_ms") or {}
+ttfc = overall.get("ttfc_ms") or {}
 replay_ttft = (phases.get("replay", {}) or {}).get("ttft_ms") or {}
+replay_ttfc = (phases.get("replay", {}) or {}).get("ttfc_ms") or {}
 replay_lat = (phases.get("replay", {}) or {}).get("latency_ms") or {}
 
 def load_json(path):
@@ -284,6 +457,22 @@ if not isinstance(kvbm_status, dict):
     kvbm_status = {}
 kvbm_ok = str(kvbm_status.get("status") or "") == "ok"
 
+def choose_metric(ttfc_stats, ttft_stats, stat):
+    if isinstance(ttfc_stats, dict):
+        ttfc_value = parse_float(ttfc_stats.get(stat))
+        if ttfc_value is not None:
+            return ttfc_value, "ttfc_ms"
+    if isinstance(ttft_stats, dict):
+        ttft_value = parse_float(ttft_stats.get(stat))
+        if ttft_value is not None:
+            return ttft_value, "ttft_ms"
+    return None, "missing"
+
+overall_metric_p95, overall_metric_source_p95 = choose_metric(ttfc, ttft, "p95")
+overall_metric_p99, overall_metric_source_p99 = choose_metric(ttfc, ttft, "p99")
+replay_metric_p95, replay_metric_source_p95 = choose_metric(replay_ttfc, replay_ttft, "p95")
+replay_metric_p99, replay_metric_source_p99 = choose_metric(replay_ttfc, replay_ttft, "p99")
+
 phase_io_gib = {}
 for phase_name, phase_payload in phases.items():
     if not isinstance(phase_payload, dict):
@@ -301,6 +490,45 @@ rb2 = replay2_io.get("block_device_delta", {})
 wb = replay_io.get("worker_process_io_delta", {})
 wb2 = replay2_io.get("worker_process_io_delta", {})
 
+matched_delta = (
+    (replay_kv.get("kvbm_matched_tokens_delta") or 0.0) + (replay2_kv.get("kvbm_matched_tokens_delta") or 0.0)
+    if kvbm_ok
+    else None
+)
+onboard_delta = (
+    (replay_kv.get("kvbm_onboard_blocks_d2d_delta") or 0.0) + (replay2_kv.get("kvbm_onboard_blocks_d2d_delta") or 0.0)
+    if kvbm_ok
+    else None
+)
+offload_h2d_delta = (
+    (replay_kv.get("kvbm_offload_blocks_h2d_delta") or 0.0) + (replay2_kv.get("kvbm_offload_blocks_h2d_delta") or 0.0)
+    if kvbm_ok
+    else None
+)
+block_read_delta = (rb.get("read_bytes_delta") or 0) + (rb2.get("read_bytes_delta") or 0)
+block_write_delta = (rb.get("write_bytes_delta") or 0) + (rb2.get("write_bytes_delta") or 0)
+cgroup_read_delta = (wb.get("cgroup_read_bytes_delta") or 0) + (wb2.get("cgroup_read_bytes_delta") or 0)
+cgroup_write_delta = (wb.get("cgroup_write_bytes_delta") or 0) + (wb2.get("cgroup_write_bytes_delta") or 0)
+
+replay_phase = phases.get("replay", {}) if isinstance(phases.get("replay"), dict) else {}
+replay_kv_end = replay_phase.get("kvbm_metrics_end") if isinstance(replay_phase.get("kvbm_metrics_end"), dict) else {}
+replay_kv_start = replay_phase.get("kvbm_metrics_start") if isinstance(replay_phase.get("kvbm_metrics_start"), dict) else {}
+replay_kv_delta = replay_phase.get("kvbm_metrics_delta") if isinstance(replay_phase.get("kvbm_metrics_delta"), dict) else {}
+disk_hit_rate = first_float(
+    replay_kv_end.get("kvbm_disk_cache_hit_rate"),
+    replay_kv_delta.get("kvbm_disk_cache_hit_rate"),
+    replay_kv_delta.get("kvbm_disk_cache_hit_rate_delta"),
+    replay_kv.get("kvbm_disk_cache_hit_rate"),
+    replay2_kv.get("kvbm_disk_cache_hit_rate"),
+)
+if disk_hit_rate is None:
+    end_rate = parse_float(replay_kv_end.get("kvbm_disk_cache_hit_rate"))
+    start_rate = parse_float(replay_kv_start.get("kvbm_disk_cache_hit_rate"))
+    if end_rate is not None and start_rate is not None:
+        disk_hit_rate = end_rate - start_rate
+    else:
+        disk_hit_rate = 0.0
+
 request_manifest = run_dir / "request_manifest.jsonl"
 prompts_manifest = run_dir / "prompts_manifest.jsonl"
 
@@ -314,17 +542,93 @@ def sha256(path: pathlib.Path) -> str:
             h.update(b)
     return h.hexdigest()
 
+mode_value = summary.get("mode") or summary.get("tier_mode") or ((config.get("tier_mode")) if isinstance(config, dict) else None)
+mode_upper = str(mode_value).upper() if mode_value is not None else ""
+config_args = config.get("args") if isinstance(config.get("args"), dict) else {}
+config_kv_mode = config.get("kv_mode") if isinstance(config.get("kv_mode"), dict) else {}
+kv_mode_name = config_kv_mode.get("mode") or config.get("kv_mode") or config_args.get("kv_mode")
+
+config_disk_cache_gb = first_float(
+    config_args.get("kv_disk_cache_gb"),
+    config_kv_mode.get("disk_cache_gb"),
+    ((manifest.get("kv_mode") or {}).get("disk_cache_gb") if isinstance(manifest.get("kv_mode"), dict) else None),
+)
+runtime_disk_cache_gb = first_float(runtime_env.get("DYN_KVBM_DISK_CACHE_GB"))
+config_cache_dir = config_args.get("kvbm_cache_dir")
+runtime_cache_dir = runtime_env.get("DYN_KVBM_DISK_CACHE_DIR")
+
+try:
+    b1_read_bytes_threshold = max(0, int(float(b1_read_bytes_threshold_raw)))
+except Exception:
+    b1_read_bytes_threshold = 0
+try:
+    b1_disk_hit_rate_threshold = max(0.0, float(b1_disk_hit_rate_threshold_raw))
+except Exception:
+    b1_disk_hit_rate_threshold = 0.0
+enforce_b1_disk_tier_off = parse_bool(enforce_b1_disk_tier_off_raw)
+
+b1_disk_tier_verified = None
+b1_disk_tier_verification = None
+if mode_upper == "B1":
+    fail_reasons = []
+    kv_mode_ok = str(kv_mode_name or "") == "cpu_only"
+    disk_cache_disabled = (
+        (config_disk_cache_gb is not None and config_disk_cache_gb <= 0.0)
+        or (runtime_disk_cache_gb is not None and runtime_disk_cache_gb <= 0.0)
+    )
+    if not kv_mode_ok:
+        fail_reasons.append(f"kv_mode_not_cpu_only:{kv_mode_name}")
+    if not disk_cache_disabled:
+        fail_reasons.append(
+            f"disk_cache_gb_not_disabled:config={config_disk_cache_gb},runtime={runtime_disk_cache_gb}"
+        )
+    if float(onboard_delta or 0.0) > 0.0:
+        fail_reasons.append(f"onboard_blocks_d2d_delta={onboard_delta}")
+    if int(block_read_delta) > b1_read_bytes_threshold:
+        fail_reasons.append(f"replay_block_read_bytes_delta={block_read_delta}")
+    if int(cgroup_read_delta) > b1_read_bytes_threshold:
+        fail_reasons.append(f"replay_process_read_bytes_delta={cgroup_read_delta}")
+    if float(disk_hit_rate or 0.0) > b1_disk_hit_rate_threshold:
+        fail_reasons.append(f"kvbm_disk_cache_hit_rate={disk_hit_rate}")
+
+    b1_disk_tier_verified = len(fail_reasons) == 0
+    b1_disk_tier_verification = {
+        "enforcement_enabled": enforce_b1_disk_tier_off,
+        "kv_mode": kv_mode_name,
+        "config_disk_cache_gb": config_disk_cache_gb,
+        "runtime_disk_cache_gb": runtime_disk_cache_gb,
+        "config_cache_dir": config_cache_dir,
+        "runtime_cache_dir": runtime_cache_dir,
+        "onboard_blocks_d2d_delta_replay_plus_replay2": float(onboard_delta or 0.0),
+        "replay_block_read_bytes_delta_replay_plus_replay2": int(block_read_delta),
+        "replay_process_read_bytes_delta_replay_plus_replay2": int(cgroup_read_delta),
+        "kvbm_disk_cache_hit_rate": float(disk_hit_rate or 0.0),
+        "read_bytes_threshold": b1_read_bytes_threshold,
+        "disk_hit_rate_threshold": b1_disk_hit_rate_threshold,
+        "fail_reasons": fail_reasons,
+    }
+
 payload = {
-    "mode": summary.get("mode") or summary.get("tier_mode") or ((config.get("tier_mode")) if isinstance(config, dict) else None),
+    "mode": mode_value,
     "kvbm_enabled": bool(summary.get("kvbm_enabled")) if "kvbm_enabled" in summary else bool(((summary.get("kv_mode") or {}).get("kvbm_enabled"))),
     "kvbm_metrics_available": bool(summary.get("kvbm_metrics_available")) if "kvbm_metrics_available" in summary else bool(((summary.get("kvbm_metrics") or {}).get("available"))),
     "kvbm_metrics_status": kvbm_status,
     "run_path": str(run_dir),
     "error_rate": overall.get("error_rate"),
+    "overall_ttfc_ms": {
+        "p50": ttfc.get("p50"),
+        "p95": ttfc.get("p95"),
+        "p99": ttfc.get("p99"),
+    },
     "overall_ttft_ms": {
         "p50": ttft.get("p50"),
         "p95": ttft.get("p95"),
         "p99": ttft.get("p99"),
+    },
+    "replay_ttfc_ms": {
+        "p50": replay_ttfc.get("p50"),
+        "p95": replay_ttfc.get("p95"),
+        "p99": replay_ttfc.get("p99"),
     },
     "replay_ttft_ms": {
         "p50": replay_ttft.get("p50"),
@@ -336,21 +640,39 @@ payload = {
         "p95": replay_lat.get("p95"),
         "p99": replay_lat.get("p99"),
     },
+    "metric_preferred": "ttfc_ms",
+    "metric_used": {
+        "overall_p95": overall_metric_source_p95,
+        "overall_p99": overall_metric_source_p99,
+        "replay_p95": replay_metric_source_p95,
+        "replay_p99": replay_metric_source_p99,
+    },
+    "overall_metric_p95_ms": overall_metric_p95,
+    "overall_metric_p99_ms": overall_metric_p99,
+    "replay_metric_p95_ms": replay_metric_p95,
+    "replay_metric_p99_ms": replay_metric_p99,
+    "b1_disk_tier_verified": b1_disk_tier_verified,
+    "b1_disk_tier_verification": b1_disk_tier_verification,
     "mechanism": {
-        "kvbm_matched_tokens_delta_replay_plus_replay2": (
-            (replay_kv.get("kvbm_matched_tokens_delta") or 0.0) + (replay2_kv.get("kvbm_matched_tokens_delta") or 0.0)
-            if kvbm_ok
-            else None
+        "kvbm_matched_tokens_delta_replay_plus_replay2": matched_delta,
+        "kvbm_onboard_blocks_d2d_delta_replay_plus_replay2": onboard_delta,
+        "kvbm_offload_blocks_h2d_delta_replay_plus_replay2": offload_h2d_delta,
+        "kvbm_disk_cache_hit_rate": disk_hit_rate if kvbm_ok else None,
+        "block_read_bytes_delta_replay_plus_replay2": block_read_delta,
+        "block_write_bytes_delta_replay_plus_replay2": block_write_delta,
+        "cgroup_read_bytes_delta_replay_plus_replay2": cgroup_read_delta,
+        "cgroup_write_bytes_delta_replay_plus_replay2": cgroup_write_delta,
+        "ssd_rehydrate_signal_present": bool(
+            float(onboard_delta or 0.0) > 0.0
+            or float(disk_hit_rate or 0.0) > 0.0
+            or int(block_read_delta) > 0
+            or int(cgroup_read_delta) > 0
         ),
-        "kvbm_onboard_blocks_d2d_delta_replay_plus_replay2": (
-            (replay_kv.get("kvbm_onboard_blocks_d2d_delta") or 0.0) + (replay2_kv.get("kvbm_onboard_blocks_d2d_delta") or 0.0)
-            if kvbm_ok
-            else None
+        "ssd_write_signal_present": bool(
+            float(offload_h2d_delta or 0.0) > 0.0
+            or int(block_write_delta) > 0
+            or int(cgroup_write_delta) > 0
         ),
-        "block_read_bytes_delta_replay_plus_replay2": (rb.get("read_bytes_delta") or 0) + (rb2.get("read_bytes_delta") or 0),
-        "block_write_bytes_delta_replay_plus_replay2": (rb.get("write_bytes_delta") or 0) + (rb2.get("write_bytes_delta") or 0),
-        "cgroup_read_bytes_delta_replay_plus_replay2": (wb.get("cgroup_read_bytes_delta") or 0) + (wb2.get("cgroup_read_bytes_delta") or 0),
-        "cgroup_write_bytes_delta_replay_plus_replay2": (wb.get("cgroup_write_bytes_delta") or 0) + (wb2.get("cgroup_write_bytes_delta") or 0),
     },
     "phase_io_gib": phase_io_gib,
     "manifest_hashes": {
@@ -365,6 +687,8 @@ payload = {
         "scenario": config.get("scenario"),
         "tier_mode": config.get("tier_mode"),
         "kv_mode": (((config.get("kv_mode") or {}).get("mode")) if isinstance(config.get("kv_mode"), dict) else config.get("kv_mode")),
+        "kv_disk_cache_gb": ((config.get("args") or {}).get("kv_disk_cache_gb")),
+        "runtime_kv_disk_cache_gb": runtime_env.get("DYN_KVBM_DISK_CACHE_GB"),
         "rehydrate_populate_sessions": ((config.get("args") or {}).get("rehydrate_populate_sessions")),
         "rehydrate_thrash_sessions": ((config.get("args") or {}).get("rehydrate_thrash_sessions")),
         "rehydrate_turns": ((config.get("args") or {}).get("rehydrate_turns")),
@@ -376,6 +700,7 @@ payload = {
         "request_seed": ((config.get("args") or {}).get("request_seed")),
         "seed": ((config.get("args") or {}).get("seed")),
         "kvbm_cache_dir": ((config.get("args") or {}).get("kvbm_cache_dir")),
+        "runtime_kvbm_cache_dir": runtime_env.get("DYN_KVBM_DISK_CACHE_DIR"),
         "diagnostic_disable_disk_offload_filter": ((config.get("args") or {}).get("diagnostic_disable_disk_offload_filter")),
     },
     "nvme_artifacts": {},
@@ -492,6 +817,86 @@ print(json.dumps(payload, separators=(",", ":")))
 PY
 }
 
+build_semantic_context_json() {
+  "${PYTHON_BIN}" - "${SCENARIO}" "${MODEL_PROFILE}" "${CONC_LIST}" "${BASELINE_REPLAY_CONC}" "${PRESSURE_POPULATE_CONC}" "${PRESSURE_THRASH_CONC}" "${IO_ATTRIB}" "${INCLUDE_B0_ENABLED}" "${ENFORCE_B1_DISK_TIER_OFF_ENABLED}" "${B1_DISK_CACHE_GB}" "${B1_DISK_TIER_READ_BYTES_THRESHOLD}" "${B1_DISK_TIER_HIT_RATE_THRESHOLD}" <<'PY'
+import json
+import sys
+
+scenario = sys.argv[1]
+model_profile = sys.argv[2]
+conc_list_raw = sys.argv[3]
+baseline_replay_conc = int(sys.argv[4])
+pressure_pop_conc = int(sys.argv[5])
+pressure_thrash_conc = int(sys.argv[6])
+io_attrib_enabled = str(sys.argv[7]).strip().lower() in {"1", "true", "yes", "on"}
+include_b0 = str(sys.argv[8]).strip().lower() in {"1", "true", "yes", "on"}
+enforce_b1_disk_tier_off = str(sys.argv[9]).strip().lower() in {"1", "true", "yes", "on"}
+b1_disk_cache_gb = float(sys.argv[10])
+b1_read_bytes_threshold = int(float(sys.argv[11]))
+b1_disk_hit_rate_threshold = float(sys.argv[12])
+sweep_concs = [int(x) for x in str(conc_list_raw).split() if x.strip()]
+run_order = ["B2", "B1"] + (["B0"] if include_b0 else [])
+
+payload = {
+    "scenario": scenario,
+    "model_profile": model_profile,
+    "sweep_replay_concurrencies": sweep_concs,
+    "baseline_replay_concurrency": baseline_replay_conc,
+    "pressure_populate_concurrency": pressure_pop_conc,
+    "pressure_thrash_concurrency": pressure_thrash_conc,
+    "include_b0": include_b0,
+    "run_order_per_concurrency": run_order,
+    "require_b2_rehydrate": True,
+    "io_attrib_enabled": io_attrib_enabled,
+    "b1_disk_tier_enforced": enforce_b1_disk_tier_off,
+    "b1_disk_cache_gb": b1_disk_cache_gb,
+    "b1_read_bytes_threshold": b1_read_bytes_threshold,
+    "b1_disk_hit_rate_threshold": b1_disk_hit_rate_threshold,
+    "metric_preferred": "ttfc_ms",
+}
+print(json.dumps(payload, separators=(",", ":"), ensure_ascii=True))
+PY
+}
+
+compute_semantic_payload_for_run() {
+  local run_dir="$1"
+  local context_json="$2"
+  "${PYTHON_BIN}" "${PHASE60_SEMANTIC_HASH_HELPER}" compute --run-dir "${run_dir}" --context-json "${context_json}"
+}
+
+resolve_known_semantic_payload() {
+  local baseline_file="$1"
+  local fallback_payload_json="$2"
+  "${PYTHON_BIN}" - "${baseline_file}" "${fallback_payload_json}" <<'PY'
+import json
+import pathlib
+import sys
+
+baseline_file = pathlib.Path(sys.argv[1])
+fallback_payload = json.loads(sys.argv[2])
+
+if baseline_file.exists():
+    try:
+        payload = json.loads(baseline_file.read_text(encoding="utf-8"))
+    except Exception:
+        payload = {}
+    if isinstance(payload, dict) and payload.get("semantic_hash"):
+        merged = {
+            "semantic_hash": payload.get("semantic_hash"),
+            "semantic_manifest": payload.get("semantic_manifest") if isinstance(payload.get("semantic_manifest"), dict) else {},
+            "run_path": payload.get("source_run_path"),
+            "manifest_path": payload.get("manifest_path"),
+            "source": "baseline_file",
+            "baseline_file": str(baseline_file),
+        }
+        print(json.dumps(merged, separators=(",", ":"), ensure_ascii=True))
+        raise SystemExit(0)
+
+fallback_payload["source"] = "known_good_run_fallback"
+print(json.dumps(fallback_payload, separators=(",", ":"), ensure_ascii=True))
+PY
+}
+
 run_probe() {
   local mode="$1"
   local bundle_id="$2"
@@ -506,12 +911,23 @@ run_probe() {
   local replay_repeats="${11}"
   local gen_tokens="${12}"
   local log_path="${LOG_DIR}/${bundle_id}.log"
+  local mode_cache_dir="${cache_dir}"
+  local mode_disk_cache_gb="${DISK_CACHE_GB}"
 
-  if [[ "${mode}" != "B0" && -n "${cache_dir}" ]]; then
-    mk_cache_dir "${cache_dir}"
+  if [[ "${mode}" == "B1" && "${ENFORCE_B1_DISK_TIER_OFF_ENABLED}" == "1" ]]; then
+    mode_disk_cache_gb="${B1_DISK_CACHE_GB}"
+    mode_cache_dir="${B1_KVBM_CACHE_DIR}/c${replay_conc}"
+  fi
+  if [[ "${mode}" == "B0" ]]; then
+    mode_disk_cache_gb="0"
+    mode_cache_dir=""
+  fi
+
+  if [[ "${mode}" != "B0" && -n "${mode_cache_dir}" ]]; then
+    mk_cache_dir "${mode_cache_dir}"
   fi
   {
-    echo "==== $(date -u +%Y-%m-%dT%H:%M:%SZ) run_probe start mode=${mode} bundle=${bundle_id} run=${run_id} replay_conc=${replay_conc} pressure_populate_conc=${PRESSURE_POPULATE_CONC} pressure_thrash_conc=${PRESSURE_THRASH_CONC} cache_dir=${cache_dir} disable_filter=${disable_filter} ===="
+    echo "==== $(date -u +%Y-%m-%dT%H:%M:%SZ) run_probe start mode=${mode} bundle=${bundle_id} run=${run_id} replay_conc=${replay_conc} pressure_populate_conc=${PRESSURE_POPULATE_CONC} pressure_thrash_conc=${PRESSURE_THRASH_CONC} cache_dir=${mode_cache_dir} mode_disk_cache_gb=${mode_disk_cache_gb} disable_filter=${disable_filter} ===="
   } >> "${log_path}"
 
   set +e
@@ -522,7 +938,7 @@ run_probe() {
   BENCH_MODEL_PROFILE="${MODEL_PROFILE}" \
   BENCH_PHASE56_SCENARIO="${SCENARIO}" \
   BENCH_PHASE56_CPU_CACHE_GB="${CPU_CACHE_GB}" \
-  BENCH_PHASE56_DISK_CACHE_GB="${DISK_CACHE_GB}" \
+  BENCH_PHASE56_DISK_CACHE_GB="${mode_disk_cache_gb}" \
   BENCH_PHASE56_MAX_TOKENS="${MAX_TOKENS}" \
   BENCH_PHASE56_TEMPERATURE="${TEMPERATURE}" \
   BENCH_PHASE56_SEED="${SEED}" \
@@ -542,7 +958,7 @@ run_probe() {
   BENCH_PHASE56_DISABLE_DISK_OFFLOAD_FILTER="${disable_filter}" \
   BENCH_PHASE56_IO_ATTRIB="${IO_ATTRIB}" \
   BENCH_PHASE56_IO_ATTRIB_INTERVAL_S="${IO_ATTRIB_INTERVAL_S}" \
-  DYN_KVBM_DISK_CACHE_DIR="${cache_dir}" \
+  DYN_KVBM_DISK_CACHE_DIR="${mode_cache_dir}" \
   BENCH_CONTAINER_NAME="${CONTAINER_NAME}" \
   scripts/bench_phase56_like_probe_trtllm.sh >> "${log_path}" 2>&1
   local rc=$?
@@ -630,6 +1046,17 @@ if mode == "B2":
         errs.append(
             f"mechanism_disappeared:matched={matched},onboard={onboard},block_read={block_read},cgroup_read={cgroup_read}"
         )
+elif mode == "B1":
+    verified = obj.get("b1_disk_tier_verified")
+    verification = obj.get("b1_disk_tier_verification") if isinstance(obj.get("b1_disk_tier_verification"), dict) else {}
+    enforcement_enabled = bool(verification.get("enforcement_enabled", True))
+    fail_reasons = verification.get("fail_reasons") if isinstance(verification.get("fail_reasons"), list) else []
+    if enforcement_enabled and verified is not True:
+        suffix = ",".join(str(item) for item in fail_reasons if str(item))
+        if suffix:
+            errs.append(f"B1_DISK_TIER_NOT_DISABLED:{suffix}")
+        else:
+            errs.append("B1_DISK_TIER_NOT_DISABLED")
 
 for name, d in (obj.get("nvme_artifacts") or {}).items():
     if d.get("success") is not True:
@@ -889,8 +1316,45 @@ for r in obj.get("rows", []):
         mx[mode] = max(mx[mode], int(r.get("concurrency") or 0))
 
 obj["max_concurrency_meeting_slo"] = mx
-obj["status"] = "completed"
-obj["decision_grade"] = True
+metric_counts = {"ttfc_ms": 0, "ttft_ms": 0, "missing": 0}
+for r in rows:
+    metric_used = r.get("metric_used") if isinstance(r.get("metric_used"), dict) else {}
+    replay_p95_used = metric_used.get("replay_p95")
+    if replay_p95_used in metric_counts:
+        metric_counts[replay_p95_used] += 1
+        continue
+
+    replay_ttfc = ((r.get("replay_ttfc_ms") or {}).get("p95"))
+    replay_ttft = ((r.get("replay_ttft_ms") or {}).get("p95"))
+    if replay_ttfc is not None:
+        metric_counts["ttfc_ms"] += 1
+    elif replay_ttft is not None:
+        metric_counts["ttft_ms"] += 1
+    else:
+        metric_counts["missing"] += 1
+
+dominant_metric = "mixed"
+non_zero = [name for name, count in metric_counts.items() if count > 0]
+if len(non_zero) == 1:
+    dominant_metric = non_zero[0]
+elif not non_zero:
+    dominant_metric = "missing"
+meta = obj.setdefault("meta", {})
+meta["metric_policy"] = {
+    "preferred": "ttfc_ms",
+    "fallback": "ttft_ms",
+    "used_replay_p95": dominant_metric,
+    "used_replay_p95_counts": metric_counts,
+}
+warnings = obj.get("warnings")
+warning_count = len(warnings) if isinstance(warnings, list) else 0
+obj["warning_count"] = warning_count
+if warning_count > 0:
+    obj["status"] = "completed"
+    obj["decision_grade"] = False
+else:
+    obj["status"] = "completed"
+    obj["decision_grade"] = True
 p.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
 PY
 }
@@ -916,10 +1380,15 @@ fieldnames = [
     "status",
     "pass_slo",
     "error_rate",
+    "overall_ttfc_p95_ms",
+    "overall_ttfc_p99_ms",
+    "replay_ttfc_p95_ms",
+    "replay_ttfc_p99_ms",
     "overall_ttft_p95_ms",
     "overall_ttft_p99_ms",
     "replay_ttft_p95_ms",
     "replay_ttft_p99_ms",
+    "metric_used_replay_p95",
     "populate_read_gib",
     "populate_write_gib",
     "thrash_read_gib",
@@ -933,6 +1402,7 @@ fieldnames = [
     "kvbm_metrics_available",
     "kvbm_matched_tokens_delta_replay_plus_replay2",
     "kvbm_onboard_blocks_d2d_delta_replay_plus_replay2",
+    "b1_disk_tier_verified",
     "run_path",
 ]
 
@@ -973,10 +1443,15 @@ with csv_path.open("w", encoding="utf-8", newline="") as fp:
                 "status": row.get("status"),
                 "pass_slo": row.get("pass_slo"),
                 "error_rate": row.get("error_rate"),
+                "overall_ttfc_p95_ms": ((row.get("overall_ttfc_ms") or {}).get("p95")),
+                "overall_ttfc_p99_ms": ((row.get("overall_ttfc_ms") or {}).get("p99")),
+                "replay_ttfc_p95_ms": ((row.get("replay_ttfc_ms") or {}).get("p95")),
+                "replay_ttfc_p99_ms": ((row.get("replay_ttfc_ms") or {}).get("p99")),
                 "overall_ttft_p95_ms": ((row.get("overall_ttft_ms") or {}).get("p95")),
                 "overall_ttft_p99_ms": ((row.get("overall_ttft_ms") or {}).get("p99")),
                 "replay_ttft_p95_ms": ((row.get("replay_ttft_ms") or {}).get("p95")),
                 "replay_ttft_p99_ms": ((row.get("replay_ttft_ms") or {}).get("p99")),
+                "metric_used_replay_p95": ((row.get("metric_used") or {}).get("replay_p95")),
                 "populate_read_gib": phase_val(phase_io, "populate", "read_gib"),
                 "populate_write_gib": phase_val(phase_io, "populate", "write_gib"),
                 "thrash_read_gib": phase_val(phase_io, "thrash", "read_gib"),
@@ -994,6 +1469,7 @@ with csv_path.open("w", encoding="utf-8", newline="") as fp:
                 "kvbm_onboard_blocks_d2d_delta_replay_plus_replay2": (
                     mechanism.get("kvbm_onboard_blocks_d2d_delta_replay_plus_replay2") if kvbm_ok else ""
                 ),
+                "b1_disk_tier_verified": row.get("b1_disk_tier_verified"),
                 "run_path": row.get("run_path"),
             }
         )
@@ -1005,15 +1481,31 @@ ensure_container
 trap 'emit_summary_csv >/dev/null 2>&1 || true' EXIT
 emit_diagnosis "${KNOWN_GOOD_B2_RUN}" "${FAILED_B2_C1_RUN}" "${DIAG_JSON}"
 
-KNOWN_METRICS_JSON="$(collect_run_metrics "${KNOWN_GOOD_B2_RUN}")"
-KNOWN_REQ_HASH="$("${PYTHON_BIN}" - "${KNOWN_METRICS_JSON}" <<'PY'
+if [[ ! -f "${PHASE60_SEMANTIC_HASH_HELPER}" ]]; then
+  echo "Missing helper: ${PHASE60_SEMANTIC_HASH_HELPER}" >&2
+  exit 2
+fi
+
+SEMANTIC_CONTEXT_JSON="$(build_semantic_context_json)"
+if [[ -f "${BASELINE_SEMANTIC_HASH_FILE}" ]]; then
+  KNOWN_SEMANTIC_PAYLOAD="$(resolve_known_semantic_payload "${BASELINE_SEMANTIC_HASH_FILE}" "{}")"
+else
+  FALLBACK_KNOWN_SEMANTIC_PAYLOAD="$(compute_semantic_payload_for_run "${KNOWN_GOOD_B2_RUN}" "${SEMANTIC_CONTEXT_JSON}")"
+  KNOWN_SEMANTIC_PAYLOAD="$(resolve_known_semantic_payload "${BASELINE_SEMANTIC_HASH_FILE}" "${FALLBACK_KNOWN_SEMANTIC_PAYLOAD}")"
+fi
+KNOWN_SEMANTIC_HASH="$("${PYTHON_BIN}" - "${KNOWN_SEMANTIC_PAYLOAD}" <<'PY'
 import json,sys
-print((json.loads(sys.argv[1]).get("manifest_hashes") or {}).get("request_manifest_sha256",""))
+payload = json.loads(sys.argv[1])
+print(payload.get("semantic_hash") or "")
 PY
 )"
-KNOWN_PROMPTS_HASH="$("${PYTHON_BIN}" - "${KNOWN_METRICS_JSON}" <<'PY'
+KNOWN_SEMANTIC_SOURCE="$("${PYTHON_BIN}" - "${KNOWN_SEMANTIC_PAYLOAD}" <<'PY'
 import json,sys
-print((json.loads(sys.argv[1]).get("manifest_hashes") or {}).get("prompts_manifest_sha256",""))
+payload = json.loads(sys.argv[1])
+if payload.get("source") == "baseline_file":
+    print(payload.get("baseline_file") or "baseline_file")
+else:
+    print(payload.get("run_path") or "")
 PY
 )"
 
@@ -1050,6 +1542,7 @@ meta.update(
         "include_b0": include_b0,
         "run_order_per_concurrency": run_order,
         "slo_definition": "replay_p95_ms <= (baseline_B2_replay_p95_ms_at_concurrency1 * 1.10)",
+        "metric_policy": {"preferred": "ttfc_ms", "fallback": "ttft_ms", "used_replay_p95": "pending"},
         "diagnosis_json": sys.argv[3],
         "known_good_b2_run": sys.argv[4],
         "resume_from": sys.argv[9] or None,
@@ -1061,6 +1554,7 @@ obj["stop_reason"] = None
 obj["stop_detail"] = None
 obj["stopped_at"] = None
 obj.setdefault("rows", [])
+obj.setdefault("warnings", [])
 obj.setdefault("baseline_b2_replay_p95_ms_at_concurrency1", None)
 obj.setdefault("slo_replay_p95_ms", None)
 obj.setdefault("max_concurrency_meeting_slo", {"B0": None, "B1": None, "B2": None})
@@ -1096,11 +1590,13 @@ payload = {
         "include_b0": include_b0,
         "run_order_per_concurrency": run_order,
         "slo_definition": "replay_p95_ms <= (baseline_B2_replay_p95_ms_at_concurrency1 * 1.10)",
+        "metric_policy": {"preferred": "ttfc_ms", "fallback": "ttft_ms", "used_replay_p95": "pending"},
         "diagnosis_json": sys.argv[3],
         "known_good_b2_run": sys.argv[4],
         "resume_from": sys.argv[9] or None,
     },
     "rows": [],
+    "warnings": [],
     "status": "running",
     "decision_grade": None,
     "baseline_b2_replay_p95_ms_at_concurrency1": None,
@@ -1110,6 +1606,8 @@ payload = {
 path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 PY
 fi
+
+summary_set_baseline_policy_meta "${KNOWN_SEMANTIC_HASH}" "${KNOWN_SEMANTIC_SOURCE}"
 
 RESUME_FROM_NORMALIZED=""
 resume_gate_open="true"
@@ -1293,18 +1791,54 @@ PY
     fi
 
     if [[ "${conc}" == "1" ]]; then
-      b2_req_hash="$("${PYTHON_BIN}" - "${b2_metrics_json}" <<'PY'
+      b2_semantic_payload="$(compute_semantic_payload_for_run "${b2_run_dir}" "${SEMANTIC_CONTEXT_JSON}")"
+      semantic_decision_json="$("${PYTHON_BIN}" "${PHASE60_SEMANTIC_HASH_HELPER}" decide --known-json "${KNOWN_SEMANTIC_PAYLOAD}" --current-json "${b2_semantic_payload}" --strict "${STRICT_BASELINE_HASH_ENABLED}" --accept-new "${ACCEPT_NEW_BASELINE_MANIFEST_ENABLED}")"
+      semantic_action="$("${PYTHON_BIN}" - "${semantic_decision_json}" <<'PY'
 import json,sys
-print((json.loads(sys.argv[1]).get("manifest_hashes") or {}).get("request_manifest_sha256",""))
+print((json.loads(sys.argv[1]).get("action") or ""))
 PY
 )"
-      b2_prompts_hash="$("${PYTHON_BIN}" - "${b2_metrics_json}" <<'PY'
+      if [[ "${semantic_action}" != "match" ]]; then
+        mismatch_diagnostics_json="$("${PYTHON_BIN}" - "${semantic_decision_json}" "${KNOWN_SEMANTIC_PAYLOAD}" "${b2_semantic_payload}" "${BASELINE_SEMANTIC_HASH_FILE}" "${KNOWN_SEMANTIC_SOURCE}" <<'PY'
 import json,sys
-print((json.loads(sys.argv[1]).get("manifest_hashes") or {}).get("prompts_manifest_sha256",""))
+decision = json.loads(sys.argv[1])
+known = json.loads(sys.argv[2])
+current = json.loads(sys.argv[3])
+diag = {
+    "baseline_manifest_path": current.get("manifest_path"),
+    "known_good_manifest_path": known.get("manifest_path"),
+    "known_good_source": sys.argv[5] or known.get("source"),
+    "semantic_hash_file": sys.argv[4],
+    "computed_semantic_hash": decision.get("current_hash"),
+    "known_good_semantic_hash": decision.get("known_hash"),
+    "differing_fields": decision.get("diff_fields") or [],
+    "known_run_path": known.get("run_path"),
+    "current_run_path": current.get("run_path"),
+}
+print(json.dumps(diag, separators=(",", ":"), ensure_ascii=True))
 PY
 )"
-      if [[ "${b2_req_hash}" != "${KNOWN_REQ_HASH}" || "${b2_prompts_hash}" != "${KNOWN_PROMPTS_HASH}" ]]; then
-        b2_invalid_hash_row="$("${PYTHON_BIN}" - "${b2_metrics_json}" "${conc}" "${b2_cache}" "${KNOWN_REQ_HASH}" "${KNOWN_PROMPTS_HASH}" <<'PY'
+
+        if [[ "${semantic_action}" == "accept" ]]; then
+          "${PYTHON_BIN}" "${PHASE60_SEMANTIC_HASH_HELPER}" accept \
+            --baseline-file "${BASELINE_SEMANTIC_HASH_FILE}" \
+            --audit-jsonl "${BASELINE_SEMANTIC_AUDIT_JSONL}" \
+            --known-json "${KNOWN_SEMANTIC_PAYLOAD}" \
+            --current-json "${b2_semantic_payload}" \
+            --reason "BENCH_PHASE60_ACCEPT_NEW_BASELINE_MANIFEST=1" >/dev/null
+          KNOWN_SEMANTIC_PAYLOAD="${b2_semantic_payload}"
+          KNOWN_SEMANTIC_HASH="$("${PYTHON_BIN}" - "${KNOWN_SEMANTIC_PAYLOAD}" <<'PY'
+import json,sys
+print((json.loads(sys.argv[1]).get("semantic_hash") or ""))
+PY
+)"
+          KNOWN_SEMANTIC_SOURCE="${BASELINE_SEMANTIC_HASH_FILE}"
+          summary_set_baseline_policy_meta "${KNOWN_SEMANTIC_HASH}" "${KNOWN_SEMANTIC_SOURCE}"
+          summary_append_warning "BASELINE_MANIFEST_HASH_ACCEPTED" "B2@c1 semantic baseline hash mismatch accepted and baseline updated" "B2" "1" "${mismatch_diagnostics_json}"
+        elif [[ "${semantic_action}" == "warn" ]]; then
+          summary_append_warning "BASELINE_MANIFEST_HASH_MISMATCH_WARNING" "B2@c1 semantic baseline hash mismatch (strict mode disabled); continuing sweep" "B2" "1" "${mismatch_diagnostics_json}"
+        else
+          b2_invalid_hash_row="$("${PYTHON_BIN}" - "${b2_metrics_json}" "${conc}" "${b2_cache}" "${KNOWN_SEMANTIC_HASH}" "${mismatch_diagnostics_json}" <<'PY'
 import json,sys
 m=json.loads(sys.argv[1])
 m["mode"]="B2"
@@ -1312,16 +1846,18 @@ m["concurrency"]=int(sys.argv[2])
 m["replay_concurrency"]=int(sys.argv[2])
 m["status"]="invalid_manifest_hash"
 m["phase"]="sweep_point"
-m["expected_known_good_hashes"]={"request_manifest_sha256":sys.argv[4],"prompts_manifest_sha256":sys.argv[5]}
+m["expected_known_good_semantic_hash"]=sys.argv[4]
+m["baseline_manifest_hash_diagnostics"]=json.loads(sys.argv[5])
 m["disk_offload_filter_disabled"]=False
 m["kvbm_cache_dir"]=sys.argv[3]
 print(json.dumps(m,separators=(",",":")))
 PY
 )"
-        summary_upsert_row "${b2_invalid_hash_row}" "${point_key_b2}"
-        update_summary_stop "baseline_manifest_hash_mismatch" "B2@c1 manifest hash mismatch vs known-good" "B2" "1"
-        emit_stop_verdict "baseline_manifest_hash_mismatch" "B2@c1 manifest hash mismatch vs known-good" "B2" "1"
-        exit 2
+          summary_upsert_row "${b2_invalid_hash_row}" "${point_key_b2}"
+          update_summary_stop "baseline_manifest_hash_mismatch" "B2@c1 semantic baseline hash mismatch vs known-good" "B2" "1" "${mismatch_diagnostics_json}"
+          emit_stop_verdict "baseline_manifest_hash_mismatch" "B2@c1 semantic baseline hash mismatch vs known-good" "B2" "1" "${mismatch_diagnostics_json}"
+          exit 2
+        fi
       fi
     fi
 
@@ -1346,6 +1882,9 @@ PY
     b1_bundle="phase60_rehydrate_minimal_sweep_B1_c${conc}_${TS}"
     b1_run="run_B1_c${conc}_${TS}"
     b1_cache="${KVBM_CACHE_BASE_DIR}/B1_c${conc}_full"
+    if [[ "${ENFORCE_B1_DISK_TIER_OFF_ENABLED}" == "1" ]]; then
+      b1_cache="${B1_KVBM_CACHE_DIR}/c${conc}"
+    fi
     b1_run_dir="$(run_probe "B1" "${b1_bundle}" "${b1_run}" "${conc}" "${b1_cache}" "false" "${POP_SESSIONS}" "${THRASH_SESSIONS}" "${TURNS}" "${PREFIX_TOKENS}" "${REPLAY_REPEATS}" "${REHYDRATE_GEN_TOKENS}")" || {
       update_summary_stop "probe_failed" "B1 full point failed to execute" "B1" "${conc}"
       emit_stop_verdict "probe_failed" "B1 full point failed to execute" "B1" "${conc}"
