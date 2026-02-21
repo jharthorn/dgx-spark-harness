@@ -146,6 +146,43 @@ class TestStreamingMetrics(unittest.TestCase):
             self.assertIn("stream_first_event_type", row)
             self.assertIn("http_status", row)
 
+    def test_ttfc_sanity_evaluation_passes_with_stable_ttfc(self) -> None:
+        verdict = run_bench.evaluate_ttfc_sanity(
+            short_stream_case={
+                "summary": {"ttfc_ms": {"p95": 40.0}, "latency_ms": {"p95": 80.0}},
+                "error_count": 0,
+            },
+            long_stream_case={
+                "summary": {"ttfc_ms": {"p95": 42.0}, "latency_ms": {"p95": 140.0}},
+                "error_count": 0,
+            },
+            short_legacy_case={"summary": {"ttft_ms": {"p95": 60.0}}, "error_count": 0},
+            long_legacy_case={"summary": {"ttft_ms": {"p95": 110.0}}, "error_count": 0},
+            ttfc_ratio_threshold=1.35,
+            ttft_ratio_threshold=1.20,
+        )
+        self.assertTrue(verdict["passed"])
+        self.assertTrue((verdict.get("checks") or {}).get("ttfc_stable_across_output_length"))
+        self.assertTrue((verdict.get("checks") or {}).get("legacy_ttft_scales_with_output_length"))
+
+    def test_ttfc_sanity_evaluation_fails_when_ttfc_scales(self) -> None:
+        verdict = run_bench.evaluate_ttfc_sanity(
+            short_stream_case={
+                "summary": {"ttfc_ms": {"p95": 30.0}, "latency_ms": {"p95": 70.0}},
+                "error_count": 0,
+            },
+            long_stream_case={
+                "summary": {"ttfc_ms": {"p95": 65.0}, "latency_ms": {"p95": 160.0}},
+                "error_count": 0,
+            },
+            short_legacy_case={"summary": {"ttft_ms": {"p95": 60.0}}, "error_count": 0},
+            long_legacy_case={"summary": {"ttft_ms": {"p95": 95.0}}, "error_count": 0},
+            ttfc_ratio_threshold=1.35,
+            ttft_ratio_threshold=1.20,
+        )
+        self.assertFalse(verdict["passed"])
+        self.assertIn("ttfc_scales_with_output_length", verdict["reasons"])
+
 
 if __name__ == "__main__":
     unittest.main()

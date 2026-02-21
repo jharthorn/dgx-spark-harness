@@ -57,3 +57,5 @@ trt_*/
 scripts/cufile.log
 hf_ckpt*/
 legacy/local/
+
+Project_Review.md

@@ -182,6 +182,17 @@ def enrich_summary_rows(summary_rows: list[dict[str, Any]]) -> list[dict[str, An
                         pass
                 else:
                     enriched[key] = parse_float(enriched.get(key))
+        if not str(enriched.get("metric_preferred_replay_p95") or "").strip():
+            enriched["metric_preferred_replay_p95"] = "replay_ttfc_p95_ms"
+        metric_used_replay_p95 = str(enriched.get("metric_used_replay_p95") or "").strip()
+        if not metric_used_replay_p95:
+            if parse_float(enriched.get("replay_ttfc_p95_ms")) is not None:
+                metric_used_replay_p95 = "replay_ttfc_p95_ms"
+            elif parse_float(enriched.get("replay_ttft_p95_ms")) is not None:
+                metric_used_replay_p95 = "replay_ttft_p95_ms"
+            else:
+                metric_used_replay_p95 = "missing"
+        enriched["metric_used_replay_p95"] = metric_used_replay_p95
         enriched["io_attrib_pass"] = parse_bool(enriched.get("io_attrib_pass"))
         out.append(enriched)
     return out

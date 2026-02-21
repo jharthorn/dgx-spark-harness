@@ -239,6 +239,7 @@ class AnalyzePhase70PairsTests(unittest.TestCase):
             self.assertEqual(p1_b2.get("process_evidence_method"), "cgroup")
             self.assertEqual(p1_b2.get("pid_warn"), "True")
             self.assertEqual(p1_b2.get("replay_concurrency"), "4")
+            self.assertEqual(p1_b2.get("metric_used_replay_p95"), "replay_ttfc_p95_ms")
 
             with delta_csv_path.open("r", encoding="utf-8", newline="") as fp:
                 deltas = list(csv.DictReader(fp))

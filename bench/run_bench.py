@@ -293,6 +293,55 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Record TTFB (time to response headers/first byte) when available.",
     )
+    parser.add_argument(
+        "--ttfc-sanity-validate",
+        action="store_true",
+        help=(
+            "Run a short TTFC sanity check: compare stream TTFC at short/long max_tokens and "
+            "legacy non-stream TTFT scaling on the same prompt/concurrency."
+        ),
+    )
+    parser.add_argument(
+        "--ttfc-sanity-fail-on-error",
+        action="store_true",
+        help="Mark run invalid when TTFC sanity validation fails.",
+    )
+    parser.add_argument(
+        "--ttfc-sanity-requests",
+        type=int,
+        default=8,
+        help="Request count per TTFC sanity case.",
+    )
+    parser.add_argument(
+        "--ttfc-sanity-concurrency",
+        type=int,
+        default=None,
+        help="Optional concurrency override for TTFC sanity cases.",
+    )
+    parser.add_argument(
+        "--ttfc-sanity-short-max-tokens",
+        type=int,
+        default=8,
+        help="Short-output max_tokens for TTFC sanity cases.",
+    )
+    parser.add_argument(
+        "--ttfc-sanity-long-max-tokens",
+        type=int,
+        default=256,
+        help="Long-output max_tokens for TTFC sanity cases.",
+    )
+    parser.add_argument(
+        "--ttfc-sanity-ttfc-ratio-threshold",
+        type=float,
+        default=1.35,
+        help="Fail TTFC sanity when long/short stream TTFC p95 exceeds this ratio.",
+    )
+    parser.add_argument(
+        "--ttfc-sanity-ttft-ratio-threshold",
+        type=float,
+        default=1.20,
+        help="Fail TTFC sanity when long/short non-stream TTFT p95 is below this ratio.",
+    )
     parser.add_argument("--timeout-s", type=float, default=600.0)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument(
@@ -492,6 +541,20 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.stream_timeout_s is not None and float(args.stream_timeout_s) <= 0:
         parser.error("--stream-timeout-s must be > 0 when provided.")
+    if int(args.ttfc_sanity_requests) <= 0:
+        parser.error("--ttfc-sanity-requests must be >= 1.")
+    if args.ttfc_sanity_concurrency is not None and int(args.ttfc_sanity_concurrency) <= 0:
+        parser.error("--ttfc-sanity-concurrency must be >= 1.")
+    if int(args.ttfc_sanity_short_max_tokens) <= 0:
+        parser.error("--ttfc-sanity-short-max-tokens must be >= 1.")
+    if int(args.ttfc_sanity_long_max_tokens) <= 0:
+        parser.error("--ttfc-sanity-long-max-tokens must be >= 1.")
+    if int(args.ttfc_sanity_long_max_tokens) < int(args.ttfc_sanity_short_max_tokens):
+        parser.error("--ttfc-sanity-long-max-tokens must be >= --ttfc-sanity-short-max-tokens.")
+    if float(args.ttfc_sanity_ttfc_ratio_threshold) <= 0:
+        parser.error("--ttfc-sanity-ttfc-ratio-threshold must be > 0.")
+    if float(args.ttfc_sanity_ttft_ratio_threshold) <= 0:
+        parser.error("--ttfc-sanity-ttft-ratio-threshold must be > 0.")
     return args
 
 
@@ -1619,6 +1682,7 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
     run_valid = True
     invalid_reason: Optional[str] = None
     invalid_details: list[str] = []
+    ttfc_sanity_validation: dict[str, Any] = {"enabled": bool(args.ttfc_sanity_validate), "status": "not_run"}
     model_id = args.model_id
     model_count_end: Optional[int] = None
 
@@ -1986,6 +2050,46 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
                     snap = kvbm_probe.snapshot("run_end")
                     kvbm_snapshots.append(snap)
                     append_jsonl(kvbm_snapshots_path, snap)
+
+                if bool(args.ttfc_sanity_validate):
+                    sanity_prompt_text = unique_prompts[0].prompt if unique_prompts else "Sanity check prompt."
+                    try:
+                        ttfc_sanity_validation = await run_ttfc_sanity_validation(
+                            client=client,
+                            model_id=model_id,
+                            args=args,
+                            estimator=estimator,
+                            prompt_text=sanity_prompt_text,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        ttfc_sanity_validation = {
+                            "enabled": True,
+                            "status": "error",
+                            "error": str(exc),
+                        }
+                    verdict = (
+                        ttfc_sanity_validation.get("verdict")
+                        if isinstance(ttfc_sanity_validation.get("verdict"), dict)
+                        else {}
+                    )
+                    sanity_passed = bool(verdict.get("passed"))
+                    if not sanity_passed:
+                        reasons = verdict.get("reasons") if isinstance(verdict.get("reasons"), list) else []
+                        failure_detail = (
+                            "ttfc_sanity_failed:" + ",".join(str(item) for item in reasons if str(item))
+                            if reasons
+                            else "ttfc_sanity_failed"
+                        )
+                        if bool(args.ttfc_sanity_fail_on_error):
+                            invalid_details.append(failure_detail)
+                            run_valid = False
+                            if invalid_reason is None:
+                                invalid_reason = "ttfc_sanity_failed"
+                        else:
+                            ttfc_sanity_validation["warning"] = failure_detail
+                    ttfc_sanity_validation["status"] = "pass" if sanity_passed else "fail"
+                else:
+                    ttfc_sanity_validation = {"enabled": False, "status": "disabled"}
                 model_count_end = await client.count_models()
         except Exception as exc:  # noqa: BLE001
             run_valid = False
@@ -2198,6 +2302,7 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
             "records": metrics_capture_records if args.capture_metrics_snapshot else [],
             "inventory_keywords": metrics_inventory_keywords if args.capture_metrics_snapshot else [],
         },
+        "ttfc_sanity_validation": ttfc_sanity_validation,
         "request_identity": request_identity_summary,
         "fingerprint": fingerprint,
         "notes": [
@@ -2629,6 +2734,290 @@ def percentile(values: list[float], pct: float) -> float:
     if f == c:
         return ordered[int(k)]
     return ordered[f] * (c - k) + ordered[c] * (k - f)
+
+
+def _metric_p95(summary: dict[str, Any], metric_key: str) -> Optional[float]:
+    metric_payload = summary.get(metric_key) if isinstance(summary.get(metric_key), dict) else {}
+    try:
+        value = metric_payload.get("p95") if isinstance(metric_payload, dict) else None
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_ratio(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
+    if numerator is None or denominator is None:
+        return None
+    if denominator <= 0.0:
+        return None
+    return float(numerator) / float(denominator)
+
+
+def _resolve_ttfc_sanity_concurrency(args: argparse.Namespace) -> int:
+    if args.ttfc_sanity_concurrency is not None:
+        return max(1, int(args.ttfc_sanity_concurrency))
+    if args.scenario == "rehydrate_replay":
+        replay_conc = args.rehydrate_replay_concurrency or args.rehydrate_populate_concurrency or args.concurrency
+        return max(1, int(replay_conc))
+    return max(1, int(args.concurrency))
+
+
+async def run_ttfc_sanity_case(
+    *,
+    client: Any,
+    model_id: str,
+    prompt_text: str,
+    estimator: TokenEstimator,
+    requests: int,
+    concurrency: int,
+    max_tokens: int,
+    stream: bool,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    if requests <= 0:
+        return {
+            "requests": 0,
+            "concurrency": int(max(1, concurrency)),
+            "max_tokens": int(max_tokens),
+            "stream": bool(stream),
+            "summary": summarize_phase([], 0.0),
+            "error_count": 0,
+            "ttfc_present_count": 0,
+            "ttft_present_count": 0,
+            "ttfb_present_count": 0,
+            "avg_output_tokens_est": 0.0,
+        }
+
+    queue: asyncio.Queue[int] = asyncio.Queue()
+    for idx in range(requests):
+        queue.put_nowait(idx + 1)
+
+    rows: list[dict[str, Any]] = []
+    rows_lock = asyncio.Lock()
+    prompt_tokens_est = estimator.estimate(prompt_text)
+    started = time.perf_counter()
+
+    async def worker() -> None:
+        while True:
+            try:
+                req_idx = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            completion = await client.create_completion(
+                model=model_id,
+                prompt=prompt_text,
+                max_tokens=int(max_tokens),
+                temperature=float(args.temperature),
+                top_p=float(args.top_p),
+                stop=list(args.stop),
+                stream=bool(stream),
+                seed=args.request_seed,
+                stream_timeout_s=(float(args.stream_timeout_s) if args.stream_timeout_s is not None else None),
+                stream_record_ttfb=bool(args.stream_record_ttfb),
+            )
+            output_tokens_est = estimator.estimate(completion.text or "") if completion.text else 0
+            row = {
+                "request_index": req_idx,
+                "latency_ms": round(float(completion.latency_ms), 3),
+                "ttft_ms": round(float(completion.ttft_ms), 3) if completion.ttft_ms is not None else None,
+                "ttfc_ms": round(float(completion.ttfc_ms), 3) if completion.ttfc_ms is not None else None,
+                "ttfb_ms": round(float(completion.ttfb_ms), 3) if completion.ttfb_ms is not None else None,
+                "status_code": int(completion.status_code),
+                "error": completion.error,
+                "prompt_tokens_est": int(prompt_tokens_est),
+                "output_tokens_est": int(output_tokens_est),
+            }
+            async with rows_lock:
+                rows.append(row)
+            queue.task_done()
+
+    workers = [asyncio.create_task(worker()) for _ in range(max(1, int(concurrency)))]
+    await asyncio.gather(*workers)
+    rows.sort(key=lambda item: int(item.get("request_index", 0)))
+    duration_s = time.perf_counter() - started
+    summary = summarize_phase(rows, duration_s)
+    output_tokens = [int(row.get("output_tokens_est", 0)) for row in rows if not row.get("error")]
+    avg_output_tokens = (sum(output_tokens) / len(output_tokens)) if output_tokens else 0.0
+    return {
+        "requests": len(rows),
+        "concurrency": int(max(1, int(concurrency))),
+        "max_tokens": int(max_tokens),
+        "stream": bool(stream),
+        "summary": summary,
+        "error_count": sum(1 for row in rows if row.get("error")),
+        "ttfc_present_count": sum(1 for row in rows if row.get("ttfc_ms") is not None),
+        "ttft_present_count": sum(1 for row in rows if row.get("ttft_ms") is not None),
+        "ttfb_present_count": sum(1 for row in rows if row.get("ttfb_ms") is not None),
+        "avg_output_tokens_est": round(avg_output_tokens, 3),
+    }
+
+
+def evaluate_ttfc_sanity(
+    *,
+    short_stream_case: dict[str, Any],
+    long_stream_case: dict[str, Any],
+    short_legacy_case: dict[str, Any],
+    long_legacy_case: dict[str, Any],
+    ttfc_ratio_threshold: float,
+    ttft_ratio_threshold: float,
+) -> dict[str, Any]:
+    short_stream_summary = (
+        short_stream_case.get("summary") if isinstance(short_stream_case.get("summary"), dict) else {}
+    )
+    long_stream_summary = long_stream_case.get("summary") if isinstance(long_stream_case.get("summary"), dict) else {}
+    short_legacy_summary = (
+        short_legacy_case.get("summary") if isinstance(short_legacy_case.get("summary"), dict) else {}
+    )
+    long_legacy_summary = long_legacy_case.get("summary") if isinstance(long_legacy_case.get("summary"), dict) else {}
+
+    short_stream_ttfc_p95 = _metric_p95(short_stream_summary, "ttfc_ms")
+    long_stream_ttfc_p95 = _metric_p95(long_stream_summary, "ttfc_ms")
+    short_stream_latency_p95 = _metric_p95(short_stream_summary, "latency_ms")
+    long_stream_latency_p95 = _metric_p95(long_stream_summary, "latency_ms")
+
+    short_legacy_ttft_p95 = _metric_p95(short_legacy_summary, "ttft_ms")
+    long_legacy_ttft_p95 = _metric_p95(long_legacy_summary, "ttft_ms")
+
+    ttfc_ratio = _safe_ratio(long_stream_ttfc_p95, short_stream_ttfc_p95)
+    stream_latency_ratio = _safe_ratio(long_stream_latency_p95, short_stream_latency_p95)
+    legacy_ttft_ratio = _safe_ratio(long_legacy_ttft_p95, short_legacy_ttft_p95)
+
+    reasons: list[str] = []
+    stream_ttfc_present = short_stream_ttfc_p95 is not None and long_stream_ttfc_p95 is not None
+    if not stream_ttfc_present:
+        reasons.append("stream_ttfc_missing")
+    if short_stream_case.get("error_count", 0) or long_stream_case.get("error_count", 0):
+        reasons.append("stream_case_errors_present")
+    if short_legacy_case.get("error_count", 0) or long_legacy_case.get("error_count", 0):
+        reasons.append("legacy_case_errors_present")
+
+    ttfc_stable = ttfc_ratio is not None and ttfc_ratio <= float(ttfc_ratio_threshold)
+    if stream_ttfc_present and not ttfc_stable:
+        reasons.append("ttfc_scales_with_output_length")
+
+    legacy_ttft_scales = legacy_ttft_ratio is not None and legacy_ttft_ratio >= float(ttft_ratio_threshold)
+    if not legacy_ttft_scales:
+        reasons.append("legacy_ttft_not_scaling_with_output_length")
+
+    passed = stream_ttfc_present and ttfc_stable and legacy_ttft_scales and not (
+        short_stream_case.get("error_count", 0)
+        or long_stream_case.get("error_count", 0)
+        or short_legacy_case.get("error_count", 0)
+        or long_legacy_case.get("error_count", 0)
+    )
+
+    return {
+        "passed": bool(passed),
+        "reasons": reasons,
+        "thresholds": {
+            "ttfc_ratio_max": float(ttfc_ratio_threshold),
+            "legacy_ttft_ratio_min": float(ttft_ratio_threshold),
+        },
+        "checks": {
+            "stream_ttfc_present": stream_ttfc_present,
+            "ttfc_stable_across_output_length": ttfc_stable,
+            "legacy_ttft_scales_with_output_length": legacy_ttft_scales,
+        },
+        "ratios": {
+            "stream_ttfc_p95_long_over_short": ttfc_ratio,
+            "stream_latency_p95_long_over_short": stream_latency_ratio,
+            "legacy_ttft_p95_long_over_short": legacy_ttft_ratio,
+        },
+        "metrics_p95_ms": {
+            "stream_short_ttfc": short_stream_ttfc_p95,
+            "stream_long_ttfc": long_stream_ttfc_p95,
+            "stream_short_latency": short_stream_latency_p95,
+            "stream_long_latency": long_stream_latency_p95,
+            "legacy_short_ttft": short_legacy_ttft_p95,
+            "legacy_long_ttft": long_legacy_ttft_p95,
+        },
+    }
+
+
+async def run_ttfc_sanity_validation(
+    *,
+    client: Any,
+    model_id: str,
+    args: argparse.Namespace,
+    estimator: TokenEstimator,
+    prompt_text: str,
+) -> dict[str, Any]:
+    requests = max(1, int(args.ttfc_sanity_requests))
+    concurrency = _resolve_ttfc_sanity_concurrency(args)
+    short_tokens = max(1, int(args.ttfc_sanity_short_max_tokens))
+    long_tokens = max(short_tokens, int(args.ttfc_sanity_long_max_tokens))
+
+    short_stream_case = await run_ttfc_sanity_case(
+        client=client,
+        model_id=model_id,
+        prompt_text=prompt_text,
+        estimator=estimator,
+        requests=requests,
+        concurrency=concurrency,
+        max_tokens=short_tokens,
+        stream=True,
+        args=args,
+    )
+    long_stream_case = await run_ttfc_sanity_case(
+        client=client,
+        model_id=model_id,
+        prompt_text=prompt_text,
+        estimator=estimator,
+        requests=requests,
+        concurrency=concurrency,
+        max_tokens=long_tokens,
+        stream=True,
+        args=args,
+    )
+    short_legacy_case = await run_ttfc_sanity_case(
+        client=client,
+        model_id=model_id,
+        prompt_text=prompt_text,
+        estimator=estimator,
+        requests=requests,
+        concurrency=concurrency,
+        max_tokens=short_tokens,
+        stream=False,
+        args=args,
+    )
+    long_legacy_case = await run_ttfc_sanity_case(
+        client=client,
+        model_id=model_id,
+        prompt_text=prompt_text,
+        estimator=estimator,
+        requests=requests,
+        concurrency=concurrency,
+        max_tokens=long_tokens,
+        stream=False,
+        args=args,
+    )
+
+    verdict = evaluate_ttfc_sanity(
+        short_stream_case=short_stream_case,
+        long_stream_case=long_stream_case,
+        short_legacy_case=short_legacy_case,
+        long_legacy_case=long_legacy_case,
+        ttfc_ratio_threshold=float(args.ttfc_sanity_ttfc_ratio_threshold),
+        ttft_ratio_threshold=float(args.ttfc_sanity_ttft_ratio_threshold),
+    )
+    return {
+        "enabled": True,
+        "requests_per_case": requests,
+        "concurrency": concurrency,
+        "short_max_tokens": short_tokens,
+        "long_max_tokens": long_tokens,
+        "prompt_sha256": hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
+        "cases": {
+            "short_stream": short_stream_case,
+            "long_stream": long_stream_case,
+            "short_legacy_non_stream": short_legacy_case,
+            "long_legacy_non_stream": long_legacy_case,
+        },
+        "verdict": verdict,
+    }
 
 
 def parse_token_range(text: str, arg_name: str) -> tuple[int, int]:

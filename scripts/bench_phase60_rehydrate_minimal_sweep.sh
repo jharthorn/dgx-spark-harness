@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+normalize_bool() {
+  local raw="${1:-0}"
+  case "${raw,,}" in
+    1|true|yes|on) echo "1" ;;
+    0|false|no|off|"") echo "0" ;;
+    *)
+      echo "Invalid boolean value: ${raw}" >&2
+      exit 1
+      ;;
+  esac
+}
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
@@ -44,6 +56,18 @@ PRESSURE_THRASH_CONC="${BENCH_PHASE60_PRESSURE_THRASH_CONCURRENCY:-2}"
 BASELINE_REPLAY_CONC="${BENCH_PHASE60_BASELINE_REPLAY_CONCURRENCY:-1}"
 IO_ATTRIB="${BENCH_PHASE60_IO_ATTRIB:-0}"
 IO_ATTRIB_INTERVAL_S="${BENCH_PHASE60_IO_ATTRIB_INTERVAL_S:-1}"
+STREAM_METRICS="$(normalize_bool "${BENCH_PHASE60_STREAM_METRICS:-1}")"
+STREAM_TIMEOUT_S="${BENCH_PHASE60_STREAM_TIMEOUT_S:-}"
+STREAM_RECORD_TTFB="$(normalize_bool "${BENCH_PHASE60_STREAM_RECORD_TTFB:-0}")"
+REQUIRE_TTFC="$(normalize_bool "${BENCH_PHASE60_REQUIRE_TTFC:-1}")"
+TTFC_SANITY_VALIDATE="$(normalize_bool "${BENCH_PHASE60_TTFC_SANITY_VALIDATE:-0}")"
+TTFC_SANITY_FAIL_ON_ERROR="$(normalize_bool "${BENCH_PHASE60_TTFC_SANITY_FAIL_ON_ERROR:-0}")"
+TTFC_SANITY_REQUESTS="${BENCH_PHASE60_TTFC_SANITY_REQUESTS:-8}"
+TTFC_SANITY_CONCURRENCY="${BENCH_PHASE60_TTFC_SANITY_CONCURRENCY:-}"
+TTFC_SANITY_SHORT_MAX_TOKENS="${BENCH_PHASE60_TTFC_SANITY_SHORT_MAX_TOKENS:-8}"
+TTFC_SANITY_LONG_MAX_TOKENS="${BENCH_PHASE60_TTFC_SANITY_LONG_MAX_TOKENS:-256}"
+TTFC_SANITY_TTFC_RATIO_THRESHOLD="${BENCH_PHASE60_TTFC_SANITY_TTFC_RATIO_THRESHOLD:-1.35}"
+TTFC_SANITY_TTFT_RATIO_THRESHOLD="${BENCH_PHASE60_TTFC_SANITY_TTFT_RATIO_THRESHOLD:-1.20}"
 IO_ATTRIB_CHECKER="${REPO_ROOT}/scripts/check_io_attrib_replay.py"
 INCLUDE_B0="${BENCH_PHASE60_INCLUDE_B0:-0}"
 STRICT_BASELINE_HASH="${BENCH_PHASE60_STRICT_BASELINE_HASH:-0}"
@@ -169,7 +193,7 @@ if diagnostics_raw:
 obj.setdefault("baseline_b2_replay_p95_ms_at_concurrency1", None)
 obj.setdefault("slo_replay_p95_ms", None)
 obj.setdefault("max_concurrency_meeting_slo", {"B0": None, "B1": None, "B2": None})
-metric_counts = {"ttfc_ms": 0, "ttft_ms": 0, "missing": 0}
+metric_counts = {"replay_ttfc_p95_ms": 0, "replay_ttft_p95_ms": 0, "missing": 0}
 for row in obj.get("rows", []):
     if not isinstance(row, dict):
         continue
@@ -178,12 +202,18 @@ for row in obj.get("rows", []):
     if replay_p95_used in metric_counts:
         metric_counts[replay_p95_used] += 1
         continue
+    if replay_p95_used == "ttfc_ms":
+        metric_counts["replay_ttfc_p95_ms"] += 1
+        continue
+    if replay_p95_used == "ttft_ms":
+        metric_counts["replay_ttft_p95_ms"] += 1
+        continue
     replay_ttfc = ((row.get("replay_ttfc_ms") or {}).get("p95"))
     replay_ttft = ((row.get("replay_ttft_ms") or {}).get("p95"))
     if replay_ttfc is not None:
-        metric_counts["ttfc_ms"] += 1
+        metric_counts["replay_ttfc_p95_ms"] += 1
     elif replay_ttft is not None:
-        metric_counts["ttft_ms"] += 1
+        metric_counts["replay_ttft_p95_ms"] += 1
     else:
         metric_counts["missing"] += 1
 dominant_metric = "mixed"
@@ -194,8 +224,8 @@ elif not non_zero:
     dominant_metric = "missing"
 meta = obj.setdefault("meta", {})
 meta["metric_policy"] = {
-    "preferred": "ttfc_ms",
-    "fallback": "ttft_ms",
+    "preferred": "replay_ttfc_p95_ms",
+    "fallback": "replay_ttft_p95_ms",
     "used_replay_p95": dominant_metric,
     "used_replay_p95_counts": metric_counts,
 }
@@ -228,6 +258,11 @@ fi
 ENFORCE_B1_DISK_TIER_OFF_ENABLED="0"
 if is_truthy "${ENFORCE_B1_DISK_TIER_OFF}"; then
   ENFORCE_B1_DISK_TIER_OFF_ENABLED="1"
+fi
+
+REQUIRE_TTFC_ENABLED="0"
+if is_truthy "${REQUIRE_TTFC}"; then
+  REQUIRE_TTFC_ENABLED="1"
 fi
 
 summary_append_warning() {
@@ -457,21 +492,21 @@ if not isinstance(kvbm_status, dict):
     kvbm_status = {}
 kvbm_ok = str(kvbm_status.get("status") or "") == "ok"
 
-def choose_metric(ttfc_stats, ttft_stats, stat):
+def choose_metric(scope, ttfc_stats, ttft_stats, stat):
     if isinstance(ttfc_stats, dict):
         ttfc_value = parse_float(ttfc_stats.get(stat))
         if ttfc_value is not None:
-            return ttfc_value, "ttfc_ms"
+            return ttfc_value, f"{scope}_ttfc_{stat}_ms"
     if isinstance(ttft_stats, dict):
         ttft_value = parse_float(ttft_stats.get(stat))
         if ttft_value is not None:
-            return ttft_value, "ttft_ms"
+            return ttft_value, f"{scope}_ttft_{stat}_ms"
     return None, "missing"
 
-overall_metric_p95, overall_metric_source_p95 = choose_metric(ttfc, ttft, "p95")
-overall_metric_p99, overall_metric_source_p99 = choose_metric(ttfc, ttft, "p99")
-replay_metric_p95, replay_metric_source_p95 = choose_metric(replay_ttfc, replay_ttft, "p95")
-replay_metric_p99, replay_metric_source_p99 = choose_metric(replay_ttfc, replay_ttft, "p99")
+overall_metric_p95, overall_metric_source_p95 = choose_metric("overall", ttfc, ttft, "p95")
+overall_metric_p99, overall_metric_source_p99 = choose_metric("overall", ttfc, ttft, "p99")
+replay_metric_p95, replay_metric_source_p95 = choose_metric("replay", replay_ttfc, replay_ttft, "p95")
+replay_metric_p99, replay_metric_source_p99 = choose_metric("replay", replay_ttfc, replay_ttft, "p99")
 
 phase_io_gib = {}
 for phase_name, phase_payload in phases.items():
@@ -610,6 +645,8 @@ if mode_upper == "B1":
 
 payload = {
     "mode": mode_value,
+    "stream": bool(summary.get("stream")),
+    "stream_record_ttfb": bool(summary.get("stream_record_ttfb")),
     "kvbm_enabled": bool(summary.get("kvbm_enabled")) if "kvbm_enabled" in summary else bool(((summary.get("kv_mode") or {}).get("kvbm_enabled"))),
     "kvbm_metrics_available": bool(summary.get("kvbm_metrics_available")) if "kvbm_metrics_available" in summary else bool(((summary.get("kvbm_metrics") or {}).get("available"))),
     "kvbm_metrics_status": kvbm_status,
@@ -640,7 +677,7 @@ payload = {
         "p95": replay_lat.get("p95"),
         "p99": replay_lat.get("p99"),
     },
-    "metric_preferred": "ttfc_ms",
+    "metric_preferred": "replay_ttfc_p95_ms",
     "metric_used": {
         "overall_p95": overall_metric_source_p95,
         "overall_p99": overall_metric_source_p99,
@@ -852,7 +889,7 @@ payload = {
     "b1_disk_cache_gb": b1_disk_cache_gb,
     "b1_read_bytes_threshold": b1_read_bytes_threshold,
     "b1_disk_hit_rate_threshold": b1_disk_hit_rate_threshold,
-    "metric_preferred": "ttfc_ms",
+    "metric_preferred": "replay_ttfc_p95_ms",
 }
 print(json.dumps(payload, separators=(",", ":"), ensure_ascii=True))
 PY
@@ -958,6 +995,17 @@ run_probe() {
   BENCH_PHASE56_DISABLE_DISK_OFFLOAD_FILTER="${disable_filter}" \
   BENCH_PHASE56_IO_ATTRIB="${IO_ATTRIB}" \
   BENCH_PHASE56_IO_ATTRIB_INTERVAL_S="${IO_ATTRIB_INTERVAL_S}" \
+  BENCH_PHASE56_STREAM_METRICS="${STREAM_METRICS}" \
+  BENCH_PHASE56_STREAM_TIMEOUT_S="${STREAM_TIMEOUT_S}" \
+  BENCH_PHASE56_STREAM_RECORD_TTFB="${STREAM_RECORD_TTFB}" \
+  BENCH_PHASE56_TTFC_SANITY_VALIDATE="${TTFC_SANITY_VALIDATE}" \
+  BENCH_PHASE56_TTFC_SANITY_FAIL_ON_ERROR="${TTFC_SANITY_FAIL_ON_ERROR}" \
+  BENCH_PHASE56_TTFC_SANITY_REQUESTS="${TTFC_SANITY_REQUESTS}" \
+  BENCH_PHASE56_TTFC_SANITY_CONCURRENCY="${TTFC_SANITY_CONCURRENCY}" \
+  BENCH_PHASE56_TTFC_SANITY_SHORT_MAX_TOKENS="${TTFC_SANITY_SHORT_MAX_TOKENS}" \
+  BENCH_PHASE56_TTFC_SANITY_LONG_MAX_TOKENS="${TTFC_SANITY_LONG_MAX_TOKENS}" \
+  BENCH_PHASE56_TTFC_SANITY_TTFC_RATIO_THRESHOLD="${TTFC_SANITY_TTFC_RATIO_THRESHOLD}" \
+  BENCH_PHASE56_TTFC_SANITY_TTFT_RATIO_THRESHOLD="${TTFC_SANITY_TTFT_RATIO_THRESHOLD}" \
   DYN_KVBM_DISK_CACHE_DIR="${mode_cache_dir}" \
   BENCH_CONTAINER_NAME="${CONTAINER_NAME}" \
   scripts/bench_phase56_like_probe_trtllm.sh >> "${log_path}" 2>&1
@@ -1009,6 +1057,34 @@ ok = (
     or int(m.get("cgroup_read_bytes_delta_replay_plus_replay2") or 0) > 0
 )
 print("1" if ok else "0")
+PY
+}
+
+validate_ttfc_capture() {
+  local mode="$1"
+  local metrics_json="$2"
+  local require_ttfc="${3:-1}"
+  "${PYTHON_BIN}" - "${mode}" "${metrics_json}" "${require_ttfc}" <<'PY'
+import json
+import sys
+
+mode = sys.argv[1]
+obj = json.loads(sys.argv[2])
+require_ttfc = str(sys.argv[3]).strip().lower() in {"1", "true", "yes", "on"}
+if not require_ttfc:
+    print("OK")
+    raise SystemExit(0)
+
+stream_enabled = bool(obj.get("stream"))
+replay_ttfc = obj.get("replay_ttfc_ms") if isinstance(obj.get("replay_ttfc_ms"), dict) else {}
+p95 = replay_ttfc.get("p95") if isinstance(replay_ttfc, dict) else None
+if not stream_enabled:
+    print(f"FAIL:stream_disabled_ttfc_required:mode={mode}")
+    raise SystemExit(0)
+if p95 is None:
+    print(f"FAIL:missing_replay_ttfc_p95:mode={mode}")
+    raise SystemExit(0)
+print("OK")
 PY
 }
 
@@ -1316,20 +1392,26 @@ for r in obj.get("rows", []):
         mx[mode] = max(mx[mode], int(r.get("concurrency") or 0))
 
 obj["max_concurrency_meeting_slo"] = mx
-metric_counts = {"ttfc_ms": 0, "ttft_ms": 0, "missing": 0}
+metric_counts = {"replay_ttfc_p95_ms": 0, "replay_ttft_p95_ms": 0, "missing": 0}
 for r in rows:
     metric_used = r.get("metric_used") if isinstance(r.get("metric_used"), dict) else {}
     replay_p95_used = metric_used.get("replay_p95")
     if replay_p95_used in metric_counts:
         metric_counts[replay_p95_used] += 1
         continue
+    if replay_p95_used == "ttfc_ms":
+        metric_counts["replay_ttfc_p95_ms"] += 1
+        continue
+    if replay_p95_used == "ttft_ms":
+        metric_counts["replay_ttft_p95_ms"] += 1
+        continue
 
     replay_ttfc = ((r.get("replay_ttfc_ms") or {}).get("p95"))
     replay_ttft = ((r.get("replay_ttft_ms") or {}).get("p95"))
     if replay_ttfc is not None:
-        metric_counts["ttfc_ms"] += 1
+        metric_counts["replay_ttfc_p95_ms"] += 1
     elif replay_ttft is not None:
-        metric_counts["ttft_ms"] += 1
+        metric_counts["replay_ttft_p95_ms"] += 1
     else:
         metric_counts["missing"] += 1
 
@@ -1341,8 +1423,8 @@ elif not non_zero:
     dominant_metric = "missing"
 meta = obj.setdefault("meta", {})
 meta["metric_policy"] = {
-    "preferred": "ttfc_ms",
-    "fallback": "ttft_ms",
+    "preferred": "replay_ttfc_p95_ms",
+    "fallback": "replay_ttft_p95_ms",
     "used_replay_p95": dominant_metric,
     "used_replay_p95_counts": metric_counts,
 }
@@ -1542,7 +1624,7 @@ meta.update(
         "include_b0": include_b0,
         "run_order_per_concurrency": run_order,
         "slo_definition": "replay_p95_ms <= (baseline_B2_replay_p95_ms_at_concurrency1 * 1.10)",
-        "metric_policy": {"preferred": "ttfc_ms", "fallback": "ttft_ms", "used_replay_p95": "pending"},
+        "metric_policy": {"preferred": "replay_ttfc_p95_ms", "fallback": "replay_ttft_p95_ms", "used_replay_p95": "pending"},
         "diagnosis_json": sys.argv[3],
         "known_good_b2_run": sys.argv[4],
         "resume_from": sys.argv[9] or None,
@@ -1590,7 +1672,7 @@ payload = {
         "include_b0": include_b0,
         "run_order_per_concurrency": run_order,
         "slo_definition": "replay_p95_ms <= (baseline_B2_replay_p95_ms_at_concurrency1 * 1.10)",
-        "metric_policy": {"preferred": "ttfc_ms", "fallback": "ttft_ms", "used_replay_p95": "pending"},
+        "metric_policy": {"preferred": "replay_ttfc_p95_ms", "fallback": "replay_ttft_p95_ms", "used_replay_p95": "pending"},
         "diagnosis_json": sys.argv[3],
         "known_good_b2_run": sys.argv[4],
         "resume_from": sys.argv[9] or None,
@@ -1649,6 +1731,27 @@ if ! summary_has_baseline; then
     exit 2
   }
   pre_metrics_json="$(collect_run_metrics "${pre_run_dir}")"
+  pre_ttfc_valid="$(validate_ttfc_capture "B2" "${pre_metrics_json}" "${REQUIRE_TTFC_ENABLED}")"
+  if [[ "${pre_ttfc_valid}" != "OK" ]]; then
+    pre_ttfc_row="$("${PYTHON_BIN}" - "${pre_metrics_json}" "${BASELINE_REPLAY_CONC}" "${pre_cache}" "${pre_ttfc_valid}" <<'PY'
+import json,sys
+m=json.loads(sys.argv[1])
+m["mode"]="B2"
+m["concurrency"]=int(sys.argv[2])
+m["replay_concurrency"]=int(sys.argv[2])
+m["status"]="invalid_ttfc"
+m["phase"]="baseline_preflight"
+m["validation"]=sys.argv[4]
+m["disk_offload_filter_disabled"]=False
+m["kvbm_cache_dir"]=sys.argv[3]
+print(json.dumps(m,separators=(",",":")))
+PY
+)"
+    summary_upsert_row "${pre_ttfc_row}" "baseline_preflight_B2_c${BASELINE_REPLAY_CONC}"
+    update_summary_stop "ttfc_missing_stream_capture" "${pre_ttfc_valid}" "B2" "${BASELINE_REPLAY_CONC}"
+    emit_stop_verdict "ttfc_missing_stream_capture" "${pre_ttfc_valid}" "B2" "${BASELINE_REPLAY_CONC}"
+    exit 2
+  fi
 pre_io_valid="$(validate_io_attrib_point "B2" "${pre_metrics_json}")"
   if [[ "${pre_io_valid}" != "OK" ]]; then
     pre_io_row="$("${PYTHON_BIN}" - "${pre_metrics_json}" "${BASELINE_REPLAY_CONC}" "${pre_cache}" "${pre_io_valid}" <<'PY'
@@ -1742,6 +1845,28 @@ print(json.dumps(m,separators=(",",":")))
 PY
 )"
     summary_upsert_row "${b2_partial_row}" "${point_key_b2}"
+
+    b2_ttfc_valid="$(validate_ttfc_capture "B2" "${b2_metrics_json}" "${REQUIRE_TTFC_ENABLED}")"
+    if [[ "${b2_ttfc_valid}" != "OK" ]]; then
+      b2_invalid_ttfc_row="$("${PYTHON_BIN}" - "${b2_metrics_json}" "${conc}" "${b2_cache}" "${b2_ttfc_valid}" <<'PY'
+import json,sys
+m=json.loads(sys.argv[1])
+m["mode"]="B2"
+m["concurrency"]=int(sys.argv[2])
+m["replay_concurrency"]=int(sys.argv[2])
+m["status"]="invalid_ttfc"
+m["phase"]="sweep_point"
+m["validation"]=sys.argv[4]
+m["disk_offload_filter_disabled"]=False
+m["kvbm_cache_dir"]=sys.argv[3]
+print(json.dumps(m,separators=(",",":")))
+PY
+)"
+      summary_upsert_row "${b2_invalid_ttfc_row}" "${point_key_b2}"
+      update_summary_stop "ttfc_missing_stream_capture" "${b2_ttfc_valid}" "B2" "${conc}"
+      emit_stop_verdict "ttfc_missing_stream_capture" "${b2_ttfc_valid}" "B2" "${conc}"
+      exit 2
+    fi
 
     b2_io_valid="$(validate_io_attrib_point "B2" "${b2_metrics_json}")"
     if [[ "${b2_io_valid}" != "OK" ]]; then
@@ -1906,6 +2031,28 @@ PY
 )"
     summary_upsert_row "${b1_partial_row}" "${point_key_b1}"
 
+    b1_ttfc_valid="$(validate_ttfc_capture "B1" "${b1_metrics_json}" "${REQUIRE_TTFC_ENABLED}")"
+    if [[ "${b1_ttfc_valid}" != "OK" ]]; then
+      b1_invalid_ttfc_row="$("${PYTHON_BIN}" - "${b1_metrics_json}" "${conc}" "${b1_cache}" "${b1_ttfc_valid}" <<'PY'
+import json,sys
+m=json.loads(sys.argv[1])
+m["mode"]="B1"
+m["concurrency"]=int(sys.argv[2])
+m["replay_concurrency"]=int(sys.argv[2])
+m["status"]="invalid_ttfc"
+m["phase"]="sweep_point"
+m["validation"]=sys.argv[4]
+m["disk_offload_filter_disabled"]=False
+m["kvbm_cache_dir"]=sys.argv[3]
+print(json.dumps(m,separators=(",",":")))
+PY
+)"
+      summary_upsert_row "${b1_invalid_ttfc_row}" "${point_key_b1}"
+      update_summary_stop "ttfc_missing_stream_capture" "${b1_ttfc_valid}" "B1" "${conc}"
+      emit_stop_verdict "ttfc_missing_stream_capture" "${b1_ttfc_valid}" "B1" "${conc}"
+      exit 2
+    fi
+
     b1_io_valid="$(validate_io_attrib_point "B1" "${b1_metrics_json}")"
     if [[ "${b1_io_valid}" != "OK" ]]; then
       b1_invalid_io_row="$("${PYTHON_BIN}" - "${b1_metrics_json}" "${conc}" "${b1_cache}" "${b1_io_valid}" <<'PY'
@@ -1992,6 +2139,28 @@ print(json.dumps(m,separators=(",",":")))
 PY
 )"
       summary_upsert_row "${b0_partial_row}" "${point_key_b0}"
+
+      b0_ttfc_valid="$(validate_ttfc_capture "B0" "${b0_metrics_json}" "${REQUIRE_TTFC_ENABLED}")"
+      if [[ "${b0_ttfc_valid}" != "OK" ]]; then
+        b0_invalid_ttfc_row="$("${PYTHON_BIN}" - "${b0_metrics_json}" "${conc}" "${b0_cache}" "${b0_ttfc_valid}" <<'PY'
+import json,sys
+m=json.loads(sys.argv[1])
+m["mode"]="B0"
+m["concurrency"]=int(sys.argv[2])
+m["replay_concurrency"]=int(sys.argv[2])
+m["status"]="invalid_ttfc"
+m["phase"]="sweep_point"
+m["validation"]=sys.argv[4]
+m["disk_offload_filter_disabled"]=False
+m["kvbm_cache_dir"]=sys.argv[3]
+print(json.dumps(m,separators=(",",":")))
+PY
+)"
+        summary_upsert_row "${b0_invalid_ttfc_row}" "${point_key_b0}"
+        update_summary_stop "ttfc_missing_stream_capture" "${b0_ttfc_valid}" "B0" "${conc}"
+        emit_stop_verdict "ttfc_missing_stream_capture" "${b0_ttfc_valid}" "B0" "${conc}"
+        exit 2
+      fi
 
       b0_io_valid="$(validate_io_attrib_point "B0" "${b0_metrics_json}")"
       if [[ "${b0_io_valid}" != "OK" ]]; then

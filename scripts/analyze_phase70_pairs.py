@@ -118,6 +118,13 @@ def extract_run_row(entry: dict[str, Any], *, replay_concurrency: int | None) ->
     storage = summary.get("storage") if isinstance(summary.get("storage"), dict) else {}
 
     io_attrib_pass, process_evidence_method, pid_warn, io_verdict = extract_io_verdict(run_dir)
+    replay_ttfc_p95 = parse_float((replay.get("ttfc_ms") or {}).get("p95"))
+    replay_ttfc_p99 = parse_float((replay.get("ttfc_ms") or {}).get("p99"))
+    replay_ttft_p95 = parse_float((replay.get("ttft_ms") or {}).get("p95"))
+    replay_ttft_p99 = parse_float((replay.get("ttft_ms") or {}).get("p99"))
+    metric_used_replay_p95 = "replay_ttfc_p95_ms"
+    if replay_ttfc_p95 is None:
+        metric_used_replay_p95 = "replay_ttft_p95_ms" if replay_ttft_p95 is not None else "missing"
 
     row = {
         "pair_id": int(entry.get("pair_id") or 0),
@@ -132,10 +139,12 @@ def extract_run_row(entry: dict[str, Any], *, replay_concurrency: int | None) ->
         "error_rate": parse_float(overall.get("error_rate")),
         "stream": parse_bool(summary.get("stream")),
         "stream_record_ttfb": parse_bool(summary.get("stream_record_ttfb")),
-        "replay_ttfc_p95_ms": parse_float((replay.get("ttfc_ms") or {}).get("p95")),
-        "replay_ttfc_p99_ms": parse_float((replay.get("ttfc_ms") or {}).get("p99")),
-        "replay_ttft_p95_ms": parse_float((replay.get("ttft_ms") or {}).get("p95")),
-        "replay_ttft_p99_ms": parse_float((replay.get("ttft_ms") or {}).get("p99")),
+        "replay_ttfc_p95_ms": replay_ttfc_p95,
+        "replay_ttfc_p99_ms": replay_ttfc_p99,
+        "replay_ttft_p95_ms": replay_ttft_p95,
+        "replay_ttft_p99_ms": replay_ttft_p99,
+        "metric_preferred_replay_p95": "replay_ttfc_p95_ms",
+        "metric_used_replay_p95": metric_used_replay_p95,
         "replay_read_gib": resolve_replay_read_gib(replay),
         "io_attrib_pass": io_attrib_pass,
         "process_evidence_method": process_evidence_method,
@@ -352,6 +361,8 @@ def main() -> int:
         "replay_ttfc_p99_ms",
         "replay_ttft_p95_ms",
         "replay_ttft_p99_ms",
+        "metric_preferred_replay_p95",
+        "metric_used_replay_p95",
         "replay_read_gib",
         "io_attrib_pass",
         "process_evidence_method",

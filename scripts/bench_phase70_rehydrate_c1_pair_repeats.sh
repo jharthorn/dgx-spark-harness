@@ -65,9 +65,18 @@ PRESSURE_POPULATE_CONC="${BENCH_PHASE70_PRESSURE_POPULATE_CONCURRENCY:-2}"
 PRESSURE_THRASH_CONC="${BENCH_PHASE70_PRESSURE_THRASH_CONCURRENCY:-2}"
 IO_ATTRIB="$(normalize_bool "${BENCH_PHASE70_IO_ATTRIB:-0}")"
 IO_ATTRIB_INTERVAL_S="${BENCH_PHASE70_IO_ATTRIB_INTERVAL_S:-1}"
-STREAM_METRICS="$(normalize_bool "${BENCH_PHASE70_STREAM_METRICS:-0}")"
+STREAM_METRICS="$(normalize_bool "${BENCH_PHASE70_STREAM_METRICS:-1}")"
 STREAM_TIMEOUT_S="${BENCH_PHASE70_STREAM_TIMEOUT_S:-}"
 STREAM_RECORD_TTFB="$(normalize_bool "${BENCH_PHASE70_STREAM_RECORD_TTFB:-0}")"
+REQUIRE_TTFC="$(normalize_bool "${BENCH_PHASE70_REQUIRE_TTFC:-1}")"
+TTFC_SANITY_VALIDATE="$(normalize_bool "${BENCH_PHASE70_TTFC_SANITY_VALIDATE:-0}")"
+TTFC_SANITY_FAIL_ON_ERROR="$(normalize_bool "${BENCH_PHASE70_TTFC_SANITY_FAIL_ON_ERROR:-0}")"
+TTFC_SANITY_REQUESTS="${BENCH_PHASE70_TTFC_SANITY_REQUESTS:-8}"
+TTFC_SANITY_CONCURRENCY="${BENCH_PHASE70_TTFC_SANITY_CONCURRENCY:-}"
+TTFC_SANITY_SHORT_MAX_TOKENS="${BENCH_PHASE70_TTFC_SANITY_SHORT_MAX_TOKENS:-8}"
+TTFC_SANITY_LONG_MAX_TOKENS="${BENCH_PHASE70_TTFC_SANITY_LONG_MAX_TOKENS:-256}"
+TTFC_SANITY_TTFC_RATIO_THRESHOLD="${BENCH_PHASE70_TTFC_SANITY_TTFC_RATIO_THRESHOLD:-1.35}"
+TTFC_SANITY_TTFT_RATIO_THRESHOLD="${BENCH_PHASE70_TTFC_SANITY_TTFT_RATIO_THRESHOLD:-1.20}"
 PAIR_WASHOUT_S="${BENCH_PHASE70_PAIR_WASHOUT_S:-0}"
 PAIR_WASHOUT_SYNC="$(normalize_bool "${BENCH_PHASE70_PAIR_WASHOUT_SYNC:-0}")"
 PAIR_WASHOUT_DROP_CACHES="$(normalize_bool "${BENCH_PHASE70_PAIR_WASHOUT_DROP_CACHES:-0}")"
@@ -375,7 +384,7 @@ mk_cache_dir() {
 }
 
 init_manifest() {
-  "${PYTHON_BIN}" - "${MANIFEST_JSON}" "${TS}" "${MODEL_PROFILE}" "${SCENARIO}" "${PAIR_COUNT}" "${MODE_A}" "${MODE_B}" "${REPLAY_CONC}" "${ORDER_STRATEGY}" "${ORDER_SEED}" "${IO_ATTRIB}" "${IO_ATTRIB_INTERVAL_S}" "${STREAM_METRICS}" "${STREAM_TIMEOUT_S}" "${STREAM_RECORD_TTFB}" "${PAIR_WASHOUT_S}" "${PAIR_WASHOUT_SYNC}" "${PAIR_WASHOUT_DROP_CACHES}" "${SKIP_PREFLIGHT}" "${ALLOW_MISSING_KVBM_METRICS}" "${DISABLE_MECHANISM_GATE}" "${DECISION_GRADE_REQUIRE_REHYDRATE}" <<'PY'
+  "${PYTHON_BIN}" - "${MANIFEST_JSON}" "${TS}" "${MODEL_PROFILE}" "${SCENARIO}" "${PAIR_COUNT}" "${MODE_A}" "${MODE_B}" "${REPLAY_CONC}" "${ORDER_STRATEGY}" "${ORDER_SEED}" "${IO_ATTRIB}" "${IO_ATTRIB_INTERVAL_S}" "${STREAM_METRICS}" "${STREAM_TIMEOUT_S}" "${STREAM_RECORD_TTFB}" "${PAIR_WASHOUT_S}" "${PAIR_WASHOUT_SYNC}" "${PAIR_WASHOUT_DROP_CACHES}" "${SKIP_PREFLIGHT}" "${ALLOW_MISSING_KVBM_METRICS}" "${DISABLE_MECHANISM_GATE}" "${DECISION_GRADE_REQUIRE_REHYDRATE}" "${REQUIRE_TTFC}" <<'PY'
 import json
 import pathlib
 import sys
@@ -404,6 +413,7 @@ payload = {
         "allow_missing_kvbm_metrics": bool(int(sys.argv[20])),
         "disable_mechanism_gate": bool(int(sys.argv[21])),
         "decision_grade_require_rehydrate": bool(int(sys.argv[22])),
+        "require_ttfc": bool(int(sys.argv[23])),
         "methodology": {
             "design": "pair_local_blocked_matched_pairs",
             "counterbalancing": "AB_BA",
@@ -429,6 +439,61 @@ row = json.loads(sys.argv[2])
 obj = json.loads(path.read_text(encoding="utf-8"))
 obj.setdefault("runs", []).append(row)
 path.write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+validate_run_ttfc_capture() {
+  local run_dir="$1"
+  local mode="$2"
+  local require_ttfc="$3"
+  "${PYTHON_BIN}" - "${run_dir}" "${mode}" "${require_ttfc}" <<'PY'
+import json
+import pathlib
+import sys
+
+run_dir = pathlib.Path(sys.argv[1])
+mode = sys.argv[2]
+require_ttfc = str(sys.argv[3]).strip().lower() in {"1", "true", "yes", "on"}
+if not require_ttfc:
+    print("OK")
+    raise SystemExit(0)
+
+summary_path = run_dir / "summary.json"
+if not summary_path.exists():
+    print(f"FAIL:missing_summary_json:mode={mode}")
+    raise SystemExit(0)
+
+try:
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+except Exception as exc:  # noqa: BLE001
+    print(f"FAIL:invalid_summary_json:{exc}")
+    raise SystemExit(0)
+
+if not bool(summary.get("stream")):
+    print(f"FAIL:stream_disabled_ttfc_required:mode={mode}")
+    raise SystemExit(0)
+
+phase_summaries = summary.get("phase_summaries") if isinstance(summary.get("phase_summaries"), list) else []
+replay = {}
+for wanted in ("replay", "replay_A"):
+    for phase in phase_summaries:
+        if isinstance(phase, dict) and str(phase.get("phase")) == wanted:
+            replay = phase
+            break
+    if replay:
+        break
+if not replay:
+    for phase in phase_summaries:
+        if isinstance(phase, dict) and str(phase.get("phase") or "").startswith("replay"):
+            replay = phase
+            break
+
+ttfc = replay.get("ttfc_ms") if isinstance(replay.get("ttfc_ms"), dict) else {}
+if not isinstance(ttfc, dict) or ttfc.get("p95") is None:
+    print(f"FAIL:missing_replay_ttfc_p95:mode={mode}")
+    raise SystemExit(0)
+
+print("OK")
 PY
 }
 
@@ -569,6 +634,14 @@ run_probe() {
   BENCH_PHASE56_STREAM_METRICS="${STREAM_METRICS}" \
   BENCH_PHASE56_STREAM_TIMEOUT_S="${STREAM_TIMEOUT_S}" \
   BENCH_PHASE56_STREAM_RECORD_TTFB="${STREAM_RECORD_TTFB}" \
+  BENCH_PHASE56_TTFC_SANITY_VALIDATE="${TTFC_SANITY_VALIDATE}" \
+  BENCH_PHASE56_TTFC_SANITY_FAIL_ON_ERROR="${TTFC_SANITY_FAIL_ON_ERROR}" \
+  BENCH_PHASE56_TTFC_SANITY_REQUESTS="${TTFC_SANITY_REQUESTS}" \
+  BENCH_PHASE56_TTFC_SANITY_CONCURRENCY="${TTFC_SANITY_CONCURRENCY}" \
+  BENCH_PHASE56_TTFC_SANITY_SHORT_MAX_TOKENS="${TTFC_SANITY_SHORT_MAX_TOKENS}" \
+  BENCH_PHASE56_TTFC_SANITY_LONG_MAX_TOKENS="${TTFC_SANITY_LONG_MAX_TOKENS}" \
+  BENCH_PHASE56_TTFC_SANITY_TTFC_RATIO_THRESHOLD="${TTFC_SANITY_TTFC_RATIO_THRESHOLD}" \
+  BENCH_PHASE56_TTFC_SANITY_TTFT_RATIO_THRESHOLD="${TTFC_SANITY_TTFT_RATIO_THRESHOLD}" \
   DYN_KVBM_DISK_CACHE_DIR="${cache_dir}" \
   BENCH_CONTAINER_NAME="${CONTAINER_NAME}" \
   scripts/bench_phase56_like_probe_trtllm.sh >> "${log_path}" 2>&1
@@ -581,6 +654,14 @@ run_probe() {
   fi
 
   local run_dir="${RESULTS_ROOT}/${bundle_id}/${run_id}"
+  local ttfc_validation="OK"
+  ttfc_validation="$(validate_run_ttfc_capture "${run_dir}" "${mode}" "${REQUIRE_TTFC}")"
+  if [[ "${ttfc_validation}" != "OK" ]]; then
+    add_reason_code "TTFC_MISSING_STREAM_CAPTURE"
+    echo "Phase70 TTFC validation failed pair_id=${pair_id} mode=${mode} run_dir=${run_dir} detail=${ttfc_validation}" >&2
+    exit 3
+  fi
+
   local io_checked="0"
   local io_checker_rc=""
   if is_truthy "${IO_ATTRIB}" && [[ "${mode}" != "B0" ]]; then
