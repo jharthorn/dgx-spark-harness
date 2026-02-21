@@ -2065,6 +2065,7 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
                         ttfc_sanity_validation = {
                             "enabled": True,
                             "status": "error",
+                            "ok": False,
                             "error": str(exc),
                         }
                     verdict = (
@@ -2088,8 +2089,9 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[Path, bool]:
                         else:
                             ttfc_sanity_validation["warning"] = failure_detail
                     ttfc_sanity_validation["status"] = "pass" if sanity_passed else "fail"
+                    ttfc_sanity_validation["ok"] = sanity_passed
                 else:
-                    ttfc_sanity_validation = {"enabled": False, "status": "disabled"}
+                    ttfc_sanity_validation = {"enabled": False, "status": "disabled", "ok": None}
                 model_count_end = await client.count_models()
         except Exception as exc:  # noqa: BLE001
             run_valid = False
@@ -3005,6 +3007,7 @@ async def run_ttfc_sanity_validation(
     )
     return {
         "enabled": True,
+        "ok": bool(verdict.get("passed")),
         "requests_per_case": requests,
         "concurrency": concurrency,
         "short_max_tokens": short_tokens,
