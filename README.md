@@ -105,17 +105,78 @@ BENCH_PHASE60_FORCE_NEW_SUMMARY=true \
 scripts/bench_phase60_rehydrate_minimal_sweep.sh
 ```
 
-11. Run the Phase70 c=1 paired repeats helper (pair-local AB/BA counterbalanced design):
+Phase60 baseline manifest policy knobs:
+
+- `BENCH_PHASE60_STRICT_BASELINE_HASH=0|1` (default `0` for discovery).  
+  `1` stops on baseline semantic-hash mismatch at `B2@c1`; `0` records a warning and continues.
+- `BENCH_PHASE60_ACCEPT_NEW_BASELINE_MANIFEST=1` updates the known-good baseline semantic hash on mismatch and appends an audit record.
+- Known-good semantic hash file: `bench/results/phase60_known_good_baseline_manifest_semantic_hash.json`
+- Audit trail (append-only): `bench/results/phase60_baseline_manifest_audit.jsonl`
+- `BENCH_PHASE60_ENFORCE_B1_DISK_TIER_OFF=1` (default) forces `B1` to run with disk tier disabled (`kv_disk_cache_gb=0`) and validates mechanism sanity; violations are flagged as `B1_DISK_TIER_NOT_DISABLED`.
+- `BENCH_PHASE60_B1_DISK_TIER_READ_BYTES_THRESHOLD` and `BENCH_PHASE60_B1_DISK_TIER_HIT_RATE_THRESHOLD` control strictness for B1 replay read/hit-rate sanity checks.
+- Phase60 rows now include `b1_disk_tier_verified=true|false` plus per-row `metric_used` (`ttfc_ms` preferred, `ttft_ms` fallback). Summary metadata includes run-level `meta.metric_policy`.
+
+Phase60 primary outputs from step 10:
+
+- `bench/results/phase60_rehydrate_concurrency_sweep_summary_minimal_<ts>.json`
+- `bench/results/phase60_rehydrate_concurrency_sweep_summary_minimal_<ts>.csv`
+- stop/fail-only: `bench/results/phase60_matrix_stop_verdict_minimal_<ts>.json`
+- stop/fail diagnostics: `bench/results/phase60_sweep_b2c1_failure_diagnosis_<ts>.json`
+
+10b. Extract a knee-review table from the Phase60 sweep:
+
+```bash
+python3 scripts/phase60_extract_knee_table.py \
+  --phase60-summary-json "bench/results/phase60_rehydrate_concurrency_sweep_summary_minimal_${TS}.json"
+```
+
+By default this writes `bench/results/phase60_knee_table_<ts>.csv` and labels metric source per row (`ttfc` or `ttft_fallback`).
+
+10c. Recommend the best Phase70 replay concurrency from the Phase60 sweep:
+
+```bash
+python3 scripts/recommend_phase70_crossover_from_phase60.py \
+  --ts "$TS" \
+  --results-root bench/results \
+  --out-md "bench/results/phase60_crossover_recommendation_${TS}.md"
+```
+
+This writes `bench/results/phase60_crossover_recommendation_<ts>.json` and optional markdown, then prints the recommended replay concurrency.
+
+11. Run the Phase70 paired repeats helper (pair-local AB/BA counterbalanced design, replay concurrency `c>=1`), using the recommended `c`:
 
 ```bash
 BENCH_PHASE70_PAIRS=6 \
-BENCH_PHASE70_REPLAY_CONCURRENCY=1 \
+BENCH_PHASE70_REPLAY_CONCURRENCY=4 \
 BENCH_PHASE70_IO_ATTRIB=1 \
 BENCH_PHASE70_STREAM_METRICS=1 \
 BENCH_PHASE70_STREAM_TIMEOUT_S=120 \
 BENCH_PHASE70_STREAM_RECORD_TTFB=1 \
-scripts/bench_phase70_rehydrate_c1_pair_repeats.sh
+scripts/bench_phase70_rehydrate_pair_repeats.sh
 ```
+
+`BENCH_PHASE70_REPLAY_CONCURRENCY` is passed through to both legs via `BENCH_PHASE56_REHYDRATE_REPLAY_CONC`.
+
+Default fast-fail behavior for Phase70:
+
+- preflight (frontend health, model registration, KVBM metrics reachability),
+- early mechanism gate after first `B2` leg (SSD-tier signal required),
+- post-run self-check verdict at `bench/results/phase70_rehydrate_pair_repeats_verdict_<ts>.json`.
+- for `rehydrate_replay` runs, decision-grade defaults to requiring SSD rehydrate evidence (not write-only offload).
+- reason codes are explicit (`PREFLIGHT_*`, `GATE_NO_SSD_MECHANISM_SIGNAL`, `RUN_ERRORS_PRESENT`, `ORDER_EFFECT_*`, `REHYDRATE_SIGNAL_ABSENT_WRITE_ONLY`).
+
+Common overrides:
+
+- `BENCH_PHASE70_ALLOW_MISSING_KVBM_METRICS=1` keeps running when metrics are unavailable (marks non-decision-grade).
+- `BENCH_PHASE70_DISABLE_MECHANISM_GATE=1` forces completion without early gate abort (marks non-decision-grade).
+- `BENCH_PHASE70_SKIP_PREFLIGHT=1` skips preflight checks.
+- `BENCH_PHASE70_DECISION_GRADE_REQUIRE_REHYDRATE=0` allows write-only mechanism evidence to remain decision-grade; verdict still records `REHYDRATE_SIGNAL_ABSENT_WRITE_ONLY`.
+
+Verdict mechanism semantics:
+
+- `ssd_write_signal_present`: SSD write/offload observed.
+- `ssd_rehydrate_signal_present`: replay-time SSD rehydrate evidence observed (onboard/hit-rate/replay reads).
+- `ssd_reuse_signal_present`: matched-token reuse signal observed.
 
 12. Build a brief-ready results pack (single command + folder):
 
@@ -125,7 +186,21 @@ python3 scripts/make_phase70_results_pack.py \
   --ts <ts>
 ```
 
-This writes `bench/results/publish/phase70_pairs<N>_<ts>/` with summary artifacts, review tables, and methodology text.
+This writes `bench/results/publish/phase70_pairs<N>_c<replay_concurrency>_<ts>/` with summary artifacts, review tables, and methodology text.
+When present, `phase70_rehydrate_pair_repeats_verdict_<ts>.json` is copied into the pack as `verdict.json` under that pack folder.
+
+Canonical Phase 1 operator loop:
+
+1. `bench_phase60_rehydrate_minimal_sweep.sh` (fixed-pressure sweep + guardrails)
+2. `phase60_extract_knee_table.py` (compact review table)
+3. `recommend_phase70_crossover_from_phase60.py` (recommended replay concurrency)
+4. `bench_phase70_rehydrate_pair_repeats.sh` (paired repeats + preflight/gate/verdict)
+5. `make_phase70_results_pack.py` (publish pack)
+
+Current known constraints:
+
+- Some runs still lack TTFC in replay rows; tooling falls back to TTFT and records that fallback (`metric_used`, `ttft_fallback`, `METRIC_FALLBACK_TTFT_P95`).
+- Many local engines are capped at `max_num_tokens=8192`; Dataset L (`>=32k`) requires an engine rebuild and context ladder bring-up.
 
 Artifacts are written under `bench/results/<run_id>/`.
 
@@ -151,13 +226,14 @@ Artifacts are written under `bench/results/<run_id>/`.
   - `phase70_rehydrate_pair_repeats_summary_<ts>.csv`
   - `phase70_rehydrate_pair_repeats_deltas_<ts>.csv`
   - `phase70_rehydrate_pair_repeats_order_check_<ts>.json`
+  - `phase70_rehydrate_pair_repeats_verdict_<ts>.json`
 - Per-pair deltas are always `mode_b - mode_a` (default `B2 - B1`).
 
 ## Workload Mapping
 
 - Phase56-like probe: mechanism/debug run (`scripts/bench_phase56_like_probe_trtllm.sh`).
 - Phase60 sweep: baseline + concurrency sweep (`scripts/bench_phase60_rehydrate_minimal_sweep.sh`).
-- Phase70 repeats: publishability gate run with AB/BA order checks (`scripts/bench_phase70_rehydrate_c1_pair_repeats.sh`).
+- Phase70 repeats: publishability gate run with AB/BA order checks (`scripts/bench_phase70_rehydrate_pair_repeats.sh`; legacy alias `scripts/bench_phase70_rehydrate_c1_pair_repeats.sh`).
 
 ## Results Hygiene
 
@@ -208,9 +284,15 @@ Notes:
 - `scripts/bench_start_nats.sh`, `scripts/bench_wait_nats_ready.sh`, `scripts/bench_stop_nats.sh`: NATS control-plane runbook helpers.
 - `scripts/bench_run_mode_compare.sh`: mode-controlled baseline vs offload runs.
 - `scripts/bench_phase60_rehydrate_minimal_sweep.sh`: fixed-pressure replay-concurrency sweep with baseline/SLO persistence and resume checkpoints.
-- `scripts/bench_phase70_rehydrate_c1_pair_repeats.sh`: pair-local blocked repeat runner for c=1 rehydrate replay with AB/BA counterbalancing and order-effect output.
+- `scripts/phase60_extract_knee_table.py`: derive compact per-concurrency B1/B2 knee-review CSV from a Phase60 summary.
+- `scripts/phase60_baseline_manifest_semantic.py`: semantic baseline hash compute/decide/accept helper with audit logging.
+- `scripts/recommend_phase70_crossover_from_phase60.py`: parse the Phase60 sweep summary and recommend the best replay concurrency for Phase70 paired repeats.
+- `scripts/bench_phase70_rehydrate_pair_repeats.sh`: canonical pair-local blocked repeat runner for rehydrate replay with AB/BA counterbalancing and order-effect output (legacy alias: `scripts/bench_phase70_rehydrate_c1_pair_repeats.sh`).
 - `scripts/analyze_phase70_pairs.py`: manifest-driven analyzer for per-run CSV, per-pair deltas, and order-effect summaries.
-- `scripts/make_phase70_results_pack.py`: one-command packager for brief-ready Phase70 folders (`publish/phase70_pairs<N>_<ts>/`).
+- `scripts/make_phase70_results_pack.py`: one-command packager for brief-ready Phase70 folders (`publish/phase70_pairs<N>_c<replay_concurrency>_<ts>/`).
+- `scripts/bench_phase70_preflight.sh`: Phase70 preflight fast-fail checks for health/models/KVBM metrics.
+- `scripts/phase70_check_mechanism_gate.py`: early mechanism gate evaluator for first B2 leg.
+- `scripts/phase70_write_verdict.py`: post-run decision-grade verdict writer.
 - `images/dyn/`: benchmark container Docker build context.
 - `kvbm/kvbm_llm_api_config.yaml`: tracked KVBM template used by `scripts/bench_prepare_host.sh`.
 

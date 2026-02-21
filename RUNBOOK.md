@@ -32,6 +32,8 @@ BENCH_COMPARE_SKIP_READY=1 BENCH_KV_MODE_LIST="cpu_only cpu_disk" scripts/bench_
 BENCH_BACKEND=trtllm BENCH_PHASE58_PATTERN=progressive_thrash BENCH_PHASE58_MAX_ATTEMPTS=1 scripts/bench_phase58_eviction_thrash.sh
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 BENCH_PHASE60_TS=$TS BENCH_PHASE60_SWEEP_CONCURRENCIES="1 2 4" BENCH_PHASE60_PRESSURE_POPULATE_CONCURRENCY=2 BENCH_PHASE60_PRESSURE_THRASH_CONCURRENCY=2 BENCH_PHASE60_BASELINE_REPLAY_CONCURRENCY=1 BENCH_PHASE60_FORCE_NEW_SUMMARY=true scripts/bench_phase60_rehydrate_minimal_sweep.sh
+BENCH_PHASE70_TS=$TS BENCH_PHASE70_PAIRS=6 BENCH_PHASE70_REPLAY_CONCURRENCY=4 BENCH_PHASE70_IO_ATTRIB=1 scripts/bench_phase70_rehydrate_pair_repeats.sh
+python3 scripts/make_phase70_results_pack.py --results-root bench/results --ts "$TS"
 scripts/bench_results_summary.sh
 ```
 
@@ -48,6 +50,14 @@ scripts/bench_wait_ready.sh
 ## 0) Canonical Decision-Grade Flow (Phase60 Fixed-Pressure Sweep)
 
 Use this flow for publishable B1 vs B2 evidence where only replay concurrency is swept and pressure stays fixed.
+
+Canonical operator loop for Phase 1:
+
+1. Phase60 fixed-pressure sweep (`bench_phase60_rehydrate_minimal_sweep.sh`)
+2. Knee table extraction (`phase60_extract_knee_table.py`)
+3. Crossover recommendation (`recommend_phase70_crossover_from_phase60.py`)
+4. Phase70 paired repeats (`bench_phase70_rehydrate_pair_repeats.sh`)
+5. Pack generation (`make_phase70_results_pack.py`)
 
 ### 0.1) Baseline-only preflight row (B2, replay=1)
 
@@ -75,6 +85,24 @@ BENCH_PHASE60_FORCE_NEW_SUMMARY=true \
 scripts/bench_phase60_rehydrate_minimal_sweep.sh
 ```
 
+Baseline semantic-hash controls for Phase60:
+
+- `BENCH_PHASE60_STRICT_BASELINE_HASH=0|1` (default `0` discovery).  
+  - `1`: stop on `baseline_manifest_hash_mismatch`.
+  - `0`: continue and append warning `BASELINE_MANIFEST_HASH_MISMATCH_WARNING`.
+- `BENCH_PHASE60_ACCEPT_NEW_BASELINE_MANIFEST=1`:
+  - on mismatch, accept current `B2@c1` semantic baseline and continue,
+  - append audit entry to `bench/results/phase60_baseline_manifest_audit.jsonl`.
+- Known-good baseline semantic hash file:
+  - `bench/results/phase60_known_good_baseline_manifest_semantic_hash.json`
+- `BENCH_PHASE60_ENFORCE_B1_DISK_TIER_OFF=1` (default):
+  - enforces `B1` with disk tier disabled (`kv_disk_cache_gb=0`),
+  - validates B1 replay mechanism sanity and flags `B1_DISK_TIER_NOT_DISABLED` on onboard/read/hit-rate violations.
+- Optional B1 strictness knobs:
+  - `BENCH_PHASE60_B1_DISK_TIER_READ_BYTES_THRESHOLD` (default `1048576` bytes),
+  - `BENCH_PHASE60_B1_DISK_TIER_HIT_RATE_THRESHOLD` (default `0.000001`).
+- Row metric policy is explicit: each row carries `metric_used` (`ttfc_ms` preferred, `ttft_ms` fallback), and summary `meta.metric_policy` captures run-level usage.
+
 ### 0.3) Resume from a point without re-running completed rows
 
 ```bash
@@ -87,17 +115,112 @@ BENCH_PHASE60_RESUME_SKIP_COMPLETED=true \
 scripts/bench_phase60_rehydrate_minimal_sweep.sh
 ```
 
+### 0.4) Build the Phase60 knee table from sweep output
+
+```bash
+python3 scripts/phase60_extract_knee_table.py \
+  --phase60-summary-json "bench/results/phase60_rehydrate_concurrency_sweep_summary_minimal_${TS}.json"
+```
+
+Default output:
+
+- `bench/results/phase60_knee_table_<TS>.csv`
+
+### 0.5) Recommend Phase70 replay concurrency from the Phase60 sweep
+
+```bash
+python3 scripts/recommend_phase70_crossover_from_phase60.py \
+  --ts "$TS" \
+  --results-root bench/results \
+  --out-md "bench/results/phase60_crossover_recommendation_${TS}.md"
+```
+
+Optional direct-input mode:
+
+```bash
+python3 scripts/recommend_phase70_crossover_from_phase60.py \
+  --phase60-summary-json "bench/results/phase60_rehydrate_concurrency_sweep_summary_minimal_${TS}.json"
+```
+
+Primary output:
+
+- `bench/results/phase60_crossover_recommendation_<TS>.json`
+- optional: `bench/results/phase60_crossover_recommendation_<TS>.md`
+
+### 0.6) Phase70 paired repeats with replay concurrency > 1
+
+```bash
+BENCH_PHASE70_TS="$TS" \
+BENCH_PHASE70_PAIRS=6 \
+BENCH_PHASE70_REPLAY_CONCURRENCY=4 \
+BENCH_PHASE70_IO_ATTRIB=1 \
+BENCH_PHASE70_STREAM_METRICS=1 \
+BENCH_PHASE70_STREAM_TIMEOUT_S=120 \
+BENCH_PHASE70_STREAM_RECORD_TTFB=1 \
+scripts/bench_phase70_rehydrate_pair_repeats.sh
+```
+
+`BENCH_PHASE70_REPLAY_CONCURRENCY` is forwarded to the underlying probe as `BENCH_PHASE56_REHYDRATE_REPLAY_CONC` for both legs.
+
+Fast-fail behavior (default):
+
+- preflight checks frontend health, model registration, and KVBM metrics endpoint.
+- early mechanism gate checks first `B2` leg for SSD-tier mechanism signal.
+- post-run verdict file is emitted at `bench/results/phase70_rehydrate_pair_repeats_verdict_<TS>.json`.
+- for `rehydrate_replay`, decision-grade defaults to requiring SSD rehydrate evidence (disk->device/onboard or disk-hit evidence), not write-only offload.
+- verdict reason codes are explicit (`PREFLIGHT_*`, `GATE_NO_SSD_MECHANISM_SIGNAL`, `RUN_ERRORS_PRESENT`, `ORDER_EFFECT_*`, `REHYDRATE_SIGNAL_ABSENT_WRITE_ONLY`).
+- verdict mechanism checks are split as:
+  - `ssd_write_signal_present`
+  - `ssd_rehydrate_signal_present`
+  - `ssd_reuse_signal_present`
+
+Override knobs:
+
+- `BENCH_PHASE70_ALLOW_MISSING_KVBM_METRICS=1` (continue, verdict becomes non-decision-grade)
+- `BENCH_PHASE70_DISABLE_MECHANISM_GATE=1` (continue, verdict becomes non-decision-grade)
+- `BENCH_PHASE70_SKIP_PREFLIGHT=1` (skip preflight checks)
+- `BENCH_PHASE70_DECISION_GRADE_REQUIRE_REHYDRATE=0` (allow write-only evidence to remain decision-grade; verdict still records `REHYDRATE_SIGNAL_ABSENT_WRITE_ONLY`)
+
+Pack output folder naming includes replay concurrency:
+
+- `bench/results/publish/phase70_pairs<N>_c<replay_concurrency>_<TS>/`
+
+### 0.7) Generate the brief-ready Phase70 pack
+
+```bash
+python3 scripts/make_phase70_results_pack.py \
+  --results-root bench/results \
+  --ts "$TS"
+```
+
+Pack structure:
+
+- `bench/results/publish/phase70_pairs<N>_c<replay_concurrency>_<TS>/summary.csv`
+- `bench/results/publish/phase70_pairs<N>_c<replay_concurrency>_<TS>/summary.json`
+- `bench/results/publish/phase70_pairs<N>_c<replay_concurrency>_<TS>/deltas.csv`
+- `bench/results/publish/phase70_pairs<N>_c<replay_concurrency>_<TS>/order_check.json`
+- `bench/results/publish/phase70_pairs<N>_c<replay_concurrency>_<TS>/verdict.json` (when source verdict exists)
+- `bench/results/publish/phase70_pairs<N>_c<replay_concurrency>_<TS>/pack_manifest.json`
+
 Primary artifacts for this flow:
 
 - `bench/results/phase60_rehydrate_concurrency_sweep_summary_minimal_<TS>.json`
+- `bench/results/phase60_rehydrate_concurrency_sweep_summary_minimal_<TS>.csv`
+- `bench/results/phase60_knee_table_<TS>.csv`
+- `bench/results/phase60_crossover_recommendation_<TS>.json`
 - `bench/results/phase60_matrix_stop_verdict_minimal_<TS>.json` (only on stop/fail)
 - `bench/results/phase60_sweep_b2c1_failure_diagnosis_<TS>.json`
+- `bench/results/phase60_known_good_baseline_manifest_semantic_hash.json` (known-good semantic baseline)
+- `bench/results/phase60_baseline_manifest_audit.jsonl` (append-only baseline updates)
 
 Notes:
 
 - Baseline/SLO are persisted as soon as baseline preflight succeeds (`baseline_b2_replay_p95_ms_at_concurrency1`, `slo_replay_p95_ms`).
 - `rows[]` includes `baseline_preflight` plus partial/ok/invalid checkpoints per sweep point.
+- In discovery mode (`BENCH_PHASE60_STRICT_BASELINE_HASH=0`), baseline semantic-hash mismatches are recorded as warnings and the sweep can complete, but `decision_grade=false`.
 - The sweep is decision-grade only when B2 mechanism signals stay present (matched/onboard/read) and `error_rate` remains zero.
+- In TTFC-missing runs, Phase60 and recommender logic fall back to TTFT and mark fallback usage in artifacts.
+- Many local engines are capped at `max_num_tokens=8192`; Dataset L (`>=32k`) requires a rebuilt engine/context ladder.
 
 The remaining sections are the low-level manual bring-up path for debugging and runtime forensics. For normal operation, prefer the scripted flow above.
 
