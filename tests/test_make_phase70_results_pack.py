@@ -41,6 +41,7 @@ class MakePhase70ResultsPackTests(unittest.TestCase):
                     "pair_count": 2,
                     "mode_a": "B1",
                     "mode_b": "B2",
+                    "replay_concurrency": 4,
                     "order_strategy": "alternating",
                     "pair_washout_s": 10,
                     "stream_metrics_enabled": True,
@@ -83,6 +84,21 @@ class MakePhase70ResultsPackTests(unittest.TestCase):
                 }
             }
             _write_json(results / f"phase70_rehydrate_pair_repeats_order_check_{ts}.json", order_check)
+            _write_json(
+                results / f"phase70_rehydrate_pair_repeats_verdict_{ts}.json",
+                {
+                    "run_valid": True,
+                    "decision_grade": True,
+                    "reason_codes": [],
+                    "meta": {"replay_concurrency": 4},
+                    "checks": {
+                        "ssd_write_signal_present": True,
+                        "ssd_rehydrate_signal_present": True,
+                        "ssd_reuse_signal_present": True,
+                        "decision_grade_require_rehydrate": True,
+                    },
+                },
+            )
 
             summary_rows = []
             deltas_rows = []
@@ -110,6 +126,7 @@ class MakePhase70ResultsPackTests(unittest.TestCase):
                         "pair_order": "B1_B2" if pair_id == 1 else "B2_B1",
                         "pair_leg": pair_leg,
                         "mode": mode,
+                        "replay_concurrency": 4,
                         "run_id": f"run_{mode}_{pair_id}_{pair_leg}",
                         "bundle_id": f"bundle_{mode}_{pair_id}_{pair_leg}",
                         "timestamp_utc": "2026-02-18T12:00:00Z",
@@ -208,11 +225,12 @@ class MakePhase70ResultsPackTests(unittest.TestCase):
                 sys.argv = old_argv
 
             self.assertEqual(rc, 0)
-            pack_dir = results / "publish" / f"phase70_pairs2_{ts}"
+            pack_dir = results / "publish" / f"phase70_pairs2_c4_{ts}"
             self.assertTrue((pack_dir / "summary.csv").exists())
             self.assertTrue((pack_dir / "summary.json").exists())
             self.assertTrue((pack_dir / "deltas.csv").exists())
             self.assertTrue((pack_dir / "order_check.json").exists())
+            self.assertTrue((pack_dir / "verdict.json").exists())
             self.assertTrue((pack_dir / "methodology.md").exists())
             self.assertTrue((pack_dir / "pack_manifest.json").exists())
             self.assertTrue((pack_dir / "tables" / "table_main_latency.csv").exists())
@@ -222,6 +240,17 @@ class MakePhase70ResultsPackTests(unittest.TestCase):
             methodology = (pack_dir / "methodology.md").read_text(encoding="utf-8")
             self.assertIn("Headline Claim Structure", methodology)
             self.assertIn("CI95 is an approximate descriptive band", methodology)
+            self.assertIn("Replay concurrency: `c=4`", methodology)
+            self.assertIn("Mechanism Signal Summary", methodology)
+            self.assertIn("SSD rehydrate signal observed: `True`", methodology)
+
+            pack_manifest = json.loads((pack_dir / "pack_manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(pack_manifest.get("replay_concurrency"), 4)
+            self.assertTrue(pack_manifest.get("ssd_write_signal_present"))
+            self.assertTrue(pack_manifest.get("ssd_rehydrate_signal_present"))
+            self.assertTrue(pack_manifest.get("ssd_reuse_signal_present"))
+            self.assertEqual(pack_manifest.get("source_artifacts", {}).get("verdict_json"), str(results / f"phase70_rehydrate_pair_repeats_verdict_{ts}.json"))
+            self.assertEqual(pack_manifest.get("pack_artifacts", {}).get("verdict_json"), str(pack_dir / "verdict.json"))
 
 
 if __name__ == "__main__":

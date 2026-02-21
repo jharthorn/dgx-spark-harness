@@ -41,6 +41,18 @@ def parse_bool(value: Any) -> bool | None:
     return None
 
 
+def parse_int(value: Any, *, min_value: int | None = None) -> int | None:
+    try:
+        if value is None:
+            return None
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if min_value is not None and parsed < min_value:
+        return None
+    return parsed
+
+
 def mean(values: list[float]) -> float | None:
     return (sum(values) / len(values)) if values else None
 
@@ -420,6 +432,8 @@ def write_methodology_md(
     order_table: list[dict[str, Any]],
     mode_a: str,
     mode_b: str,
+    replay_concurrency: int,
+    verdict_checks: dict[str, Any] | None = None,
 ) -> None:
     meta = manifest.get("meta") if isinstance(manifest.get("meta"), dict) else {}
     pair_count = int(meta.get("pair_count") or 0)
@@ -427,6 +441,7 @@ def write_methodology_md(
     ttfc_p99 = find_metric_row(main_latency, "Replay TTFC p99 (ms)") or {}
     mech_b = find_mode_row(mechanism, mode_b) or {}
     order_primary = next((row for row in order_table if row.get("metric") == "delta_replay_ttfc_p95_ms"), None) or {}
+    verdict_checks = verdict_checks or {}
 
     evidence_dist = (
         f"pid={int(mech_b.get('process_evidence_pid_count') or 0)}, "
@@ -442,6 +457,7 @@ def write_methodology_md(
 - `pair_count`: `{pair_count}`
 - `mode_a`: `{mode_a}`
 - `mode_b`: `{mode_b}`
+- `replay_concurrency`: `c{replay_concurrency}`
 - `order_strategy`: `{meta.get("order_strategy")}`
 - `washout_s`: `{meta.get("pair_washout_s")}`
 - `stream_metrics_enabled`: `{meta.get("stream_metrics_enabled")}`
@@ -460,9 +476,17 @@ def write_methodology_md(
 ## Methodology
 
 - Pair-local blocked design with AB/BA counterbalancing (`B1_B2` and `B2_B1`).
+- Replay concurrency: `c={replay_concurrency}` (replay phase executed with `{replay_concurrency}` concurrent sessions).
 - Delta definition is fixed as `mode_b - mode_a` (default `B2 - B1`).
 - Primary latency surface: replay `TTFC p95/p99`; legacy `TTFT` is retained for compatibility.
 - CI95 is an approximate descriptive band computed from pair deltas (not a formal hypothesis test).
+
+## Mechanism Signal Summary
+
+- SSD write signal observed: `{verdict_checks.get("ssd_write_signal_present")}`
+- SSD rehydrate signal observed: `{verdict_checks.get("ssd_rehydrate_signal_present")}`
+- SSD reuse signal observed: `{verdict_checks.get("ssd_reuse_signal_present")}`
+- Rehydrate required for decision-grade: `{verdict_checks.get("decision_grade_require_rehydrate")}`
 
 ## Headline Claim Structure
 
@@ -506,21 +530,30 @@ def main() -> int:
     summary_csv_path = results_root / f"phase70_rehydrate_pair_repeats_summary_{ts}.csv"
     deltas_csv_path = results_root / f"phase70_rehydrate_pair_repeats_deltas_{ts}.csv"
     order_check_path = results_root / f"phase70_rehydrate_pair_repeats_order_check_{ts}.json"
+    verdict_path = results_root / f"phase70_rehydrate_pair_repeats_verdict_{ts}.json"
 
     for path in (manifest_path, summary_json_path, summary_csv_path, deltas_csv_path, order_check_path):
         if not path.exists():
             raise SystemExit(f"required artifact missing: {path}")
 
     manifest = load_json(manifest_path)
+    manifest_meta = manifest.get("meta") if isinstance(manifest.get("meta"), dict) else {}
     summary_obj = load_json(summary_json_path)
     order_check = load_json(order_check_path)
+    summary_meta = summary_obj.get("meta") if isinstance(summary_obj.get("meta"), dict) else {}
 
-    mode_a = str(args.mode_a or manifest.get("meta", {}).get("mode_a") or summary_obj.get("mode_a") or "B1")
-    mode_b = str(args.mode_b or manifest.get("meta", {}).get("mode_b") or summary_obj.get("mode_b") or "B2")
-    pair_count = int(manifest.get("meta", {}).get("pair_count") or summary_obj.get("pair_count") or 0)
+    mode_a = str(args.mode_a or manifest_meta.get("mode_a") or summary_obj.get("mode_a") or "B1")
+    mode_b = str(args.mode_b or manifest_meta.get("mode_b") or summary_obj.get("mode_b") or "B2")
+    pair_count = int(manifest_meta.get("pair_count") or summary_obj.get("pair_count") or 0)
+    replay_concurrency = (
+        parse_int(manifest_meta.get("replay_concurrency"), min_value=1)
+        or parse_int(summary_meta.get("replay_concurrency"), min_value=1)
+        or parse_int(summary_obj.get("replay_concurrency"), min_value=1)
+        or 1
+    )
 
     out_root = Path(args.out_root) if args.out_root else (results_root / "publish")
-    pack_name = args.pack_name or f"phase70_pairs{pair_count}_{ts}"
+    pack_name = args.pack_name or f"phase70_pairs{pair_count}_c{replay_concurrency}_{ts}"
     pack_dir = out_root / pack_name
     tables_dir = pack_dir / "tables"
     figures_dir = pack_dir / "figures"
@@ -533,6 +566,10 @@ def main() -> int:
     shutil.copy2(deltas_csv_path, pack_dir / "deltas.csv")
     shutil.copy2(order_check_path, pack_dir / "order_check.json")
     shutil.copy2(manifest_path, pack_dir / "manifest.json")
+    if verdict_path.exists():
+        shutil.copy2(verdict_path, pack_dir / "verdict.json")
+    verdict_obj = load_json(verdict_path) if verdict_path.exists() else {}
+    verdict_checks = verdict_obj.get("checks") if isinstance(verdict_obj.get("checks"), dict) else {}
 
     with summary_csv_path.open("r", encoding="utf-8", newline="") as fp:
         raw_rows = list(csv.DictReader(fp))
@@ -620,6 +657,8 @@ def main() -> int:
         order_table=order_table,
         mode_a=mode_a,
         mode_b=mode_b,
+        replay_concurrency=replay_concurrency,
+        verdict_checks=verdict_checks,
     )
 
     figure_notes: list[str] = []
@@ -641,20 +680,26 @@ def main() -> int:
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "source_ts": ts,
         "pair_count": pair_count,
+        "replay_concurrency": replay_concurrency,
         "mode_a": mode_a,
         "mode_b": mode_b,
+        "ssd_write_signal_present": verdict_checks.get("ssd_write_signal_present"),
+        "ssd_rehydrate_signal_present": verdict_checks.get("ssd_rehydrate_signal_present"),
+        "ssd_reuse_signal_present": verdict_checks.get("ssd_reuse_signal_present"),
         "source_artifacts": {
             "manifest": str(manifest_path),
             "summary_json": str(summary_json_path),
             "summary_csv": str(summary_csv_path),
             "deltas_csv": str(deltas_csv_path),
             "order_check_json": str(order_check_path),
+            "verdict_json": (str(verdict_path) if verdict_path.exists() else None),
         },
         "pack_artifacts": {
             "summary_csv": str(pack_dir / "summary.csv"),
             "summary_json": str(pack_dir / "summary.json"),
             "deltas_csv": str(pack_dir / "deltas.csv"),
             "order_check_json": str(pack_dir / "order_check.json"),
+            "verdict_json": (str(pack_dir / "verdict.json") if verdict_path.exists() else None),
             "methodology_md": str(pack_dir / "methodology.md"),
             "tables": {
                 "main_latency": str(tables_dir / "table_main_latency.csv"),
@@ -670,6 +715,7 @@ def main() -> int:
     print(f"results_pack={pack_dir}")
     print(f"source_ts={ts}")
     print(f"pair_count={pair_count}")
+    print(f"replay_concurrency={replay_concurrency}")
     print(f"mode_a={mode_a} mode_b={mode_b}")
     return 0
 

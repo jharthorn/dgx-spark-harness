@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Back-compat entrypoint for Phase70 paired repeats.
+# Replay-phase concurrency is configurable via BENCH_PHASE70_REPLAY_CONCURRENCY (>=1).
+
 normalize_bool() {
   local raw="${1:-0}"
   case "${raw,,}" in
@@ -68,6 +71,17 @@ STREAM_RECORD_TTFB="$(normalize_bool "${BENCH_PHASE70_STREAM_RECORD_TTFB:-0}")"
 PAIR_WASHOUT_S="${BENCH_PHASE70_PAIR_WASHOUT_S:-0}"
 PAIR_WASHOUT_SYNC="$(normalize_bool "${BENCH_PHASE70_PAIR_WASHOUT_SYNC:-0}")"
 PAIR_WASHOUT_DROP_CACHES="$(normalize_bool "${BENCH_PHASE70_PAIR_WASHOUT_DROP_CACHES:-0}")"
+SKIP_PREFLIGHT="$(normalize_bool "${BENCH_PHASE70_SKIP_PREFLIGHT:-0}")"
+ALLOW_MISSING_KVBM_METRICS="$(normalize_bool "${BENCH_PHASE70_ALLOW_MISSING_KVBM_METRICS:-0}")"
+DISABLE_MECHANISM_GATE="$(normalize_bool "${BENCH_PHASE70_DISABLE_MECHANISM_GATE:-0}")"
+DECISION_GRADE_REQUIRE_REHYDRATE="$(normalize_bool "${BENCH_PHASE70_DECISION_GRADE_REQUIRE_REHYDRATE:-1}")"
+PREFLIGHT_BASE_URL="${BENCH_PHASE70_BASE_URL:-${BENCH_BASE_URL:-http://127.0.0.1:8000}}"
+PREFLIGHT_METRICS_KVBM_URL="${BENCH_PHASE70_METRICS_KVBM_URL:-${BENCH_METRICS_KVBM_URL:-http://127.0.0.1:6880/metrics}}"
+PREFLIGHT_TIMEOUT_S="${BENCH_PHASE70_PREFLIGHT_TIMEOUT_S:-25}"
+PREFLIGHT_SLEEP_S="${BENCH_PHASE70_PREFLIGHT_SLEEP_S:-2}"
+MECHANISM_GATE_MIN_DISK_HIT_RATE="${BENCH_PHASE70_GATE_MIN_DISK_HIT_RATE:-0.01}"
+MECHANISM_GATE_MIN_MATCHED_TOKENS="${BENCH_PHASE70_GATE_MIN_MATCHED_TOKENS:-0}"
+MECHANISM_GATE_REQUIRE_MATCHED="$(normalize_bool "${BENCH_PHASE70_GATE_REQUIRE_MATCHED:-0}")"
 
 MODE_A="${BENCH_PHASE70_MODE_A:-B1}"
 MODE_B="${BENCH_PHASE70_MODE_B:-B2}"
@@ -97,8 +111,20 @@ if ! [[ "${PAIR_COUNT}" =~ ^[0-9]+$ ]] || (( PAIR_COUNT <= 0 )); then
   echo "BENCH_PHASE70_PAIRS/REPEATS must be a positive integer; got ${PAIR_COUNT}" >&2
   exit 1
 fi
+if ! [[ "${REPLAY_CONC}" =~ ^[0-9]+$ ]] || (( REPLAY_CONC < 1 )); then
+  echo "BENCH_PHASE70_REPLAY_CONCURRENCY must be an integer >= 1; got ${REPLAY_CONC}" >&2
+  exit 1
+fi
 if ! [[ "${PAIR_WASHOUT_S}" =~ ^[0-9]+$ ]]; then
   echo "BENCH_PHASE70_PAIR_WASHOUT_S must be a non-negative integer; got ${PAIR_WASHOUT_S}" >&2
+  exit 1
+fi
+if ! [[ "${PREFLIGHT_TIMEOUT_S}" =~ ^[0-9]+$ ]] || (( PREFLIGHT_TIMEOUT_S <= 0 )); then
+  echo "BENCH_PHASE70_PREFLIGHT_TIMEOUT_S must be a positive integer; got ${PREFLIGHT_TIMEOUT_S}" >&2
+  exit 1
+fi
+if ! [[ "${PREFLIGHT_SLEEP_S}" =~ ^[0-9]+$ ]] || (( PREFLIGHT_SLEEP_S <= 0 )); then
+  echo "BENCH_PHASE70_PREFLIGHT_SLEEP_S must be a positive integer; got ${PREFLIGHT_SLEEP_S}" >&2
   exit 1
 fi
 if [[ "${ORDER_STRATEGY}" != "alternating" && "${ORDER_STRATEGY}" != "random" ]]; then
@@ -113,12 +139,228 @@ fi
 KVBM_CACHE_BASE_DIR="${BENCH_KVBM_CACHE_BASE_DIR:-/mnt/nvme/kvbm/phase70_pair_${TS}}"
 IO_ATTRIB_CHECKER="${REPO_ROOT}/scripts/check_io_attrib_replay.py"
 ANALYZER_SCRIPT="${REPO_ROOT}/scripts/analyze_phase70_pairs.py"
+PREFLIGHT_SCRIPT="${REPO_ROOT}/scripts/bench_phase70_preflight.sh"
+MECHANISM_GATE_SCRIPT="${REPO_ROOT}/scripts/phase70_check_mechanism_gate.py"
+VERDICT_SCRIPT="${REPO_ROOT}/scripts/phase70_write_verdict.py"
 
 MANIFEST_JSON="${RESULTS_ROOT}/phase70_rehydrate_pair_repeats_manifest_${TS}.json"
 SUMMARY_JSON="${RESULTS_ROOT}/phase70_rehydrate_pair_repeats_summary_${TS}.json"
 SUMMARY_CSV="${RESULTS_ROOT}/phase70_rehydrate_pair_repeats_summary_${TS}.csv"
 DELTAS_CSV="${RESULTS_ROOT}/phase70_rehydrate_pair_repeats_deltas_${TS}.csv"
 ORDER_CHECK_JSON="${RESULTS_ROOT}/phase70_rehydrate_pair_repeats_order_check_${TS}.json"
+VERDICT_JSON="${RESULTS_ROOT}/phase70_rehydrate_pair_repeats_verdict_${TS}.json"
+PREFLIGHT_JSON="${RESULTS_ROOT}/phase70_rehydrate_pair_repeats_preflight_${TS}.json"
+MECHANISM_GATE_JSON="${RESULTS_ROOT}/phase70_rehydrate_pair_repeats_gate_${TS}.json"
+
+declare -a PHASE70_REASON_CODES=()
+RUNS_EXECUTED=0
+ANALYZER_DONE=0
+DECISION_GRADE_HINT="1"
+MECHANISM_GATE_DONE="0"
+LAST_RUN_DIR=""
+if is_truthy "${DISABLE_MECHANISM_GATE}"; then
+  DECISION_GRADE_HINT="0"
+fi
+
+add_reason_code() {
+  local code="${1:-}"
+  if [[ -z "${code}" ]]; then
+    return 0
+  fi
+  local existing
+  for existing in "${PHASE70_REASON_CODES[@]}"; do
+    if [[ "${existing}" == "${code}" ]]; then
+      return 0
+    fi
+  done
+  PHASE70_REASON_CODES+=("${code}")
+}
+
+ingest_reason_codes_from_json() {
+  local json_path="$1"
+  if [[ ! -f "${json_path}" ]]; then
+    return 0
+  fi
+  mapfile -t _codes < <(
+    "${PYTHON_BIN}" - "${json_path}" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    obj = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+
+codes = obj.get("reason_codes") if isinstance(obj.get("reason_codes"), list) else []
+for code in codes:
+    if isinstance(code, str) and code.strip():
+        print(code.strip())
+PY
+  )
+  local code
+  for code in "${_codes[@]}"; do
+    add_reason_code "${code}"
+    if [[ "${code}" == "PREFLIGHT_METRICS_UNAVAILABLE" ]]; then
+      DECISION_GRADE_HINT="0"
+    fi
+  done
+}
+
+run_preflight() {
+  if is_truthy "${SKIP_PREFLIGHT}"; then
+    echo "Phase70 preflight skipped (BENCH_PHASE70_SKIP_PREFLIGHT=1)."
+    return 0
+  fi
+  if [[ ! -x "${PREFLIGHT_SCRIPT}" ]]; then
+    echo "Phase70 preflight helper missing or not executable: ${PREFLIGHT_SCRIPT}" >&2
+    return 1
+  fi
+  local preflight_rc=0
+  set +e
+  "${PREFLIGHT_SCRIPT}" \
+    --base-url "${PREFLIGHT_BASE_URL}" \
+    --metrics-kvbm-url "${PREFLIGHT_METRICS_KVBM_URL}" \
+    --timeout-s "${PREFLIGHT_TIMEOUT_S}" \
+    --sleep-s "${PREFLIGHT_SLEEP_S}" \
+    --allow-missing-kvbm-metrics "${ALLOW_MISSING_KVBM_METRICS}" \
+    --python-bin "${PYTHON_BIN}" \
+    --json-out "${PREFLIGHT_JSON}"
+  preflight_rc=$?
+  set -e
+  ingest_reason_codes_from_json "${PREFLIGHT_JSON}"
+  if (( preflight_rc != 0 )); then
+    echo "Phase70 preflight failed; see ${PREFLIGHT_JSON}" >&2
+    return "${preflight_rc}"
+  fi
+  echo "Phase70 preflight complete."
+}
+
+maybe_run_mechanism_gate() {
+  local mode="$1"
+  local pair_id="$2"
+  local pair_leg="$3"
+  local run_dir="$4"
+  if [[ "${mode}" != "B2" ]]; then
+    return 0
+  fi
+  if [[ "${MECHANISM_GATE_DONE}" == "1" ]]; then
+    return 0
+  fi
+  if is_truthy "${DISABLE_MECHANISM_GATE}"; then
+    echo "Phase70 mechanism gate disabled by override (BENCH_PHASE70_DISABLE_MECHANISM_GATE=1)." >&2
+    DECISION_GRADE_HINT="0"
+    MECHANISM_GATE_DONE="1"
+    return 0
+  fi
+  if [[ ! -f "${run_dir}/summary.json" ]]; then
+    add_reason_code "GATE_NO_SSD_MECHANISM_SIGNAL"
+    echo "Phase70 mechanism gate failed (missing summary.json for first B2 leg)." >&2
+    return 1
+  fi
+  if [[ ! -f "${MECHANISM_GATE_SCRIPT}" ]]; then
+    add_reason_code "RUN_ERRORS_PRESENT"
+    echo "Phase70 mechanism gate helper missing: ${MECHANISM_GATE_SCRIPT}" >&2
+    return 1
+  fi
+
+  local gate_rc=0
+  local gate_args=(
+    --run-dir "${run_dir}"
+    --json-out "${MECHANISM_GATE_JSON}"
+    --min-disk-hit-rate "${MECHANISM_GATE_MIN_DISK_HIT_RATE}"
+    --min-matched-tokens "${MECHANISM_GATE_MIN_MATCHED_TOKENS}"
+  )
+  if is_truthy "${MECHANISM_GATE_REQUIRE_MATCHED}"; then
+    gate_args+=(--require-matched)
+  fi
+
+  set +e
+  "${PYTHON_BIN}" "${MECHANISM_GATE_SCRIPT}" "${gate_args[@]}" >> "${LOG_DIR}/phase70_mechanism_gate_${TS}.log" 2>&1
+  gate_rc=$?
+  set -e
+  if (( gate_rc != 0 )); then
+    add_reason_code "GATE_NO_SSD_MECHANISM_SIGNAL"
+    echo "Phase70 mechanism gate failed pair_id=${pair_id} pair_leg=${pair_leg} run_dir=${run_dir} reason=NO_SSD_MECHANISM_SIGNAL" >&2
+    return "${gate_rc}"
+  fi
+  MECHANISM_GATE_DONE="1"
+  echo "Phase70 mechanism gate passed pair_id=${pair_id} pair_leg=${pair_leg} run_dir=${run_dir}"
+}
+
+run_analyzer() {
+  if [[ "${ANALYZER_DONE}" == "1" ]]; then
+    return 0
+  fi
+  if [[ ! -f "${MANIFEST_JSON}" ]]; then
+    echo "Phase70 analyzer skipped (manifest missing)." >&2
+    return 1
+  fi
+  "${PYTHON_BIN}" "${ANALYZER_SCRIPT}" \
+    --manifest "${MANIFEST_JSON}" \
+    --summary-json "${SUMMARY_JSON}" \
+    --summary-csv "${SUMMARY_CSV}" \
+    --pair-delta-csv "${DELTAS_CSV}" \
+    --order-check-json "${ORDER_CHECK_JSON}" \
+    --mode-a "${MODE_A}" \
+    --mode-b "${MODE_B}"
+  ANALYZER_DONE="1"
+}
+
+write_verdict() {
+  if (( RUNS_EXECUTED <= 0 )); then
+    return 0
+  fi
+  if [[ ! -f "${VERDICT_SCRIPT}" ]]; then
+    echo "Phase70 verdict helper missing: ${VERDICT_SCRIPT}" >&2
+    return 1
+  fi
+  local reason_args=()
+  local code
+  for code in "${PHASE70_REASON_CODES[@]}"; do
+    reason_args+=(--reason-code "${code}")
+  done
+  "${PYTHON_BIN}" "${VERDICT_SCRIPT}" \
+    --manifest "${MANIFEST_JSON}" \
+    --summary-json "${SUMMARY_JSON}" \
+    --summary-csv "${SUMMARY_CSV}" \
+    --pair-delta-csv "${DELTAS_CSV}" \
+    --order-check-json "${ORDER_CHECK_JSON}" \
+    --out "${VERDICT_JSON}" \
+    --io-attrib-enabled "${IO_ATTRIB}" \
+    --decision-grade-hint "${DECISION_GRADE_HINT}" \
+    --decision-grade-require-rehydrate "${DECISION_GRADE_REQUIRE_REHYDRATE}" \
+    "${reason_args[@]}"
+}
+
+phase70_on_exit() {
+  local rc="$1"
+  trap - EXIT
+  if (( RUNS_EXECUTED > 0 )); then
+    if (( rc != 0 )); then
+      add_reason_code "RUN_ERRORS_PRESENT"
+    fi
+    if [[ "${ANALYZER_DONE}" != "1" ]]; then
+      set +e
+      run_analyzer
+      local analyzer_rc=$?
+      set -e
+      if (( analyzer_rc != 0 )); then
+        add_reason_code "RUN_ERRORS_PRESENT"
+      fi
+    fi
+    set +e
+    write_verdict
+    local verdict_rc=$?
+    set -e
+    if (( verdict_rc != 0 )); then
+      echo "Phase70 verdict generation failed rc=${verdict_rc}" >&2
+    fi
+  fi
+  exit "${rc}"
+}
+trap 'phase70_on_exit $?' EXIT
 
 ensure_container() {
   if ! docker ps --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; then
@@ -133,7 +375,7 @@ mk_cache_dir() {
 }
 
 init_manifest() {
-  "${PYTHON_BIN}" - "${MANIFEST_JSON}" "${TS}" "${MODEL_PROFILE}" "${SCENARIO}" "${PAIR_COUNT}" "${MODE_A}" "${MODE_B}" "${REPLAY_CONC}" "${ORDER_STRATEGY}" "${ORDER_SEED}" "${IO_ATTRIB}" "${IO_ATTRIB_INTERVAL_S}" "${STREAM_METRICS}" "${STREAM_TIMEOUT_S}" "${STREAM_RECORD_TTFB}" "${PAIR_WASHOUT_S}" "${PAIR_WASHOUT_SYNC}" "${PAIR_WASHOUT_DROP_CACHES}" <<'PY'
+  "${PYTHON_BIN}" - "${MANIFEST_JSON}" "${TS}" "${MODEL_PROFILE}" "${SCENARIO}" "${PAIR_COUNT}" "${MODE_A}" "${MODE_B}" "${REPLAY_CONC}" "${ORDER_STRATEGY}" "${ORDER_SEED}" "${IO_ATTRIB}" "${IO_ATTRIB_INTERVAL_S}" "${STREAM_METRICS}" "${STREAM_TIMEOUT_S}" "${STREAM_RECORD_TTFB}" "${PAIR_WASHOUT_S}" "${PAIR_WASHOUT_SYNC}" "${PAIR_WASHOUT_DROP_CACHES}" "${SKIP_PREFLIGHT}" "${ALLOW_MISSING_KVBM_METRICS}" "${DISABLE_MECHANISM_GATE}" "${DECISION_GRADE_REQUIRE_REHYDRATE}" <<'PY'
 import json
 import pathlib
 import sys
@@ -158,6 +400,10 @@ payload = {
         "pair_washout_s": int(sys.argv[16]),
         "pair_washout_sync": bool(int(sys.argv[17])),
         "pair_washout_drop_caches": bool(int(sys.argv[18])),
+        "skip_preflight": bool(int(sys.argv[19])),
+        "allow_missing_kvbm_metrics": bool(int(sys.argv[20])),
+        "disable_mechanism_gate": bool(int(sys.argv[21])),
+        "decision_grade_require_rehydrate": bool(int(sys.argv[22])),
         "methodology": {
             "design": "pair_local_blocked_matched_pairs",
             "counterbalancing": "AB_BA",
@@ -329,6 +575,7 @@ run_probe() {
   local rc=$?
   set -e
   if (( rc != 0 )); then
+    add_reason_code "RUN_ERRORS_PRESENT"
     echo "Phase70 run failed pair_id=${pair_id} mode=${mode} rc=${rc}; see ${log_path}" >&2
     exit "${rc}"
   fi
@@ -349,6 +596,7 @@ run_probe() {
       echo "==== $(now_utc) io_attrib checker done mode=${mode} rc=${io_checker_rc} ===="
     } >> "${log_path}"
     if (( io_checker_rc != 0 )); then
+      add_reason_code "IO_ATTRIB_MISSING"
       echo "io_attrib replay gate failed for mode=${mode} pair_id=${pair_id}; rc=${io_checker_rc}; see ${log_path}" >&2
       exit "${io_checker_rc}"
     fi
@@ -380,11 +628,14 @@ print(json.dumps(payload, separators=(",", ":")))
 PY
   )"
   append_manifest_run "${row_json}"
+  RUNS_EXECUTED=$((RUNS_EXECUTED + 1))
+  LAST_RUN_DIR="${run_dir}"
 
   echo "Phase70 pair_id=${pair_id} pair_order=${pair_order} pair_leg=${pair_leg} mode=${mode} run_dir=${run_dir}"
 }
 
 ensure_container
+run_preflight
 init_manifest
 generate_pair_orders
 
@@ -399,22 +650,18 @@ for pair_id in $(seq 1 "${PAIR_COUNT}"); do
 
   echo "Phase70 pair ${pair_id}/${PAIR_COUNT}: order=${pair_order}"
   run_probe "${pair_id}" "${pair_order}" 1 "${first_mode}"
+  maybe_run_mechanism_gate "${first_mode}" "${pair_id}" 1 "${LAST_RUN_DIR}"
   run_pair_washout "${pair_id}" "${pair_order}" "${first_mode}" "${second_mode}" "${PAIR_WASHOUT_DROP_CACHES}"
   run_probe "${pair_id}" "${pair_order}" 2 "${second_mode}"
+  maybe_run_mechanism_gate "${second_mode}" "${pair_id}" 2 "${LAST_RUN_DIR}"
 done
 
-"${PYTHON_BIN}" "${ANALYZER_SCRIPT}" \
-  --manifest "${MANIFEST_JSON}" \
-  --summary-json "${SUMMARY_JSON}" \
-  --summary-csv "${SUMMARY_CSV}" \
-  --pair-delta-csv "${DELTAS_CSV}" \
-  --order-check-json "${ORDER_CHECK_JSON}" \
-  --mode-a "${MODE_A}" \
-  --mode-b "${MODE_B}"
+run_analyzer
 
 echo "PHASE70_MANIFEST_JSON=${MANIFEST_JSON}"
 echo "PHASE70_SUMMARY_JSON=${SUMMARY_JSON}"
 echo "PHASE70_SUMMARY_CSV=${SUMMARY_CSV}"
 echo "PHASE70_DELTAS_CSV=${DELTAS_CSV}"
 echo "PHASE70_ORDER_CHECK_JSON=${ORDER_CHECK_JSON}"
+echo "PHASE70_VERDICT_JSON=${VERDICT_JSON}"
 echo "PHASE70_LOG_DIR=${LOG_DIR}"

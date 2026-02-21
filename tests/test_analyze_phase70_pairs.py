@@ -197,6 +197,7 @@ class AnalyzePhase70PairsTests(unittest.TestCase):
                         "pair_count": 2,
                         "mode_a": "B1",
                         "mode_b": "B2",
+                        "replay_concurrency": 4,
                     },
                     "runs": entries,
                 },
@@ -237,6 +238,7 @@ class AnalyzePhase70PairsTests(unittest.TestCase):
             p1_b2 = next(r for r in rows if r.get("pair_id") == "1" and r.get("mode") == "B2")
             self.assertEqual(p1_b2.get("process_evidence_method"), "cgroup")
             self.assertEqual(p1_b2.get("pid_warn"), "True")
+            self.assertEqual(p1_b2.get("replay_concurrency"), "4")
 
             with delta_csv_path.open("r", encoding="utf-8", newline="") as fp:
                 deltas = list(csv.DictReader(fp))
@@ -260,12 +262,15 @@ class AnalyzePhase70PairsTests(unittest.TestCase):
             self.assertIn("approx_ci95_half_width", ttfc_stats["order_ab"])
             self.assertIn("delta_rollups", order_check)
             self.assertIn("delta_replay_ttft_p95_ms", order_check["delta_rollups"])
+            self.assertEqual((order_check.get("meta") or {}).get("replay_concurrency"), 4)
 
             summary_obj = json.loads(summary_json_path.read_text(encoding="utf-8"))
             self.assertEqual(summary_obj.get("pair_count"), 2)
             self.assertEqual(len(summary_obj.get("rows") or []), 4)
             self.assertIn("delta_rollups", summary_obj)
             self.assertIn("delta_replay_read_gib", summary_obj["delta_rollups"])
+            self.assertEqual(summary_obj.get("replay_concurrency"), 4)
+            self.assertEqual((summary_obj.get("meta") or {}).get("replay_concurrency"), 4)
 
 
 if __name__ == "__main__":

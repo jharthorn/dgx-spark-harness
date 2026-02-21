@@ -44,6 +44,18 @@ def parse_bool(value: Any) -> bool | None:
     return None
 
 
+def parse_int(value: Any, *, min_value: int | None = None) -> int | None:
+    try:
+        if value is None:
+            return None
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if min_value is not None and parsed < min_value:
+        return None
+    return parsed
+
+
 def resolve_replay_phase(summary: dict[str, Any]) -> dict[str, Any]:
     phase_summaries = summary.get("phase_summaries") if isinstance(summary.get("phase_summaries"), list) else []
     for phase in phase_summaries:
@@ -97,7 +109,7 @@ def extract_io_verdict(run_dir: Path) -> tuple[bool | None, str | None, bool | N
     return parse_bool(verdict.get("pass")), method, bool(pid_warn), verdict
 
 
-def extract_run_row(entry: dict[str, Any]) -> dict[str, Any]:
+def extract_run_row(entry: dict[str, Any], *, replay_concurrency: int | None) -> dict[str, Any]:
     run_dir = Path(str(entry.get("run_dir") or ""))
     summary = load_json(run_dir / "summary.json")
 
@@ -112,6 +124,7 @@ def extract_run_row(entry: dict[str, Any]) -> dict[str, Any]:
         "pair_order": entry.get("pair_order"),
         "pair_leg": int(entry.get("pair_leg") or 0),
         "mode": entry.get("mode"),
+        "replay_concurrency": replay_concurrency,
         "run_id": entry.get("run_id"),
         "bundle_id": entry.get("bundle_id"),
         "timestamp_utc": summary.get("created_utc"),
@@ -305,6 +318,8 @@ def main() -> int:
     order_check_json_path = Path(args.order_check_json)
 
     manifest = load_json(manifest_path)
+    manifest_meta = manifest.get("meta") if isinstance(manifest.get("meta"), dict) else {}
+    replay_concurrency = parse_int(manifest_meta.get("replay_concurrency"), min_value=1)
     run_entries = manifest.get("runs") if isinstance(manifest.get("runs"), list) else []
 
     per_run_rows: list[dict[str, Any]] = []
@@ -313,7 +328,7 @@ def main() -> int:
         if not isinstance(entry, dict):
             continue
         try:
-            per_run_rows.append(extract_run_row(entry))
+            per_run_rows.append(extract_run_row(entry, replay_concurrency=replay_concurrency))
         except Exception as exc:  # noqa: BLE001
             run_id = entry.get("run_id") if isinstance(entry, dict) else "unknown"
             errors.append(f"failed_to_extract_run:{run_id}:{exc}")
@@ -325,6 +340,7 @@ def main() -> int:
         "pair_order",
         "pair_leg",
         "mode",
+        "replay_concurrency",
         "run_id",
         "bundle_id",
         "timestamp_utc",
@@ -458,6 +474,9 @@ def main() -> int:
     )
     order_check_payload = {
         "created_utc": now_utc(),
+        "meta": {
+            "replay_concurrency": replay_concurrency,
+        },
         "pair_count": len(pair_deltas),
         "mode_a": args.mode_a,
         "mode_b": args.mode_b,
@@ -480,8 +499,13 @@ def main() -> int:
     }
     order_check_json_path.write_text(json.dumps(order_check_payload, indent=2) + "\n", encoding="utf-8")
 
+    summary_meta = dict(manifest_meta)
+    if replay_concurrency is not None:
+        summary_meta["replay_concurrency"] = replay_concurrency
+
     summary_payload = {
-        "meta": manifest.get("meta"),
+        "meta": summary_meta,
+        "replay_concurrency": replay_concurrency,
         "mode_a": args.mode_a,
         "mode_b": args.mode_b,
         "run_count": len(per_run_rows),
